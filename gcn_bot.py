@@ -31,7 +31,7 @@ from gcn_kafka import Consumer
 from slack_sdk import WebClient
 from slack_sdk.errors import SlackApiError
 
-# Local imports - now required components
+# Local imports
 from gcn_notice_handler import GCNNoticeHandler
 
 # Configure logging with a custom formatter to show source file
@@ -159,15 +159,15 @@ try:
     visibility_available = True
     logger.info("Successfully imported visibility plotter from supy package")
 except ImportError:
-    logger.warning("Failed to import visibility plotter from supy, trying local import")
-    try:
-        from visibility_plotter_old import VisibilityPlotter
-        plotter = VisibilityPlotter(logger=logger)
-        visibility_available = True
-        logger.info("Successfully imported local visibility plotter")
-    except ImportError:
-        logger.warning("Visibility plotter not available. Skipping visibility plots.")
-        visibility_available = False
+    # logger.warning("Failed to import visibility plotter from supy, trying local import")
+    # try:
+    #     from visibility_plotter_old import VisibilityPlotter
+    #     plotter = VisibilityPlotter(logger=logger)
+    #     visibility_available = True
+    #     logger.info("Successfully imported local visibility plotter")
+    # except ImportError:
+    logger.warning("Visibility plotter not available. Skipping visibility plots.")
+    visibility_available = False
 
 # Initialize GCN consumer
 consumer = Consumer(
