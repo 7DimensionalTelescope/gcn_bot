@@ -377,8 +377,6 @@ class GCNNoticeHandler:
         except Exception as e:
             logger.error(f"Error in verification schedule check: {e}")
 
-<<<<<<< HEAD
-=======
     def _normalize_facility_name(self, facility: str) -> str:
         """
         Normalize facility names to group instruments from the same mission.
@@ -403,7 +401,6 @@ class GCNNoticeHandler:
         else:
             return facility
 
->>>>>>> 63056ab975dc47b600a33fc6b1cf1400cde3cde6
     def _load_caches(self, force=False):
         """
         Load all caches for names, sequence tracking, and ASCII entries.
@@ -515,10 +512,7 @@ class GCNNoticeHandler:
     def _event_exists(self, facility: str, trigger_num: str) -> Optional[str]:
         """
         Check if an event with the given facility and trigger number already exists.
-<<<<<<< HEAD
-=======
         Facilities from the same mission (e.g., SwiftBAT, SwiftXRT) are considered the same.
->>>>>>> 63056ab975dc47b600a33fc6b1cf1400cde3cde6
         
         Args:
             facility (str): The facility name
@@ -533,14 +527,6 @@ class GCNNoticeHandler:
         if not facility or not trigger_num:
             return None
         
-<<<<<<< HEAD
-        # Create cache key and check if it exists
-        cache_key = (facility, str(trigger_num))
-        if cache_key in self._name_cache:
-            existing_name = self._name_cache[cache_key]
-            logger.info(f"Found existing event: {existing_name} for {facility} trigger {trigger_num}")
-            return existing_name
-=======
         # Normalize the facility name for comparison
         normalized_facility = self._normalize_facility_name(facility)
         
@@ -553,21 +539,12 @@ class GCNNoticeHandler:
             if normalized_existing == normalized_facility and str(existing_trigger) == str(trigger_num):
                 logger.info(f"Found existing event: {existing_name} for {facility} trigger {trigger_num} (matched with {existing_facility})")
                 return existing_name
->>>>>>> 63056ab975dc47b600a33fc6b1cf1400cde3cde6
         
         # If not in name cache, try csv directly (safety check)
         try:
             if os.path.exists(self.output_csv):
                 df = self._safe_csv_read(self.output_csv)
                 if all(col in df.columns for col in ['Name', 'Facility', 'Trigger_num']):
-<<<<<<< HEAD
-                    # Find matching rows
-                    mask = (df['Facility'] == facility) & (df['Trigger_num'].astype(str) == str(trigger_num))
-                    if mask.any():
-                        existing_name = df.loc[mask, 'Name'].iloc[0]
-                        # Update the cache
-                        self._name_cache[cache_key] = existing_name
-=======
                     # Get all matching rows with normalized facility names
                     matches = []
                     for idx, row in df.iterrows():
@@ -580,7 +557,6 @@ class GCNNoticeHandler:
                         existing_name = matches[0]  # Take the first match
                         # Update the cache
                         self._name_cache[(facility, str(trigger_num))] = existing_name
->>>>>>> 63056ab975dc47b600a33fc6b1cf1400cde3cde6
                         logger.info(f"Found existing event in CSV (not in cache): {existing_name}")
                         return existing_name
         except Exception as e:
@@ -749,7 +725,6 @@ class GCNNoticeHandler:
                                     
                                     # Determine the appropriate alphabet for this name
                                     idx_alphabet = ascii_lowercase if prefix == "EP" else ascii_uppercase
-<<<<<<< HEAD
                                     
                                     # If not final letter, use next letter
                                     if sequence_letter != idx_alphabet[-1]:
@@ -781,39 +756,6 @@ class GCNNoticeHandler:
                                                 
                                             return new_name
                                     
-=======
-                                    
-                                    # If not final letter, use next letter
-                                    if sequence_letter != idx_alphabet[-1]:
-                                        try:
-                                            next_sequence = idx_alphabet.index(sequence_letter) + 1
-                                            if next_sequence < 26:
-                                                new_name = f"{prefix} {trigger_date.strftime('%y%m%d')}{idx_alphabet[next_sequence]}"
-                                                
-                                                # Update name cache if we have facility and trigger_num
-                                                if facility and trigger_num:
-                                                    self._name_cache[(facility, str(trigger_num))] = new_name
-                                                    
-                                                return new_name
-                                            else:
-                                                new_name = f"{prefix} {trigger_date.strftime('%y%m%d')}{idx_alphabet[-1]}"
-                                                
-                                                # Update name cache if we have facility and trigger_num
-                                                if facility and trigger_num:
-                                                    self._name_cache[(facility, str(trigger_num))] = new_name
-                                                    
-                                                return new_name
-                                        except ValueError:
-                                            # If we can't find the letter in the expected alphabet, start fresh
-                                            new_name = f"{prefix} {trigger_date.strftime('%y%m%d')}{idx_alphabet[0]}"
-                                            
-                                            # Update name cache if we have facility and trigger_num
-                                            if facility and trigger_num:
-                                                self._name_cache[(facility, str(trigger_num))] = new_name
-                                                
-                                            return new_name
-                                    
->>>>>>> 63056ab975dc47b600a33fc6b1cf1400cde3cde6
                                     # If final letter, continue to next line
                                     continue
                                     
@@ -1667,43 +1609,23 @@ class GCNNoticeHandler:
                             formatted_data[field] = formatted_data[field].replace(microsecond=0)
                 
                 # Get facility and trigger_num for matching
-<<<<<<< HEAD
-                facility = formatted_data.get('Facility')
-                trigger_num = formatted_data.get('Trigger_num')
-=======
                 facility = str(formatted_data.get('Facility'))
                 trigger_num = str(formatted_data.get('Trigger_num', ''))  # Ensure trigger_num is a string
                 
                 # Normalize facility name for matching
                 normalized_facility = self._normalize_facility_name(facility)
                 logger.info(f"Saving/updating ASCII entry for facility={facility} (normalized={normalized_facility}), trigger_num={trigger_num}")
->>>>>>> 63056ab975dc47b600a33fc6b1cf1400cde3cde6
                 
                 try:
                     # Try to load existing ASCII file
                     df = pd.read_csv(self.output_ascii, sep=r'\s+', 
                                     quotechar='"', quoting=csv.QUOTE_MINIMAL)
-<<<<<<< HEAD
-=======
                     logger.info(f"Loaded ASCII file with {len(df)} entries")
->>>>>>> 63056ab975dc47b600a33fc6b1cf1400cde3cde6
                 except (pd.errors.EmptyDataError, FileNotFoundError):
                     # Create new DataFrame if file doesn't exist or is empty
                     df = pd.DataFrame(columns=self.ascii_columns)
                     logger.info(f"Created new ASCII file: {self.output_ascii}")
 
-<<<<<<< HEAD
-                # Check if entry with same Facility and Trigger_num already exists
-                existing_idx = -1
-                if 'Facility' in df.columns and 'Trigger_num' in df.columns:
-                    # Find matching entry
-                    matches = (df['Facility'] == facility) & (df['Trigger_num'] == str(trigger_num))
-                    if matches.any():
-                        # Entry exists, get its index for updating
-                        existing_idx = df.index[matches].tolist()[0]
-                        logger.info(f"Found existing entry for {facility} trigger {trigger_num} at index {existing_idx}. Updating with new data.")
-                        
-=======
                 # Check if entry with same normalized Facility and Trigger_num already exists
                 existing_idx: Optional[int] = None
                 if 'Facility' in df.columns and 'Trigger_num' in df.columns:
@@ -1727,25 +1649,17 @@ class GCNNoticeHandler:
                         # Get the actual index from the DataFrame
                         actual_idx = df.index[existing_idx]
                         
->>>>>>> 63056ab975dc47b600a33fc6b1cf1400cde3cde6
                         # Update existing row with new data - preserve certain fields
                         for col in self.ascii_columns:
                             if col in formatted_data and formatted_data[col] not in ('', None):
                                 # Don't overwrite Redshift and Host_info with empty values
                                 if col in ['Redshift', 'Host_info'] and (formatted_data[col] == '' or formatted_data[col] is None):
-<<<<<<< HEAD
-                                    continue
-                                df.at[existing_idx, col] = formatted_data[col]
-                    else:
-                        # No existing entry, create a new row
-=======
                                     logger.debug(f"Preserving existing {col} value")
                                     continue
                                 df.at[actual_idx, col] = formatted_data[col]
                     else:
                         # No existing entry, create a new row
                         logger.info(f"No existing entry found. Creating new row for {facility} trigger {trigger_num}")
->>>>>>> 63056ab975dc47b600a33fc6b1cf1400cde3cde6
                         new_row = pd.DataFrame([{
                             'GCN_ID': f"GCN_{facility}_{trigger_num}",
                             'Name': formatted_data.get('Name', ''),
@@ -1754,11 +1668,7 @@ class GCNNoticeHandler:
                             'Error': formatted_data.get('Error', ''),
                             'Discovery_UTC': formatted_data.get('Discovery_UTC', ''),
                             'Facility': formatted_data.get('Facility', ''),
-<<<<<<< HEAD
-                            'Trigger_num': formatted_data.get('Trigger_num', ''),
-=======
                             'Trigger_num': trigger_num,
->>>>>>> 63056ab975dc47b600a33fc6b1cf1400cde3cde6
                             'Notice_date': formatted_data.get('Notice_date', ''),
                             'Redshift': '',  # Empty value for Redshift
                             'Host_info': ''  # Empty value for Host_info
@@ -1768,10 +1678,7 @@ class GCNNoticeHandler:
                         logger.info(f"Added new entry for {facility} trigger {trigger_num} at the top.")
                 else:
                     # First row case - add header and first row
-<<<<<<< HEAD
-=======
                     logger.info(f"No existing entries found. Creating first entry for {facility} trigger {trigger_num}")
->>>>>>> 63056ab975dc47b600a33fc6b1cf1400cde3cde6
                     new_row = pd.DataFrame([{
                         'GCN_ID': f"GCN_{facility}_{trigger_num}",
                         'Name': formatted_data.get('Name', ''),
@@ -1780,11 +1687,7 @@ class GCNNoticeHandler:
                         'Error': formatted_data.get('Error', ''),
                         'Discovery_UTC': formatted_data.get('Discovery_UTC', ''),
                         'Facility': formatted_data.get('Facility', ''),
-<<<<<<< HEAD
-                        'Trigger_num': formatted_data.get('Trigger_num', ''),
-=======
                         'Trigger_num': trigger_num,
->>>>>>> 63056ab975dc47b600a33fc6b1cf1400cde3cde6
                         'Notice_date': formatted_data.get('Notice_date', ''),
                         'Redshift': '',  # Empty value for Redshift
                         'Host_info': ''  # Empty value for Host_info
@@ -1824,11 +1727,7 @@ class GCNNoticeHandler:
                         line = ' '.join(formatted_values)
                         f.write(f"{line}\n")
 
-<<<<<<< HEAD
-                if existing_idx >= 0:
-=======
                 if existing_idx is not None:
->>>>>>> 63056ab975dc47b600a33fc6b1cf1400cde3cde6
                     logger.info(f"Successfully updated existing entry in ASCII file for {facility} trigger {trigger_num}")
                 else:
                     logger.info(f"Successfully added new entry to ASCII file for {facility} trigger {trigger_num}")
