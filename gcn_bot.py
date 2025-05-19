@@ -354,12 +354,8 @@ def _filter_notice_text(text, topic):
         r"LOC_ALGORITHM",
         r"E_RANGE",
         r"POS_MAP_URL",
-<<<<<<< HEAD
-        r"DATA_INTERVAL"
-=======
         r"DATA_INTERVAL",
         r"AMPLIFIER"
->>>>>>> 63056ab975dc47b600a33fc6b1cf1400cde3cde6
     ]
     
     # Store sections for structured output
@@ -391,22 +387,14 @@ def _filter_notice_text(text, topic):
         
         # Check for various time fields from different facilities
         # Format with curly braces: TIME: NNNNN SOD {HH:MM:SS.ss} UT
-<<<<<<< HEAD
-        time_with_braces = re.search(r"(?:GRB|TRIGGER|DISCOVERY|EVENT)_TIME:.*?{([\d:\.]+)}\s*UT", line)
-=======
         time_with_braces = re.search(r"(?:GRB|TRIGGER|DISCOVERY|EVENT|IMG_START)_TIME:.*?{([\d:\.]+)}\s*UT", line)
->>>>>>> 63056ab975dc47b600a33fc6b1cf1400cde3cde6
         if time_with_braces:
             trigger_time = time_with_braces.group(1)
             trigger_time_line = line
             continue  # Skip to next iteration if found
         
         # Format without braces: TIME: HH:MM:SS.ss UT
-<<<<<<< HEAD
-        time_without_braces = re.search(r"(?:GRB|TRIGGER|DISCOVERY|EVENT)_TIME:\s*([\d:\.]+)\s*UT", line)
-=======
         time_without_braces = re.search(r"(?:GRB|TRIGGER|DISCOVERY|EVENT|IMG_START)_TIME:\s*([\d:\.]+)\s*UT", line)
->>>>>>> 63056ab975dc47b600a33fc6b1cf1400cde3cde6
         if time_without_braces:
             trigger_time = time_without_braces.group(1)
             trigger_time_line = line
@@ -439,13 +427,8 @@ def _filter_notice_text(text, topic):
             continue
         
         # Handle date/time combination
-<<<<<<< HEAD
-        if any(date_type in line for date_type in ["GRB_DATE:", "TRIGGER_DATE:", "DISCOVERY_DATE:", "EVENT_DATE:"]):
-            date_match = re.search(r"(?:GRB|TRIGGER|DISCOVERY|EVENT)_DATE:.*?(\d{2})/(\d{2})/(\d{2})", line)
-=======
         if any(date_type in line for date_type in ["GRB_DATE:", "TRIGGER_DATE:", "DISCOVERY_DATE:", "EVENT_DATE:", "IMG_START_DATE:"]):
             date_match = re.search(r"(?:GRB|TRIGGER|DISCOVERY|EVENT|IMG_START)_DATE:.*?(\d{2})/(\d{2})/(\d{2})", line)
->>>>>>> 63056ab975dc47b600a33fc6b1cf1400cde3cde6
             if date_match:
                 combined_date_time = f'{date_match.group(1)}/{date_match.group(2)}/{date_match.group(3)}'
             continue
@@ -459,30 +442,6 @@ def _filter_notice_text(text, topic):
                 # Use current date if no GRB_DATE found
                 today = datetime.now().strftime("%y/%m/%d")
                 full_trigger_time = f"{today} {trigger_time}"
-<<<<<<< HEAD
-            
-            # Add standardized trigger time
-            standardized_trigger = _standardize_time_format(full_trigger_time)
-            
-            # Handle different time field names
-            if "GRB_TIME:" in line:
-                sections["timing"].append(f"GRB_TIME:      {standardized_trigger}")
-            elif "TRIGGER_TIME:" in line:
-                sections["timing"].append(f"TRIGGER_TIME:      {standardized_trigger}")
-            elif "DISCOVERY_TIME:" in line:
-                sections["timing"].append(f"DISCOVERY_TIME:      {standardized_trigger}")
-            elif "EVENT_TIME:" in line:
-                sections["timing"].append(f"EVENT_TIME:      {standardized_trigger}")
-            else:
-                # Extract the time field name for other formats
-                time_field_match = re.search(r"(\w+_TIME):", line)
-                if time_field_match:
-                    time_field = time_field_match.group(1)
-                    sections["timing"].append(f"{time_field}:      {standardized_trigger}")
-                else:
-                    sections["timing"].append(f"TIME:      {standardized_trigger}")
-            
-=======
             
             # Add standardized trigger time
             standardized_trigger = _standardize_time_format(full_trigger_time)
@@ -507,7 +466,6 @@ def _filter_notice_text(text, topic):
                 else:
                     sections["timing"].append(f"TIME:      {standardized_trigger}")
             
->>>>>>> 63056ab975dc47b600a33fc6b1cf1400cde3cde6
             # Add time difference with corresponding field name
             time_diff = _calculate_time_diff(notice_date, full_trigger_time)
             if "GRB_TIME:" in line:
@@ -518,11 +476,8 @@ def _filter_notice_text(text, topic):
                 sections["timing"].append(f"DISCOVERY_TIME_DIFF:      {time_diff}")
             elif "EVENT_TIME:" in line:
                 sections["timing"].append(f"EVENT_TIME_DIFF:      {time_diff}")
-<<<<<<< HEAD
-=======
             elif "IMG_START_TIME:" in line:
                 sections["timing"].append(f"IMG_START_TIME_DIFF:      {time_diff}")
->>>>>>> 63056ab975dc47b600a33fc6b1cf1400cde3cde6
             else:
                 # Extract the time field name for other formats
                 time_field_match = re.search(r"(\w+_TIME):", line)
@@ -840,8 +795,6 @@ def format_message_for_slack(
         if isinstance(formatted_text, bytes):
             formatted_text = formatted_text.decode('utf-8')
         
-<<<<<<< HEAD
-=======
         # Add this code to handle Swift-specific LC_URL construction
         if lc_url is None and notice_data and 'Trigger_num' in notice_data and notice_data['Trigger_num']:
             try:
@@ -857,7 +810,6 @@ def format_message_for_slack(
             except Exception as e:
                 logger.warning(f"Error constructing Swift LC_URL: {e}")
         
->>>>>>> 63056ab975dc47b600a33fc6b1cf1400cde3cde6
         # Add probable GRB name if TURN_ON_NOTICE is true and we have notice data
         if TURN_ON_NOTICE and notice_data and 'Name' in notice_data and notice_data['Name']:
             # Convert formatted_text to string if it's not already
@@ -1901,11 +1853,8 @@ def process_notice_and_send_message(topic, value, slack_client, slack_channel):
                     
                 except Exception as e:
                     logger.error(f"Error sending LC link to thread: {e}")
-<<<<<<< HEAD
-=======
             else:
                 logger.warning(f"No LC URL found for {_get_facility_name(topic)}")
->>>>>>> 63056ab975dc47b600a33fc6b1cf1400cde3cde6
             
             # Send visibility plot in thread if available
             if plot_path:
@@ -1928,13 +1877,10 @@ def process_notice_and_send_message(topic, value, slack_client, slack_channel):
                         
                 except Exception as e:
                     logger.error(f"Error sending plot as thread reply: {e}")
-<<<<<<< HEAD
-=======
             else:
                 logger.warning(f"No plot path found for {_get_facility_name(topic)}")
         else:
             logger.error(f"Error sending thread message: {response}")
->>>>>>> 63056ab975dc47b600a33fc6b1cf1400cde3cde6
         
         # Send ToO email if appropriate and enabled
         if TURN_ON_TOO_EMAIL and visibility_info and visibility_info.get("status") in ["observable_now", "observable_later"]:
