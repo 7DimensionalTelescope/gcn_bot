@@ -44,58 +44,6 @@ class VisibilityPlotter:
         Args:
             utc_time: Datetime in UTC
             
-<<<<<<< HEAD
-        Returns:
-            Tuple containing (chile_time, korea_time)
-        """
-        # Ensure UTC time has timezone info
-        if utc_time.tzinfo is None:
-            utc_time = pytz.utc.localize(utc_time)
-            
-        # Convert to Chile and Korea times
-        chile_time = utc_time.astimezone(self.chile_tz)
-        korea_time = utc_time.astimezone(self.korea_tz)
-        
-        return chile_time, korea_time
-    
-    def _format_time_clt_kst(self, utc_time: Optional[datetime]) -> str:
-        """
-        Format time in both CLT and KST timezones with improved readability.
-        
-        Args:
-            utc_time: Datetime in UTC, or None
-            
-        Returns:
-            String with formatted time in both timezones, or "Unknown" if utc_time is None
-        """
-        if utc_time is None:
-            return "Unknown"
-        
-        try:
-            # Ensure UTC time has timezone info
-            if utc_time.tzinfo is None:
-                utc_time = pytz.utc.localize(utc_time)
-                
-            # Convert to Chile and Korea times
-            chile_time, korea_time = self._convert_time_to_clt_kst(utc_time)
-            
-            # Format with day information if different from today
-            today = datetime.now(tz=self.chile_tz).date()
-            
-            # If date is different, include date in format
-            if chile_time.date() != today:
-                return f"{chile_time.strftime('%m-%d %H:%M')} CLT / {korea_time.strftime('%m-%d %H:%M')} KST"
-            else:
-                return f"{chile_time.strftime('%H:%M')} CLT / {korea_time.strftime('%H:%M')} KST"
-        except Exception as e:
-            self.logger.warning(f"Error formatting time: {e}")
-            # Fallback to simple string representation
-            try:
-                return f"{utc_time.strftime('%H:%M')} UTC"
-            except:
-                return "Time format error"
-    
-=======
         Returns:
             Tuple containing (chile_time, korea_time)
         """
@@ -189,7 +137,6 @@ class VisibilityPlotter:
             self.logger.error(f"Error calculating altitude change: {e}")
             return 1.0  # Default to 1° change if calculation fails
 
->>>>>>> 63056ab975dc47b600a33fc6b1cf1400cde3cde6
     def _analyze_visibility(self, staralt_data_dict: Dict[str, Any]) -> Dict[str, Any]:
         """
         Analyze visibility data for a target to determine if it's observable.
@@ -211,11 +158,8 @@ class VisibilityPlotter:
         
         try:
             # Extract relevant information with fallbacks for missing data
-<<<<<<< HEAD
-=======
             ra = staralt_data_dict.get("target_ra")
             dec = staralt_data_dict.get("target_dec")
->>>>>>> 63056ab975dc47b600a33fc6b1cf1400cde3cde6
             now_datetime = staralt_data_dict.get("now_datetime")
             color_target = staralt_data_dict.get("color_target", [])
             target_times = staralt_data_dict.get("target_times", [])
@@ -363,10 +307,6 @@ class VisibilityPlotter:
                     
                     # If altitude is below threshold but reasonable
                     elif max_alt < min_altitude:
-<<<<<<< HEAD
-                        might_be_observable_tomorrow = True
-                        detailed_reason = f"Target maximum altitude ({max_alt:.1f}°) is below threshold today ({min_altitude}°), may be higher tomorrow due to Earth's rotation"
-=======
                         # Calculate the altitude gap
                         altitude_gap = min_altitude - max_alt
                         
@@ -394,7 +334,6 @@ class VisibilityPlotter:
                                 f"Target maximum altitude ({max_alt:.1f}°) is too far below threshold ({min_altitude}°) "
                                 f"by {altitude_gap:.1f}°, but expected to change by only ~{expected_change:.1f}° tomorrow"
                             )
->>>>>>> 63056ab975dc47b600a33fc6b1cf1400cde3cde6
                     
                     # If window passed earlier today
                     elif observable_indices and not future_observable:
@@ -423,11 +362,7 @@ class VisibilityPlotter:
                 else:
                     # Regular not observable status
                     if max_alt <= 0:
-<<<<<<< HEAD
-                        result["condition"] = "Never Rises"
-=======
                         result["condition"] = "Not Visible (North Hemisphere target)"
->>>>>>> 63056ab975dc47b600a33fc6b1cf1400cde3cde6
                         result["reason"] = f"Target never rises above horizon from this location"
                     elif max_alt < min_altitude:
                         result["condition"] = "Below Minimum Altitude"
@@ -604,17 +539,10 @@ class VisibilityPlotter:
                     phase_desc = "New Moon"
             except Exception as e:
                 self.logger.warning(f"Error getting moon phase: {e}")
-<<<<<<< HEAD
             
             # Start building message
             sections = []
             
-=======
-            
-            # Start building message
-            sections = []
-            
->>>>>>> 63056ab975dc47b600a33fc6b1cf1400cde3cde6
             # Format header based on status with color emoji
             if status == "observable_now":
                 header = "*🟢 CURRENTLY OBSERVABLE*"
@@ -684,37 +612,6 @@ class VisibilityPlotter:
                 sections.extend(details)
                 
             elif status == "observable_tomorrow":
-<<<<<<< HEAD
-                # Enhanced tomorrow observability details with clear explanation
-                reason = visibility_info.get("reason", "Target may be observable tomorrow")
-                
-                # Calculate tomorrow's timing information
-                tomorrow = datetime.now() + timedelta(days=1)
-                tomorrow_date = tomorrow.strftime("%Y-%m-%d")
-                
-                # Get observable window if available from tomorrow's analysis
-                if visibility_info.get("observable_start") and visibility_info.get("observable_end"):
-                    start_time = visibility_info.get("observable_start")
-                    end_time = visibility_info.get("observable_end")
-                    window_hours = visibility_info.get("observable_hours", 0)
-                    
-                    start_formatted = self._format_time_clt_kst(start_time)
-                    end_formatted = self._format_time_clt_kst(end_time)
-                    
-                    details = [
-                        f"> - 📆 *Tomorrow's observability ({tomorrow_date})*:",
-                        f"> - 🔍 *Reason*: {reason}",
-                        f"> - 🕙 *Expected window*: {start_formatted} to {end_formatted} (*{window_hours:.1f} hours*)"
-                    ]
-                    
-                    # Add best time if available
-                    if visibility_info.get("best_time"):
-                        best_time = visibility_info.get("best_time")
-                        best_formatted = self._format_time_clt_kst(best_time)
-                        details.append(f"> - ⭐ *Best observation time*: {best_formatted}")
-                else:
-                    # Use estimated values
-=======
                 # Get tomorrow's start time if available
                 tomorrow_start_time = visibility_info.get("tomorrow_start_time")
                 tomorrow_end_time = visibility_info.get("tomorrow_end_time")
@@ -744,7 +641,6 @@ class VisibilityPlotter:
                     details.append(f"> - ⏱️ *Duration*: {tomorrow_observable_hours:.1f} hours")
                 else:
                     # Fallback to estimation if exact times aren't available
->>>>>>> 63056ab975dc47b600a33fc6b1cf1400cde3cde6
                     max_alt = visibility_info.get("max_altitude", 0)
                     
                     # Estimate window duration based on max altitude
@@ -755,15 +651,7 @@ class VisibilityPlotter:
                     else:
                         est_hours = 3.0
                     
-<<<<<<< HEAD
-                    details = [
-                        f"> - 📆 *Tomorrow's observability ({tomorrow_date})*:",
-                        f"> - 🔍 *Reason*: {reason}",
-                        f"> - 🕙 *Estimated window*: ~{est_hours:.1f} hours"
-                    ]
-=======
                     details.append(f"> - 🕙 *Estimated window*: ~{est_hours:.1f} hours (exact times unknown)")
->>>>>>> 63056ab975dc47b600a33fc6b1cf1400cde3cde6
                 
                 # Add moon phase info - moon position will change for tomorrow
                 if moon_emoji and phase_desc:
@@ -857,13 +745,6 @@ class VisibilityPlotter:
                 visibility_info["showing_tomorrow"] = True
                 visibility_info["tomorrow_date"] = tomorrow.strftime("%Y-%m-%d")
                 
-<<<<<<< HEAD
-                # Copy useful visibility data from tomorrow's analysis
-                # but keep the original "observable_tomorrow" status
-                for key in ["observable_start", "observable_end", "observable_hours", "best_time"]:
-                    if key in tomorrow_visibility_info:
-                        visibility_info[key] = tomorrow_visibility_info[key]
-=======
                 # Save tomorrow's predicted observation start time 
                 if tomorrow_visibility_info.get("status") in ["observable_now", "observable_later"]:
                     # Get the predicted start time from tomorrow's analysis
@@ -874,7 +755,6 @@ class VisibilityPlotter:
                     visibility_info["tomorrow_observable_hours"] = tomorrow_visibility_info.get("observable_hours")
                 else:
                     visibility_info["tomorrow_start_time"] = None
->>>>>>> 63056ab975dc47b600a33fc6b1cf1400cde3cde6
             
             # If not observable, return early with no plot
             if visibility_info.get("status") == "not_observable":
@@ -905,19 +785,11 @@ class VisibilityPlotter:
             # Create plot
             plt.figure(dpi=300, figsize=(10, 4))
             self.staralt.plot_staralt(show_current_time=show_current_time)
-<<<<<<< HEAD
             
             # Add target coordinates to plot title for reference
             coord_text = f"RA={ra:.2f}°, Dec={dec:.2f}°"
             plt.title(f"{plt.gca().get_title()} ({coord_text})\n", fontsize=12)
             
-=======
-            
-            # Add target coordinates to plot title for reference
-            coord_text = f"RA={ra:.2f}°, Dec={dec:.2f}°"
-            plt.title(f"{plt.gca().get_title()} ({coord_text})\n", fontsize=12)
-            
->>>>>>> 63056ab975dc47b600a33fc6b1cf1400cde3cde6
             # Add a label if we're showing tomorrow's sky
             if visibility_info.get("showing_tomorrow"):
                 tomorrow_date = visibility_info.get("tomorrow_date", 

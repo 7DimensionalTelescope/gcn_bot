@@ -272,7 +272,7 @@ consumer = Consumer(
 
 # Try to import visibility_plotter
 try:
-    from visibility_plotter import VisibilityPlotter
+    from supy.observer.visibility_plotter import VisibilityPlotter
     # Initialize the plotter
     plotter = VisibilityPlotter(logger=logger)
     visibility_available = True
