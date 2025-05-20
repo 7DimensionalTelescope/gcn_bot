@@ -19,7 +19,9 @@ import logging
 import argparse
 from datetime import datetime
 
-# Parse arguments FIRST, before importing modules that have their own argparse
+# CRITICAL: Parse our arguments FIRST and save the original sys.argv
+original_argv = sys.argv.copy()
+
 def parse_arguments():
     """Parse command line arguments before any imports that might conflict."""
     parser = argparse.ArgumentParser(description='Thread Management Test Suite')
@@ -30,13 +32,17 @@ def parse_arguments():
     
     return parser.parse_args()
 
-# Parse arguments early to avoid conflicts
+# Parse our arguments first
 args = parse_arguments()
+
+# Now MODIFY sys.argv so that gcn_bot.py's argparse won't conflict
+# We'll set sys.argv to just the script name (no arguments)
+sys.argv = [sys.argv[0]]  # Keep only the script name
 
 # Add the main directory to Python path to import modules
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
-# Now do the imports AFTER parsing our arguments
+# Now do the imports AFTER manipulating sys.argv
 try:
     # Import config first
     try:
@@ -53,14 +59,21 @@ try:
     from gcn_notice_handler import GCNNoticeHandler
     notice_handler = GCNNoticeHandler()
     
-    # Import specific functions from gcn_bot without executing its main code
+    # Import specific functions from gcn_bot
+    # This should now work without argparse conflicts
     import gcn_bot
     
     print("✅ Successfully imported main bot modules")
 except ImportError as e:
     print(f"❌ Error importing modules: {e}")
-    print("Make sure you're running this from the same directory as gcn_bot.py")
+    print("Make sure you're running this from the same directory as gcn_bot.py and config.py")
     sys.exit(1)
+except Exception as e:
+    print(f"❌ Unexpected error during import: {e}")
+    sys.exit(1)
+
+# Restore original sys.argv after imports
+sys.argv = original_argv
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
@@ -71,7 +84,13 @@ class ThreadTester:
     
     def __init__(self, send_to_slack=False):
         self.send_to_slack = send_to_slack
-        self.test_channel = SLACK_CHANNEL_TEST if SLACK_CHANNEL_TEST else SLACK_CHANNEL
+        # Use test channel if available, otherwise use main channel
+        try:
+            self.test_channel = SLACK_CHANNEL_TEST if hasattr(sys.modules[__name__], 'SLACK_CHANNEL_TEST') and SLACK_CHANNEL_TEST else SLACK_CHANNEL
+        except:
+            self.test_channel = SLACK_CHANNEL
+        
+        print(f"📢 Using Slack channel: {self.test_channel}")
         
         # Mock message class
         class MockMessage:
@@ -146,14 +165,11 @@ COMMENTS:        Swift-XRT Coordinates - Enhanced position.
                 print("❌ FAILED: Could not process initial message")
                 return False
                 
-            # Check for thread_ts storage - note: this requires thread storage to be implemented
-            time.sleep(2)
+            time.sleep(3)  # Give more time for processing
             
             print(f"\nStep 2: Sending UPDATE message")
             print(f"  Updated coordinates: RA=150.2468, DEC=+25.4321, Error=1.8 arcsec")
             print(f"  Expected: Thread reply showing coordinate changes")
-            
-            time.sleep(2)  # Brief pause between messages
             
             # Process update message
             update_msg = self.MockMessage(topic, updated_notice)
@@ -172,7 +188,7 @@ COMMENTS:        Swift-XRT Coordinates - Enhanced position.
                 return False
             
             print("✅ SUCCESS: Both messages processed successfully")
-            print("   Note: Full thread verification requires thread storage implementation")
+            print("   📋 Check Slack to verify thread behavior")
             return True
                 
         except Exception as e:
@@ -210,6 +226,7 @@ GRB_DEC:         +30.1000d {{+30d 06' 00"}} (J2000)
 GRB_ERROR:       2.5 [deg radius]
 GRB_DATE:        25/05/20
 GRB_TIME:        39600.00 SOD {{11:00:00.00}} UT
+LC_URL:          http://heasarc.gsfc.nasa.gov/FTP/fermi/data/gbm/triggers/2025/test.gif
 """
 
         try:
@@ -231,7 +248,7 @@ GRB_TIME:        39600.00 SOD {{11:00:00.00}} UT
                 print("❌ FAILED: Could not process Swift message")
                 return False
                 
-            time.sleep(2)
+            time.sleep(3)
             
             print(f"Step 2: Sending FERMI GBM message (same trigger {test_trigger})")
             
@@ -252,7 +269,7 @@ GRB_TIME:        39600.00 SOD {{11:00:00.00}} UT
                 return False
                 
             print("✅ SUCCESS: Both facilities processed successfully")
-            print("   Note: Check Slack to verify separate messages were created")
+            print("   📋 Check Slack to verify separate messages were created")
             return True
                 
         except Exception as e:
@@ -264,11 +281,15 @@ GRB_TIME:        39600.00 SOD {{11:00:00.00}} UT
         """Run all available tests."""
         print("🧪 STARTING COMPREHENSIVE THREAD MANAGEMENT TESTS")
         print(f"📤 Send to Slack: {'YES' if self.send_to_slack else 'NO'}")
+        print(f"📢 Target channel: {self.test_channel}")
         
         results = []
         
         # Test 1: Basic thread management
         results.append(("Basic Thread Management", self.test_basic_thread_management()))
+        
+        # Small delay between tests
+        time.sleep(2)
         
         # Test 2: Different facilities
         results.append(("Different Facilities", self.test_different_facilities()))
@@ -289,6 +310,8 @@ GRB_TIME:        39600.00 SOD {{11:00:00.00}} UT
         
         if self.send_to_slack:
             print(f"\n📱 Check your Slack channel ({self.test_channel}) for test messages!")
+        else:
+            print(f"\n💡 Add --send flag to actually send messages to Slack")
         
         return passed == len(results)
 
@@ -300,6 +323,9 @@ def main():
         print("  python test_threads.py --test-facilities # Test different facilities")
         print("  python test_threads.py --test-all        # Run all tests")
         print("  python test_threads.py --send            # Actually send to Slack")
+        print("\nExamples:")
+        print("  python test_threads.py --test-all        # Run all tests (dry run)")
+        print("  python test_threads.py --test-all --send # Run all tests and send to Slack")
         return
     
     tester = ThreadTester(send_to_slack=args.send)

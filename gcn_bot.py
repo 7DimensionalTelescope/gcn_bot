@@ -235,7 +235,7 @@ DISPLAY_TOPICS = [
 
 # Try to import config.py
 try:
-    from config import *
+    from config import * # Make sure to create a config.py file based on config_template.py
 except ImportError:
     print("Configuration file 'config.py' not found.")
     print("Please create a config.py file based on config_template.py.")
@@ -279,6 +279,16 @@ try:
 except ImportError:
     logger.warning("visibility_plotter module not available. Visibility plots will be disabled.")
     visibility_available = False
+
+# Import notice handler
+from gcn_notice_handler import GCNNoticeHandler
+
+# Create notice handler
+notice_handler = GCNNoticeHandler(
+    output_csv=OUTPUT_NOTICE_CSV,
+    output_ascii=OUTPUT_ASCII,
+    ascii_max_events=ASCII_MAX_EVENTS
+)
 
 # Add argument parser
 parser = argparse.ArgumentParser(description='GCN Alert Monitor')
@@ -1682,8 +1692,8 @@ def _compare_event_data(old_data: Dict[str, Any], new_data: Dict[str, Any]) -> D
     Compare old and new event data to identify differences.
     
     Args:
-        old_data (Dict[str, Any]): Previous event data
-        new_data (Dict[str, Any]): New event data
+        old_data (Dict[str, Any]): Previous event data from ASCII file
+        new_data (Dict[str, Any]): New event data from notice
         
     Returns:
         Dict[str, Any]: Dictionary containing the differences
@@ -1702,10 +1712,16 @@ def _compare_event_data(old_data: Dict[str, Any], new_data: Dict[str, Any]) -> D
             
             # Convert to float for comparison if both are numeric
             try:
-                old_float = float(old_val) if old_val else None
-                new_float = float(new_val) if new_val else None
+                old_float = float(old_val) if old_val and old_val != '' else None
+                new_float = float(new_val) if new_val and new_val != '' else None
                 
-                if old_float != new_float and new_float is not None:
+                # Only record change if both values exist and are different
+                if old_float is not None and new_float is not None:
+                    # Use a small tolerance for floating point comparison
+                    if abs(old_float - new_float) > 0.001:
+                        coord_changed = True
+                        new_coords[field] = new_float
+                elif old_float != new_float and new_float is not None:
                     coord_changed = True
                     new_coords[field] = new_float
             except (ValueError, TypeError):
@@ -1716,22 +1732,33 @@ def _compare_event_data(old_data: Dict[str, Any], new_data: Dict[str, Any]) -> D
         
         if coord_changed:
             differences['coordinates'] = new_coords
+            logger.info(f"Coordinate changes detected: {new_coords}")
         
-        # Check facility/instrument changes
+        # Check facility/instrument changes (normalized comparison)
         old_facility = old_data.get('Facility', '')
         new_facility = new_data.get('Facility', '')
         
-        if old_facility != new_facility and new_facility:
+        # Use normalized comparison but record actual facility names
+        old_normalized = notice_handler._normalize_facility_name(old_facility)
+        new_normalized = notice_handler._normalize_facility_name(new_facility)
+        
+        # If the normalized facilities are the same but actual facilities differ,
+        # this is an instrument update (e.g., SwiftBAT -> SwiftXRT)
+        if old_normalized == new_normalized and old_facility != new_facility:
             differences['facility_change'] = {
                 'from': old_facility,
                 'to': new_facility
             }
+            logger.info(f"Facility instrument change: {old_facility} -> {new_facility}")
         
         # Check visibility changes (if visibility info is provided)
         if 'visibility_info' in new_data:
-            differences['visibility'] = new_data['visibility_info']
+            visibility_info = new_data['visibility_info']
+            # Always include visibility info for thread updates
+            differences['visibility'] = visibility_info
+            logger.info(f"Visibility status: {visibility_info.get('status', 'unknown')}")
         
-        logger.info(f"Found {len(differences)} differences between old and new data")
+        logger.info(f"Found {len(differences)} types of differences between old and new data")
         return differences
         
     except Exception as e:
@@ -1829,7 +1856,7 @@ def process_notice_and_send_message(topic, value, slack_client, slack_channel, i
             logger.info(f"Skipping test notice from {topic}")
             return False, "Test notice skipped"
         
-        # 1. Parse and save the notice with handler
+        # 1. Parse the notice with handler
         logger.info(f"Parsing notice from {topic}")
         notice_data = notice_handler.parse_notice(value, topic)
         
@@ -1859,7 +1886,6 @@ def process_notice_and_send_message(topic, value, slack_client, slack_channel, i
         # 3. Process visibility information if coordinates available
         plot_path = None
         visibility_info = None
-        visibility_blocks = []
         
         ra = notice_data.get('RA')
         dec = notice_data.get('DEC')
@@ -1872,13 +1898,14 @@ def process_notice_and_send_message(topic, value, slack_client, slack_channel, i
                     ra=ra,
                     dec=dec,
                     grb_name=notice_data.get('Name', ''),
-                    test_mode=False,
+                    test_mode=is_test,
                     minalt=MIN_ALTITUDE,
                     minmoonsep=MIN_MOON_SEP
                 )
                 
-                plot_path, visibility_info = result
-                notice_data['visibility_info'] = visibility_info  # Store for comparison
+                if isinstance(result, tuple) and len(result) == 2:
+                    plot_path, visibility_info = result
+                    notice_data['visibility_info'] = visibility_info  # Store for comparison
                 
             except Exception as e:
                 logger.error(f"Error creating visibility plot: {e}")
@@ -1900,7 +1927,8 @@ def process_notice_and_send_message(topic, value, slack_client, slack_channel, i
                     thread_message = _format_thread_message(differences, notice_data)
                     
                     try:
-                        slack_client.chat_postMessage(
+                        # Send thread update message
+                        thread_response = slack_client.chat_postMessage(
                             channel=slack_channel,
                             thread_ts=thread_ts,
                             text=thread_message,
@@ -1909,15 +1937,34 @@ def process_notice_and_send_message(topic, value, slack_client, slack_channel, i
                         )
                         logger.info(f"Sent thread update for {facility} trigger {trigger_num}")
                         
-                        # Add visibility plot to thread if coordinates changed
+                        # Add visibility plot to thread if coordinates changed and plot available
                         if 'coordinates' in differences and plot_path and os.path.exists(plot_path):
-                            slack_client.files_upload_v2(
-                                file_uploads=[{"file": plot_path}],
-                                channel=slack_channel,
-                                thread_ts=thread_ts,
-                                title=f"Updated Visibility Plot: {notice_data.get('Name', 'Target')}"
-                            )
-                            
+                            try:
+                                slack_client.files_upload_v2(
+                                    file_uploads=[{"file": plot_path}],
+                                    channel=slack_channel,
+                                    thread_ts=thread_ts,
+                                    title=f"Updated Visibility Plot: {notice_data.get('Name', 'Target')}"
+                                )
+                                logger.info(f"Uploaded updated visibility plot to thread")
+                            except Exception as plot_error:
+                                logger.error(f"Error uploading plot to thread: {plot_error}")
+                        
+                        # Send ToO email if enabled and target becomes observable
+                        if (TURN_ON_TOO_EMAIL and visibility_info and 
+                            visibility_info.get('status') in ['observable_now', 'observable_later']):
+                            try:
+                                from gcn_too_emailer import GCNToOEmailer
+                                emailer = GCNToOEmailer(
+                                    email_from=EMAIL_FROM,
+                                    email_to=["7dt.observation.alert@gmail.com"],
+                                    email_password=EMAIL_PASSWORD
+                                )
+                                email_sent = emailer.process_notice(notice_data, TOO_CONFIG, visibility_info)
+                                logger.info(f"ToO email request sent: {email_sent}")
+                            except Exception as e:
+                                logger.error(f"Error sending ToO email: {e}")
+                                
                     except Exception as e:
                         logger.error(f"Error sending thread update: {e}")
                 
@@ -1926,16 +1973,30 @@ def process_notice_and_send_message(topic, value, slack_client, slack_channel, i
                 
                 # Clean up plot file if it was created
                 if plot_path and os.path.exists(plot_path) and not plot_path.startswith('./test_plots'):
-                    os.remove(plot_path)
+                    try:
+                        os.remove(plot_path)
+                    except Exception as e:
+                        logger.warning(f"Error removing plot file: {e}")
                 
                 return True, "Thread update sent successfully"
             
             # If this is a new event, send full message
             else:
                 # 5. Format the full message for Slack
-                slack_message = format_message_from_notice_data(notice_data, topic)
+                slack_message, lc_url = format_message_for_slack(
+                    topic=topic,
+                    value=value,
+                    csv_status=csv_status,
+                    ascii_status=ascii_status,
+                    test_mode=is_test,
+                    notice_data=notice_data
+                )
+
+                if slack_message is None:
+                    return False, "Message formatting failed"
                 
                 # Add visibility blocks if available
+                visibility_blocks = []
                 if visibility_info:
                     visibility_text = plotter.format_visibility_message(visibility_info)
                     visibility_blocks = [
@@ -1950,18 +2011,8 @@ def process_notice_and_send_message(topic, value, slack_client, slack_channel, i
                         }
                     ]
                 
-                # Add database status to the message
-                status_blocks = [{
-                    "type": "context",
-                    "elements": [{
-                        "type": "mrkdwn",
-                        "text": f"✅ CSV: {'Saved' if csv_status else '❌ Failed'} | "
-                               f"✅ ASCII: {'Saved' if ascii_status else '❌ Failed'}"
-                    }]
-                }]
-                
                 # Combine all blocks
-                message_blocks = slack_message.get('blocks', []) + status_blocks + visibility_blocks
+                message_blocks = slack_message.get('blocks', []) + visibility_blocks
                 
                 # Send the main message
                 if not is_test or (is_test and TEST_SEND_TO_SLACK):
@@ -1980,10 +2031,9 @@ def process_notice_and_send_message(topic, value, slack_client, slack_channel, i
                         # Save ASCII with the new thread_ts
                         ascii_status = notice_handler.save_to_ascii(notice_data, new_thread_ts)
                         
-                        # Add LC URL and visibility plot as thread replies
-                        if not ('Einstein' in facility or 'EP' in facility):
-                            lc_url = notice_data.get('LC_URL', '')
-                            if lc_url:
+                        # Add LC URL as thread reply if available
+                        if lc_url:
+                            try:
                                 lc_message = f"*Light Curve Link*\n<{lc_url}|Click here to view Light Curve>\n_(Note: Image may take a few minutes to generate)_"
                                 slack_client.chat_postMessage(
                                     channel=slack_channel,
@@ -1991,21 +2041,30 @@ def process_notice_and_send_message(topic, value, slack_client, slack_channel, i
                                     text=lc_message,
                                     unfurl_links=False
                                 )
+                                logger.info(f"Sent LC URL to thread")
+                            except Exception as e:
+                                logger.error(f"Error sending LC URL: {e}")
                         
+                        # Add visibility plot as thread reply
                         if plot_path and os.path.exists(plot_path):
-                            slack_client.files_upload_v2(
-                                file_uploads=[{"file": plot_path}],
-                                channel=slack_channel,
-                                thread_ts=new_thread_ts,
-                                title=f"Visibility Plot: {notice_data.get('Name', 'Target')}"
-                            )
-                            
-                            # Clean up plot file
-                            if not plot_path.startswith('./test_plots'):
-                                os.remove(plot_path)
+                            try:
+                                slack_client.files_upload_v2(
+                                    file_uploads=[{"file": plot_path}],
+                                    channel=slack_channel,
+                                    thread_ts=new_thread_ts,
+                                    title=f"Visibility Plot: {notice_data.get('Name', 'Target')}"
+                                )
+                                logger.info(f"Uploaded visibility plot to thread")
+                                
+                                # Clean up plot file
+                                if not plot_path.startswith('./test_plots'):
+                                    os.remove(plot_path)
+                            except Exception as e:
+                                logger.error(f"Error uploading plot: {e}")
                         
                         # Send ToO email if enabled and target is observable
-                        if TURN_ON_TOO_EMAIL and visibility_info and visibility_info.get('status') in ['observable_now', 'observable_later']:
+                        if (TURN_ON_TOO_EMAIL and visibility_info and 
+                            visibility_info.get('status') in ['observable_now', 'observable_later']):
                             try:
                                 from gcn_too_emailer import GCNToOEmailer
                                 emailer = GCNToOEmailer(
@@ -2033,6 +2092,7 @@ def process_notice_and_send_message(topic, value, slack_client, slack_channel, i
     except Exception as e:
         logger.error(f"Error processing notice: {e}", exc_info=True)
         return False, str(e)
+
 ############################## Main Loop ##############################
 def main():
     """Main function to start the GCN Slack Bot."""

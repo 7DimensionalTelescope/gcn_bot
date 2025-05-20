@@ -1582,91 +1582,111 @@ class GCNNoticeHandler:
             return False
 
     def save_to_ascii(self, notice_data: Dict[str, Any], thread_ts: Optional[str] = None) -> bool:
-        """
-        Save/update latest events to ASCII file.
-        If an entry with the same Facility and Trigger_num already exists,
-        it will be updated with the new data instead of adding a new row.
-        
-        Args:
-            notice_data (dict): Notice data to be saved.
-            thread_ts (str, optional): Slack thread timestamp for this event
-        
-        Returns:
-            bool: True if notice data is saved successfully, False otherwise.
-        """
-        try:
-            with self.file_lock:
-                # Format numeric values again just to be sure
-                formatted_data = notice_data.copy()
-                
-                # Format numeric fields to 2 decimal places
-                for field in ['RA', 'DEC', 'Error']:
-                    if field in formatted_data and formatted_data[field] not in ('', None):
-                        formatted_data[field] = round(float(formatted_data[field]), 2)
-                
-                # Format date fields to remove microseconds
-                for field in ['Discovery_UTC', 'Notice_date']:
-                    if field in formatted_data and formatted_data[field] not in ('', None):
-                        if isinstance(formatted_data[field], datetime):
-                            formatted_data[field] = formatted_data[field].strftime('%Y-%m-%d %H:%M:%S')
-                
-                # Get facility and trigger_num for matching
-                facility = str(formatted_data.get('Facility'))
-                trigger_num = str(formatted_data.get('Trigger_num', ''))
-                
-                # Normalize facility name for matching
-                normalized_facility = self._normalize_facility_name(facility)
-                logger.info(f"Saving/updating ASCII entry for facility={facility} (normalized={normalized_facility}), trigger_num={trigger_num}")
-                
-                try:
-                    # Try to load existing ASCII file
-                    df = pd.read_csv(self.output_ascii, sep=r'\s+', 
-                                    quotechar='"', quoting=csv.QUOTE_MINIMAL)
-                    logger.info(f"Loaded ASCII file with {len(df)} entries")
-                except (pd.errors.EmptyDataError, FileNotFoundError):
-                    # Create new DataFrame if file doesn't exist or is empty
-                    df = pd.DataFrame(columns=self.ascii_columns)
-                    logger.info(f"Created new ASCII file: {self.output_ascii}")
-
-                # Check if entry with same normalized Facility and Trigger_num already exists
-                existing_idx: Optional[int] = None
-                if 'Facility' in df.columns and 'Trigger_num' in df.columns:
-                    # Find matching entry using normalized facility name
-                    for i, (idx, row) in enumerate(df.iterrows()):
-                        row_facility = row.get('Facility', '')
-                        row_trigger = str(row.get('Trigger_num', ''))
-                        
-                        # Normalize the row's facility
-                        normalized_row_facility = self._normalize_facility_name(row_facility)
-                        
-                        # Check if normalized facilities and trigger numbers match
-                        if normalized_row_facility == normalized_facility and row_trigger == trigger_num:
-                            existing_idx = i
-                            break
+            """
+            Save/update latest events to ASCII file.
+            If an entry with the same Facility and Trigger_num already exists,
+            it will be updated with the new data instead of adding a new row.
+            
+            Args:
+                notice_data (dict): Notice data to be saved.
+                thread_ts (str, optional): Slack thread timestamp for this event
+            
+            Returns:
+                bool: True if notice data is saved successfully, False otherwise.
+            """
+            try:
+                with self.file_lock:
+                    # Format numeric values again just to be sure
+                    formatted_data = notice_data.copy()
                     
-                    if existing_idx is not None:
-                        # Entry exists, update with new data
-                        logger.info(f"Found existing entry for {facility} trigger {trigger_num} at index {existing_idx}. Updating with new data.")
-                        
-                        # Get the actual index from the DataFrame
-                        actual_idx = df.index[existing_idx]
-                        
-                        # Update existing row with new data - preserve certain fields
-                        for col in self.ascii_columns:
-                            if col in formatted_data and formatted_data[col] not in ('', None):
-                                # Don't overwrite Redshift and Host_info with empty values
-                                if col in ['Redshift', 'Host_info'] and (formatted_data[col] == '' or formatted_data[col] is None):
-                                    logger.debug(f"Preserving existing {col} value")
-                                    continue
-                                df.at[actual_idx, col] = formatted_data[col]
-                        
-                        # Update thread_ts if provided
-                        if thread_ts:
-                            df.at[actual_idx, 'thread_ts'] = thread_ts
+                    # Format numeric fields to 2 decimal places
+                    for field in ['RA', 'DEC', 'Error']:
+                        if field in formatted_data and formatted_data[field] not in ('', None):
+                            formatted_data[field] = round(float(formatted_data[field]), 2)
+                    
+                    # Format date fields to remove microseconds
+                    for field in ['Discovery_UTC', 'Notice_date']:
+                        if field in formatted_data and formatted_data[field] not in ('', None):
+                            if isinstance(formatted_data[field], datetime):
+                                formatted_data[field] = formatted_data[field].strftime('%Y-%m-%d %H:%M:%S')
+                    
+                    # Get facility and trigger_num for matching
+                    facility = str(formatted_data.get('Facility'))
+                    trigger_num = str(formatted_data.get('Trigger_num', ''))
+                    
+                    # Normalize facility name for matching
+                    normalized_facility = self._normalize_facility_name(facility)
+                    logger.info(f"Saving/updating ASCII entry for facility={facility} (normalized={normalized_facility}), trigger_num={trigger_num}")
+                    
+                    try:
+                        # Try to load existing ASCII file
+                        df = pd.read_csv(self.output_ascii, sep=r'\s+', 
+                                        quotechar='"', quoting=csv.QUOTE_MINIMAL)
+                        logger.info(f"Loaded ASCII file with {len(df)} entries")
+                    except (pd.errors.EmptyDataError, FileNotFoundError):
+                        # Create new DataFrame if file doesn't exist or is empty
+                        df = pd.DataFrame(columns=self.ascii_columns)
+                        logger.info(f"Created new ASCII file: {self.output_ascii}")
+
+                    # Check if entry with same normalized Facility and Trigger_num already exists
+                    existing_idx: Optional[int] = None
+                    if 'Facility' in df.columns and 'Trigger_num' in df.columns:
+                        # Find matching entry using normalized facility name
+                        for i, (idx, row) in enumerate(df.iterrows()):
+                            row_facility = str(row.get('Facility', '')).strip()
+                            row_trigger = str(row.get('Trigger_num', '')).strip()
                             
+                            # Normalize the row's facility
+                            normalized_row_facility = self._normalize_facility_name(row_facility)
+                            
+                            # Check if normalized facilities and trigger numbers match
+                            if normalized_row_facility == normalized_facility and row_trigger == trigger_num:
+                                existing_idx = i
+                                break
+                        
+                        if existing_idx is not None:
+                            # Entry exists, update with new data
+                            logger.info(f"Found existing entry for {facility} trigger {trigger_num} at index {existing_idx}. Updating with new data.")
+                            
+                            # Get the actual index from the DataFrame
+                            actual_idx = df.index[existing_idx]
+                            
+                            # Update existing row with new data - preserve certain fields
+                            for col in self.ascii_columns:
+                                if col in formatted_data and formatted_data[col] not in ('', None):
+                                    # Don't overwrite Redshift and Host_info with empty values
+                                    if col in ['Redshift', 'Host_info'] and (formatted_data[col] == '' or formatted_data[col] is None):
+                                        logger.debug(f"Preserving existing {col} value")
+                                        continue
+                                    df.at[actual_idx, col] = formatted_data[col]
+                            
+                            # Update thread_ts if provided
+                            if thread_ts:
+                                df.at[actual_idx, 'thread_ts'] = thread_ts
+                                
+                        else:
+                            # No existing entry, create a new row
+                            logger.info(f"No existing entry found. Creating new row for {facility} trigger {trigger_num}")
+                            new_row = pd.DataFrame([{
+                                'GCN_ID': f"GCN_{facility}_{trigger_num}",
+                                'Name': formatted_data.get('Name', ''),
+                                'RA': formatted_data.get('RA', ''),
+                                'DEC': formatted_data.get('DEC', ''),
+                                'Error': formatted_data.get('Error', ''),
+                                'Discovery_UTC': formatted_data.get('Discovery_UTC', ''),
+                                'Facility': formatted_data.get('Facility', ''),
+                                'Trigger_num': trigger_num,
+                                'Notice_date': formatted_data.get('Notice_date', ''),
+                                'Redshift': '',  # Always empty for notices
+                                'Host_info': '',  # Always empty for notices
+                                'thread_ts': thread_ts or ''  # Store thread_ts for new entries
+                            }])
+                            # Add to beginning of DataFrame
+                            df = pd.concat([new_row, df], ignore_index=True)
+                            logger.info(f"Added new entry for {facility} trigger {trigger_num} at the top.")
                     else:
-                        # No existing entry, create a new row
-                        logger.info(f"No existing entry found. Creating new row for {facility} trigger {trigger_num}")
+                        # First row case - add header and first row
+                        logger.info(f"No existing entries found. Creating first entry for {facility} trigger {trigger_num}")
                         new_row = pd.DataFrame([{
                             'GCN_ID': f"GCN_{facility}_{trigger_num}",
                             'Name': formatted_data.get('Name', ''),
@@ -1677,136 +1697,137 @@ class GCNNoticeHandler:
                             'Facility': formatted_data.get('Facility', ''),
                             'Trigger_num': trigger_num,
                             'Notice_date': formatted_data.get('Notice_date', ''),
-                            'Redshift': '',  # Empty value for Redshift
-                            'Host_info': '', # Empty value for Host_info
+                            'Redshift': '',  # Always empty for notices
+                            'Host_info': '',  # Always empty for notices
                             'thread_ts': thread_ts or ''  # Store thread_ts for new entries
                         }])
-                        # Add to beginning of DataFrame
                         df = pd.concat([new_row, df], ignore_index=True)
-                        logger.info(f"Added new entry for {facility} trigger {trigger_num} at the top.")
-                else:
-                    # First row case - add header and first row
-                    logger.info(f"No existing entries found. Creating first entry for {facility} trigger {trigger_num}")
-                    new_row = pd.DataFrame([{
-                        'GCN_ID': f"GCN_{facility}_{trigger_num}",
-                        'Name': formatted_data.get('Name', ''),
-                        'RA': formatted_data.get('RA', ''),
-                        'DEC': formatted_data.get('DEC', ''),
-                        'Error': formatted_data.get('Error', ''),
-                        'Discovery_UTC': formatted_data.get('Discovery_UTC', ''),
-                        'Facility': formatted_data.get('Facility', ''),
-                        'Trigger_num': trigger_num,
-                        'Notice_date': formatted_data.get('Notice_date', ''),
-                        'Redshift': '',  # Empty value for Redshift
-                        'Host_info': '', # Empty value for Host_info
-                        'thread_ts': thread_ts or ''  # Store thread_ts for new entries
-                    }])
-                    df = pd.concat([new_row, df], ignore_index=True)
-                    logger.info(f"Added first entry for {facility} trigger {trigger_num}.")
-                    
-                # Limit to max events    
-                df = df.head(self.ascii_max_events)
-                
-                # Format dataframe columns before writing
-                for col in ['RA', 'DEC', 'Error']:
-                    if col in df.columns:
-                        df[col] = df[col].apply(lambda x: round(float(x), 2) if pd.notnull(x) and x != '' else x)
-
-                # Write the updated ASCII file
-                with open(self.output_ascii, 'w') as f:
-                    # Write header
-                    header = ' '.join(self.ascii_columns)
-                    f.write(f"{header}\n")
-                    
-                    # Write each row with proper formatting
-                    for _, row in df.iterrows():
-                        formatted_values = []
-                        for col in self.ascii_columns:
-                            if col not in row:
-                                formatted_values.append('""')
-                                continue
-                                
-                            value = str(row[col]) if pd.notnull(row[col]) else ''
-                            # Wrap in quotes if the data has space or is a special column
-                            if col in ['Name', 'Discovery_UTC', 'Notice_date', 'Host_info'] or ' ' in value:
-                                formatted_values.append(f'"{value}"')
-                            else:
-                                formatted_values.append(value)
+                        logger.info(f"Added first entry for {facility} trigger {trigger_num}.")
                         
-                        line = ' '.join(formatted_values)
-                        f.write(f"{line}\n")
+                    # Limit to max events    
+                    df = df.head(self.ascii_max_events)
+                    
+                    # Format dataframe columns before writing
+                    for col in ['RA', 'DEC', 'Error']:
+                        if col in df.columns:
+                            df[col] = df[col].apply(lambda x: round(float(x), 2) if pd.notnull(x) and str(x).strip() != '' else '')
 
-                if existing_idx is not None:
-                    logger.info(f"Successfully updated existing entry in ASCII file for {facility} trigger {trigger_num}")
-                else:
-                    logger.info(f"Successfully added new entry to ASCII file for {facility} trigger {trigger_num}")
-                
-                return True
+                    # Ensure all required columns exist and are properly formatted
+                    for col in self.ascii_columns:
+                        if col not in df.columns:
+                            df[col] = ''
 
-        except Exception as e:
-            logger.error(f"Error saving to ASCII: {e}")
-            return False
+                    # Write the updated ASCII file with proper column alignment
+                    with open(self.output_ascii, 'w') as f:
+                        # Write header
+                        header = ' '.join(self.ascii_columns)
+                        f.write(f"{header}\n")
+                        
+                        # Write each row with proper formatting and consistent column alignment
+                        for _, row in df.iterrows():
+                            formatted_values = []
+                            for col in self.ascii_columns:
+                                value = row.get(col, '')
+                                
+                                # Handle None and NaN values
+                                if pd.isna(value) or value is None:
+                                    value = ''
+                                else:
+                                    value = str(value).strip()
+                                
+                                # Format specific columns
+                                if col in ['Name', 'Discovery_UTC', 'Notice_date']:
+                                    # Always quote these fields if they have content
+                                    if value:
+                                        formatted_values.append(f'"{value}"')
+                                    else:
+                                        formatted_values.append('""')
+                                elif col in ['Redshift', 'Host_info']:
+                                    # Quote these fields and ensure they're always present
+                                    if value:
+                                        formatted_values.append(f'"{value}"')
+                                    else:
+                                        formatted_values.append('""')
+                                elif col == 'thread_ts':
+                                    # thread_ts should not be quoted
+                                    formatted_values.append(value if value else '')
+                                else:
+                                    # Other fields (numbers, IDs) - no quotes needed unless they contain spaces
+                                    if ' ' in value:
+                                        formatted_values.append(f'"{value}"')
+                                    else:
+                                        formatted_values.append(value if value else '')
+                            
+                            line = ' '.join(formatted_values)
+                            f.write(f"{line}\n")
+
+                    if existing_idx is not None:
+                        logger.info(f"Successfully updated existing entry in ASCII file for {facility} trigger {trigger_num}")
+                    else:
+                        logger.info(f"Successfully added new entry to ASCII file for {facility} trigger {trigger_num}")
+                    
+                    return True
+
+            except Exception as e:
+                logger.error(f"Error saving to ASCII: {e}")
+                return False
 
     def get_existing_event(self, facility: str, trigger_num: str) -> Optional[Dict[str, Any]]:
-        """
-        Get existing event data from ASCII file based on facility and trigger number.
-        
-        Args:
-            facility (str): The facility name
-            trigger_num (str): The trigger number
+            """
+            Get existing event data from ASCII file based on facility and trigger number.
             
-        Returns:
-            Optional[Dict[str, Any]]: Existing event data or None if not found
-        """
-        if not facility or not trigger_num:
-            return None
-        
-        # Normalize the facility name for comparison
-        normalized_facility = self._normalize_facility_name(facility)
-        
-        try:
-            if os.path.exists(self.output_ascii):
-                with open(self.output_ascii, 'r') as f:
-                    # Read header line
-                    header = f.readline().strip().split()
+            Args:
+                facility (str): The facility name
+                trigger_num (str): The trigger number
+                
+            Returns:
+                Optional[Dict[str, Any]]: Existing event data or None if not found
+            """
+            if not facility or not trigger_num:
+                return None
+            
+            # Normalize the facility name for comparison
+            normalized_facility = self._normalize_facility_name(facility)
+            logger.info(f"Looking for existing event: facility={facility} (normalized={normalized_facility}), trigger_num={trigger_num}")
+            
+            try:
+                if os.path.exists(self.output_ascii):
+                    # Use pandas to read the ASCII file properly (handles quotes correctly)
+                    df = pd.read_csv(self.output_ascii, sep=r'\s+', 
+                                    quotechar='"', quoting=csv.QUOTE_MINIMAL)
                     
-                    # Find column indices
-                    try:
-                        facility_idx = header.index('Facility')
-                        trigger_idx = header.index('Trigger_num')
-                        thread_ts_idx = header.index('thread_ts') if 'thread_ts' in header else -1
-                    except ValueError:
-                        logger.warning("Required columns missing in ASCII file header")
-                        return None
-                    
-                    # Check each line
-                    for line in f:
-                        fields = line.strip().split()
-                        if len(fields) <= max(facility_idx, trigger_idx):
-                            continue  # Skip lines with too few fields
-                        
-                        row_facility = fields[facility_idx].strip('"')
-                        row_trigger = fields[trigger_idx].strip('"')
+                    # Check each row for matching facility and trigger_num
+                    for idx, row in df.iterrows():
+                        row_facility = str(row.get('Facility', '')).strip()
+                        row_trigger = str(row.get('Trigger_num', '')).strip()
                         
                         # Normalize the row's facility
                         normalized_row_facility = self._normalize_facility_name(row_facility)
                         
                         # Check if normalized facilities and trigger numbers match
                         if normalized_row_facility == normalized_facility and row_trigger == str(trigger_num):
-                            # Build the event data dictionary
+                            # Convert row to dictionary
                             event_data = {}
-                            for i, col in enumerate(header):
-                                if i < len(fields):
-                                    value = fields[i].strip('"')
-                                    event_data[col] = value if value else None
+                            for col in self.ascii_columns:
+                                if col in row:
+                                    value = row[col]
+                                    # Handle NaN values
+                                    if pd.isna(value):
+                                        event_data[col] = None
+                                    else:
+                                        event_data[col] = str(value).strip() if value != '' else None
+                                else:
+                                    event_data[col] = None
                             
-                            logger.info(f"Found existing event data for {facility} trigger {trigger_num}")
+                            thread_ts = event_data.get('thread_ts', '')
+                            logger.info(f"Found existing event data for {facility} trigger {trigger_num} with thread_ts: {thread_ts}")
                             return event_data
-                            
-        except Exception as e:
-            logger.warning(f"Error getting existing event from ASCII file: {e}")
-        
-        return None
+                                
+            except Exception as e:
+                logger.warning(f"Error getting existing event from ASCII file: {e}")
+            
+            logger.info(f"No existing event found for {facility} trigger {trigger_num}")
+            return None
 
 #---------------------------------------Test Code----------------------------------------
 if __name__ == "__main__":
