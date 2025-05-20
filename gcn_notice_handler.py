@@ -324,7 +324,8 @@ class GCNNoticeHandler:
             'Trigger_num',   # 123456
             'Notice_date',   # 2025-01-19 00:00:10 UTC
             'Redshift',      # 0.3
-            'Host_info'      # "bright galaxy within the localization of GRB"
+            'Host_info',     # "bright galaxy within the localization of GRB"
+            'thread_ts'      # Slack thread timestamp for updates
         ]
         
         # Check if it's time to verify CSV integrity
@@ -1580,7 +1581,7 @@ class GCNNoticeHandler:
             logger.error(f"Error saving to CSV: {e}")
             return False
 
-    def save_to_ascii(self, notice_data: Dict[str, Any]) -> bool:
+    def save_to_ascii(self, notice_data: Dict[str, Any], thread_ts: Optional[str] = None) -> bool:
         """
         Save/update latest events to ASCII file.
         If an entry with the same Facility and Trigger_num already exists,
@@ -1588,6 +1589,7 @@ class GCNNoticeHandler:
         
         Args:
             notice_data (dict): Notice data to be saved.
+            thread_ts (str, optional): Slack thread timestamp for this event
         
         Returns:
             bool: True if notice data is saved successfully, False otherwise.
@@ -1606,11 +1608,11 @@ class GCNNoticeHandler:
                 for field in ['Discovery_UTC', 'Notice_date']:
                     if field in formatted_data and formatted_data[field] not in ('', None):
                         if isinstance(formatted_data[field], datetime):
-                            formatted_data[field] = formatted_data[field].replace(microsecond=0)
+                            formatted_data[field] = formatted_data[field].strftime('%Y-%m-%d %H:%M:%S')
                 
                 # Get facility and trigger_num for matching
                 facility = str(formatted_data.get('Facility'))
-                trigger_num = str(formatted_data.get('Trigger_num', ''))  # Ensure trigger_num is a string
+                trigger_num = str(formatted_data.get('Trigger_num', ''))
                 
                 # Normalize facility name for matching
                 normalized_facility = self._normalize_facility_name(facility)
@@ -1639,7 +1641,7 @@ class GCNNoticeHandler:
                         
                         # Check if normalized facilities and trigger numbers match
                         if normalized_row_facility == normalized_facility and row_trigger == trigger_num:
-                            existing_idx = i  # Use the enumerate index i instead of idx
+                            existing_idx = i
                             break
                     
                     if existing_idx is not None:
@@ -1657,6 +1659,11 @@ class GCNNoticeHandler:
                                     logger.debug(f"Preserving existing {col} value")
                                     continue
                                 df.at[actual_idx, col] = formatted_data[col]
+                        
+                        # Update thread_ts if provided
+                        if thread_ts:
+                            df.at[actual_idx, 'thread_ts'] = thread_ts
+                            
                     else:
                         # No existing entry, create a new row
                         logger.info(f"No existing entry found. Creating new row for {facility} trigger {trigger_num}")
@@ -1671,7 +1678,8 @@ class GCNNoticeHandler:
                             'Trigger_num': trigger_num,
                             'Notice_date': formatted_data.get('Notice_date', ''),
                             'Redshift': '',  # Empty value for Redshift
-                            'Host_info': ''  # Empty value for Host_info
+                            'Host_info': '', # Empty value for Host_info
+                            'thread_ts': thread_ts or ''  # Store thread_ts for new entries
                         }])
                         # Add to beginning of DataFrame
                         df = pd.concat([new_row, df], ignore_index=True)
@@ -1690,7 +1698,8 @@ class GCNNoticeHandler:
                         'Trigger_num': trigger_num,
                         'Notice_date': formatted_data.get('Notice_date', ''),
                         'Redshift': '',  # Empty value for Redshift
-                        'Host_info': ''  # Empty value for Host_info
+                        'Host_info': '', # Empty value for Host_info
+                        'thread_ts': thread_ts or ''  # Store thread_ts for new entries
                     }])
                     df = pd.concat([new_row, df], ignore_index=True)
                     logger.info(f"Added first entry for {facility} trigger {trigger_num}.")
@@ -1718,8 +1727,8 @@ class GCNNoticeHandler:
                                 continue
                                 
                             value = str(row[col]) if pd.notnull(row[col]) else ''
-                            # Wrap in quotes if the data has space
-                            if col in ['Name', 'Discovery_UTC', 'Notice_date'] or ' ' in value:
+                            # Wrap in quotes if the data has space or is a special column
+                            if col in ['Name', 'Discovery_UTC', 'Notice_date', 'Host_info'] or ' ' in value:
                                 formatted_values.append(f'"{value}"')
                             else:
                                 formatted_values.append(value)
@@ -1737,6 +1746,67 @@ class GCNNoticeHandler:
         except Exception as e:
             logger.error(f"Error saving to ASCII: {e}")
             return False
+
+    def get_existing_event(self, facility: str, trigger_num: str) -> Optional[Dict[str, Any]]:
+        """
+        Get existing event data from ASCII file based on facility and trigger number.
+        
+        Args:
+            facility (str): The facility name
+            trigger_num (str): The trigger number
+            
+        Returns:
+            Optional[Dict[str, Any]]: Existing event data or None if not found
+        """
+        if not facility or not trigger_num:
+            return None
+        
+        # Normalize the facility name for comparison
+        normalized_facility = self._normalize_facility_name(facility)
+        
+        try:
+            if os.path.exists(self.output_ascii):
+                with open(self.output_ascii, 'r') as f:
+                    # Read header line
+                    header = f.readline().strip().split()
+                    
+                    # Find column indices
+                    try:
+                        facility_idx = header.index('Facility')
+                        trigger_idx = header.index('Trigger_num')
+                        thread_ts_idx = header.index('thread_ts') if 'thread_ts' in header else -1
+                    except ValueError:
+                        logger.warning("Required columns missing in ASCII file header")
+                        return None
+                    
+                    # Check each line
+                    for line in f:
+                        fields = line.strip().split()
+                        if len(fields) <= max(facility_idx, trigger_idx):
+                            continue  # Skip lines with too few fields
+                        
+                        row_facility = fields[facility_idx].strip('"')
+                        row_trigger = fields[trigger_idx].strip('"')
+                        
+                        # Normalize the row's facility
+                        normalized_row_facility = self._normalize_facility_name(row_facility)
+                        
+                        # Check if normalized facilities and trigger numbers match
+                        if normalized_row_facility == normalized_facility and row_trigger == str(trigger_num):
+                            # Build the event data dictionary
+                            event_data = {}
+                            for i, col in enumerate(header):
+                                if i < len(fields):
+                                    value = fields[i].strip('"')
+                                    event_data[col] = value if value else None
+                            
+                            logger.info(f"Found existing event data for {facility} trigger {trigger_num}")
+                            return event_data
+                            
+        except Exception as e:
+            logger.warning(f"Error getting existing event from ASCII file: {e}")
+        
+        return None
 
 #---------------------------------------Test Code----------------------------------------
 if __name__ == "__main__":
