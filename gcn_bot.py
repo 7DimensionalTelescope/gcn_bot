@@ -171,84 +171,8 @@ from typing import Dict, Tuple, Any, Optional, Union, List
 from threading import Thread, Lock
 from datetime import datetime
 
-############################ Configuration ############################
-# Default configuration values
-# Connection settings
-CONNECTION_TIMEOUT = 300  # GCN server connection timeout in seconds
-
-# Slack configuration
-SLACK_TOKEN = "your_slack_bot_token"  # Replace with your Slack bot token
-SLACK_CHANNEL = "your_slack_channel"  # Replace with your Slack channel name
-SLACK_CHANNEL_TEST = "your_slack_channel"  # Replace with your Slack channel name (Optional)
-
-# GCN configuration
-GCN_ID = 'your_gcn_client_id'  # Replace with your GCN client ID
-GCN_SECRET = 'your_gcn_client_secret'  # Replace with your GCN client secret
-
-# Plotting configuration
-MIN_ALTITUDE = 30  # Minimum altitude for visibility plots
-MIN_MOON_SEP = 30  # Minimum moon separation for visibility plots
-
-# GCNNoticeHandler configuration
-TURN_ON_NOTICE = True  # Enable notice saving
-OUTPUT_NOTICE_CSV = 'gcn_notices.csv'  # CSV file path
-OUTPUT_ASCII = 'grb_targets.ascii'  # ASCII file path
-ASCII_MAX_EVENTS = 10  # Maximum events to store in the ASCII file
-
-# GCNToOEmailer configuration
-TURN_ON_TOO_EMAIL = False  # Enable email requests
-EMAIL_FROM = "your_email@example.com"  # Replace with your email address
-EMAIL_PASSWORD = "your_email_password"  # Replace with your email password
-TOO_CONFIG = {
-    'singleExposure': 100,       # Set up exposure time in seconds
-    'imageCount': 3,             # Set up number of images
-    'obsmode': 'Deep',           # Set up observation mode
-    'selectedFilters': ['r', 'i'], # Set up filters
-    'selectedTelNumber': 1,      # Set up number of telescopes
-    'abortObservation': 'Yes',   # Set up abort setting
-    'priority': 'High',          # Set up priority
-    'gain': 'High',              # Set up gain
-    'radius': '0',               # Set up radius
-    'binning': '1',              # Set up binning
-}
-
-# GCN Topics to monitor - add or remove topics as needed
-DISPLAY_TOPICS = [    
-    'gcn.classic.text.AMON_NU_EM_COINC',           # Combined IC+HAWC and ANTARES+Fermi                 | 4-8 alerts per year    | 7 h
-    'gcn.classic.text.ICECUBE_CASCADE',            # Hi-energy single neutrino cascade event direction  | 8   alerts per year    | 0.5-1 min
-    'gcn.classic.text.HAWC_BURST_MONITOR',         # HAWC alert of GRB-like events                      | 1   alert  per year    | 0.5-1 min
-    'gcn.classic.text.ICECUBE_ASTROTRACK_BRONZE',  # Hi-energy single neutrino directions               | 1.3 alert  per month   | 0.5-1 min
-    'gcn.classic.text.ICECUBE_ASTROTRACK_GOLD',    # Hi-energy single neutrino directions               | 1   alert  per month   | 0.5-1 min
-    
-    'gcn.classic.text.FERMI_GBM_GND_POS',          # Position Notice, Automated-Ground-calculated       | 1 alert per week       | 20-300 sec
-    # 'gcn.classic.text.FERMI_GBM_FIN_POS',          # Position Notice, Human-in-the-Loop                 | 1 alert per week       | 15 min
-    # 'gcn.classic.text.FERMI_LAT_POS_UPD',          # LAT burst-and/or-afterglow location, Updated       | < 1 alert per week     | 2–32 sec  # Not available
-    'gcn.classic.text.FERMI_LAT_OFFLINE',          # LAT location of a ground-found burst               | < 1 alert per week     | 8–12 h
-    
-    'gcn.classic.text.SWIFT_BAT_GRB_POS_ACK',      # First Position Notice, the BAT Position            | < 1 alert per week     | 13–30 sec
-    'gcn.classic.text.SWIFT_UVOT_POS',             # UVOT afterglow location                            | < 1 alert per week     | 1-3 h
-    'gcn.classic.text.SWIFT_XRT_POSITION',         # XRT afterglow location                             | < 1 alert per week     | 30–80 sec
-    
-    # JSON format topics
-    'gcn.notices.einstein_probe.wxt.alert'         # Einstein Probe WXT alerts                          | 2 alerts per week      | ~1 min
-]
-
-# Try to import config.py
-try:
-    from config import * # Make sure to create a config.py file based on config_template.py
-except ImportError:
-    print("Configuration file 'config.py' not found.")
-    print("Please create a config.py file based on config_template.py.")
-    sys.exit(1)
-
-# Global flags and variables
-running = True
-last_heartbeat = datetime.now()
-heartbeat_lock = Lock()
-last_connection_status = True  # True = connected, False = disconnected
-os.environ["NUMEXPR_MAX_THREADS"] = "4"
-
-# Too_Configure logging
+############################## Logging ############################
+# Configure logging
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
@@ -260,16 +184,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 logging.getLogger('kafka').setLevel(logging.ERROR)
 
-# Initialize Slack client
-slack_client = WebClient(token=SLACK_TOKEN)
-slack_channel = SLACK_CHANNEL
-
-# Initialize GCN consumer
-consumer = Consumer(
-    client_id=GCN_ID,
-    client_secret=GCN_SECRET
-)
-
+############################## Imports ############################
 # Try to import visibility_plotter
 try:
     from supy.supy.observer.visibility_plotter import VisibilityPlotter
@@ -283,13 +198,118 @@ except ImportError as e:
 # Import notice handler
 from gcn_notice_handler import GCNNoticeHandler
 
-# Create notice handler
-notice_handler = GCNNoticeHandler(
-    output_csv=OUTPUT_NOTICE_CSV,
-    output_ascii=OUTPUT_ASCII,
-    ascii_max_events=ASCII_MAX_EVENTS
+############################## Configuration ############################
+# Configuration class
+class Config:
+    """Configuration class with defaults and override capability."""
+    
+    # Default configuration values
+    CONNECTION_TIMEOUT = 300
+    SLACK_TOKEN = "your_slack_bot_token"
+    SLACK_CHANNEL = "your_slack_channel"
+    SLACK_CHANNEL_TEST = "your_slack_channel"
+    GCN_ID = 'your_gcn_client_id'
+    GCN_SECRET = 'your_gcn_client_secret'
+    MIN_ALTITUDE = 30
+    MIN_MOON_SEP = 30
+    TURN_ON_NOTICE = True
+    OUTPUT_CSV = 'gcn_notices.csv'
+    OUTPUT_ASCII = 'grb_targets.ascii'
+    ASCII_MAX_EVENTS = 10
+    TURN_ON_TOO_EMAIL = False
+    EMAIL_FROM = "your_email@example.com"
+    EMAIL_PASSWORD = "your_email_password"
+    TOO_CONFIG = {
+        'singleExposure': 100,
+        'imageCount': 3,
+        'obsmode': 'Deep',
+        'selectedFilters': ['r', 'i'],
+        'selectedTelNumber': 1,
+        'abortObservation': 'Yes',
+        'priority': 'High',
+        'gain': 'High',
+        'radius': '0',
+        'binning': '1',
+    }
+    DISPLAY_TOPICS = [    
+        'gcn.classic.text.AMON_NU_EM_COINC',
+        'gcn.classic.text.ICECUBE_CASCADE',
+        'gcn.classic.text.HAWC_BURST_MONITOR',
+        'gcn.classic.text.ICECUBE_ASTROTRACK_BRONZE',
+        'gcn.classic.text.ICECUBE_ASTROTRACK_GOLD',
+        'gcn.classic.text.FERMI_GBM_GND_POS',
+        'gcn.classic.text.FERMI_LAT_OFFLINE',
+        'gcn.classic.text.SWIFT_BAT_GRB_POS_ACK',
+        'gcn.classic.text.SWIFT_UVOT_POS',
+        'gcn.classic.text.SWIFT_XRT_POSITION',
+        'gcn.notices.einstein_probe.wxt.alert'
+    ]
+    
+    def __init__(self):
+        """Initialize config and try to load from config.py file."""
+        self._load_config_file()
+    
+    def _load_config_file(self):
+        """Load configuration from config.py file if it exists."""
+        try:
+            import config
+            
+            # Override defaults with values from config.py
+            for attr_name in dir(config):
+                if not attr_name.startswith('_'):  # Skip private attributes
+                    setattr(self, attr_name, getattr(config, attr_name))
+            
+            logger.info("Configuration loaded successfully from config.py")
+            
+        except ImportError:
+            logger.error("Configuration file 'config.py' not found.")
+            logger.error("Please create a config.py file based on config_template.py.")
+            sys.exit(1)
+        except Exception as e:
+            logger.error(f"Error loading configuration: {e}")
+            sys.exit(1)
+
+# Initialize global config object
+config = Config()
+
+# Configuration variables
+CONNECTION_TIMEOUT = config.CONNECTION_TIMEOUT
+MIN_ALTITUDE = config.MIN_ALTITUDE
+MIN_MOON_SEP = config.MIN_MOON_SEP
+TURN_ON_NOTICE = config.TURN_ON_NOTICE
+TURN_ON_TOO_EMAIL = config.TURN_ON_TOO_EMAIL
+EMAIL_FROM = config.EMAIL_FROM
+EMAIL_PASSWORD = config.EMAIL_PASSWORD
+TOO_CONFIG = config.TOO_CONFIG
+
+############################## Global Flags and Variables ############################
+# Global flags and variables
+running = True
+last_heartbeat = datetime.now()
+heartbeat_lock = Lock()
+last_connection_status = True  # True = connected, False = disconnected
+os.environ["NUMEXPR_MAX_THREADS"] = "4"
+
+############################## Initialize Clients ############################
+# Initialize Slack client
+slack_client = WebClient(token=config.SLACK_TOKEN)
+slack_channel = config.SLACK_CHANNEL
+slack_channel_test = config.SLACK_CHANNEL_TEST
+
+# Initialize GCN consumer
+consumer = Consumer(
+    client_id=config.GCN_ID,
+    client_secret=config.GCN_SECRET
 )
 
+# Initialize notice handler
+notice_handler = GCNNoticeHandler(
+    output_csv=config.OUTPUT_CSV,
+    output_ascii=config.OUTPUT_ASCII,
+    ascii_max_events=config.ASCII_MAX_EVENTS
+)
+
+############################## Initialize argument parser ############################
 # Add argument parser
 parser = argparse.ArgumentParser(description='GCN Alert Monitor')
 parser.add_argument('--test', action='store_true', help='Run a test with a GCN test message')
@@ -299,7 +319,7 @@ args = parser.parse_args()
 # Set TEST_SEND_TO_SLACK based on args
 TEST_SEND_TO_SLACK = args.send
 
-############################## Signal Handling ##############################
+############################## Signal Handling ############################
 def signal_handler(signum, frame):
     """Handle shutdown signals"""
     global running
@@ -310,9 +330,9 @@ def signal_handler(signum, frame):
 signal.signal(signal.SIGINT, signal_handler)
 signal.signal(signal.SIGTERM, signal_handler)
 
-############################## Facility and Topic Management ##############################
+############################## Facility and Topic Management ############################
 # Subscribe to all topics including heartbeat
-all_topics = DISPLAY_TOPICS + ['gcn.heartbeat']
+all_topics = config.DISPLAY_TOPICS + ['gcn.heartbeat']
 consumer.subscribe(all_topics)
 
 ############################## Message Formatting ##############################
@@ -1415,276 +1435,6 @@ def check_connection() -> None:
         
         # Wait before checking again
         time.sleep(60)  # Check connection every minute
-
-############################## Test Code ##############################
-def test_message():
-    """
-    Process a test message using a predefined test message.
-    Optionally sends to Slack based on TEST_SEND_TO_SLACK setting.
-    """
-    # Set test mode flag
-    test_mode = True
-    
-    # Use the provided Fermi-GBM Flight Position message
-    test_topic = "gcn.classic.text.FERMI_GBM_FLT_POS"
-    test_value = """TITLE:           GCN/FERMI NOTICE
-NOTICE_DATE:     Thu 27 Mar 25 22:22:04 UT
-NOTICE_TYPE:     Fermi-GBM Flight Position
-RECORD_NUM:      45
-TRIGGER_NUM:     764806900
-GRB_RA:          291.683d {+19h 26m 44s} (J2000),
-                 292.023d {+19h 28m 06s} (current),
-                 291.009d {+19h 24m 02s} (1950)
-GRB_DEC:          -7.317d {-07d 19' 00"} (J2000),
-                  -7.264d {-07d 15' 51"} (current),
-                  -7.418d {-07d 25' 04"} (1950)
-GRB_ERROR:       35.10 [deg radius, statistical plus systematic]
-GRB_INTEN:       195 [cnts/sec]
-DATA_SIGNIF:     2.80 [sigma]
-INTEG_TIME:      0.032 [sec]
-GRB_DATE:        20761 TJD;    86 DOY;   25/03/27
-GRB_TIME:        80495.26 SOD {22:21:35.26} UT
-GRB_PHI:          59.00 [deg]
-GRB_THETA:        70.00 [deg]
-DATA_TIME_SCALE: 0.0320 [sec]
-HARD_RATIO:      0.00
-LOC_ALGORITHM:   3 (version number of)
-MOST_LIKELY:     100%  Unreliable location
-2nd_MOST_LIKELY:   0%  n/a
-DETECTORS:       0,0,0, 0,1,1, 0,0,0, 0,0,0, 0,0,
-SUN_POSTN:         6.89d {+00h 27m 33s}   +2.98d {+02d 58' 33"}
-SUN_DIST:         75.40 [deg]   Sun_angle= 5.0 [hr] (West of Sun)
-MOON_POSTN:      347.85d {+23h 11m 24s}   -6.26d {-06d 15' 31"}
-MOON_DIST:        55.41 [deg]
-MOON_ILLUM:      3 [%]
-GAL_COORDS:       30.36,-11.16 [deg] galactic lon,lat of the burst (or transient)
-ECL_COORDS:      292.24, 14.46 [deg] ecliptic lon,lat of the burst (or transient)
-LC_URL:          http://heasarc.gsfc.nasa.gov/FTP/fermi/data/gbm/triggers/2025/bn250327932/quicklook/glg_lc_medres34_bn250327932.gif
-COMMENTS:        Fermi-GBM Flight-calculated Coordinates.  
-COMMENTS:        This trigger occurred at longitude,latitude = 95.42,-9.98 [deg].  
-COMMENTS:        The LC_URL file will not be created until ~15 min after the trigger.  
-"""
-    
-    logger.info("=== STARTING TEST: Processing test message ===")
-    
-    try:
-        # Create a mock message object that mimics what would come from Kafka
-        class MockMessage:
-            def __init__(self, topic, value):
-                self._topic = topic
-                self._value = value.encode('utf-8') if isinstance(value, str) else value
-                self._offset = 999  # Mock offset
-                
-            def topic(self):
-                return self._topic
-                
-            def value(self):
-                return self._value
-                
-            def offset(self):
-                return self._offset
-                
-            def error(self):
-                return None
-        
-        # Create mock message
-        test_message = MockMessage(test_topic, test_value)
-        
-        # Log message details
-        logger.info(f"Processing test message: topic={test_message.topic()}, offset={test_message.offset()}")
-        
-        # Process notice through handler
-        csv_status = ascii_status = None
-        notice_data = None
-        
-        if TURN_ON_NOTICE:
-            # Import notice handler
-            from gcn_notice_handler import GCNNoticeHandler
-            
-            # Create notice handler
-            notice_handler = GCNNoticeHandler(
-                output_csv=OUTPUT_NOTICE_CSV,
-                output_ascii=OUTPUT_ASCII,
-                ascii_max_events=ASCII_MAX_EVENTS
-            )
-            
-            # Parse alert data (only parse, don't save)
-            notice_data = notice_handler.parse_notice(test_message.value(), test_message.topic())
-            
-            # Only check if parsing was successful
-            if notice_data:
-                logger.info(f"Successfully parsed notice: {notice_data}")
-                csv_status = True  # Just for UI, not actually saved
-                ascii_status = True  # Just for UI, not actually saved
-                logger.info("TEST MODE: Parsing successful (not saved to files)")
-            else:
-                logger.error("Failed to parse test notice")
-                csv_status = False
-                ascii_status = False
-        
-        # Format notice message for Slack with custom facility name for test
-        result = format_message_for_slack(
-            test_message.topic(), 
-            test_message.value(), 
-            csv_status, 
-            ascii_status,
-            test_mode=test_mode,
-            custom_facility=f"🧪TEST Message",  # Add TEST to the facility name
-            notice_data=notice_data  # Pass notice_data here
-        )
-        
-        # Handle the new tuple return format
-        if result is None:
-            logger.warning("Message format returned None (likely filtered as test message)")
-            return
-            
-        slack_message, lc_url = result
-        
-        if slack_message is None:
-            logger.warning("Message content is None (likely filtered as test message)")
-            return
-        
-        # Handle visibility plot generation
-        plot_path = None
-        visibility_info = None
-        visibility_blocks = []
-        
-        # Create visibility plot and get information
-        if visibility_available:
-            ra = dec = None
-            
-            # Try to get coordinates from notice_data
-            if notice_data and 'RA' in notice_data and 'DEC' in notice_data:
-                ra = notice_data.get('RA')
-                dec = notice_data.get('DEC')
-                logger.info(f"Got coordinates from notice_data: RA={ra}, Dec={dec}")
-            else:
-                # Try backup method
-                ra, dec = _process_coordinates(test_message.value(), test_message.topic())
-                if ra is not None and dec is not None:
-                    logger.info(f"Got coordinates from _process_coordinates: RA={ra}, Dec={dec}")
-                else:
-                    logger.warning("Could not extract coordinates from message")
-            
-            if ra is not None and dec is not None:
-                try:
-                    # Create visibility plot and get information
-                    result = plotter.create_visibility_plot(
-                        ra=ra,
-                        dec=dec,
-                        grb_name=notice_data.get('Name') if notice_data else "TEST-GRB",
-                        test_mode=test_mode  # Always save test plots to separate directory
-                    )
-                    
-                    # Check the result format and unpack accordingly
-                    if isinstance(result, tuple) and len(result) == 2:
-                        plot_path, visibility_info = result
-                        
-                        if visibility_info:
-                            # Format visibility information as blocks
-                            visibility_text = plotter.format_visibility_message(visibility_info)
-                            
-                            # Create visibility blocks
-                            visibility_blocks = [
-                                {
-                                    "type": "divider"
-                                },
-                                {
-                                    "type": "header",
-                                    "text": {
-                                        "type": "plain_text",
-                                        "text": "Visibility Information"
-                                    }
-                                },
-                                {
-                                    "type": "section",
-                                    "text": {
-                                        "type": "mrkdwn",
-                                        "text": visibility_text
-                                    }
-                                }
-                            ]
-                            
-                            logger.info("Successfully formatted visibility information")
-                    else:
-                        logger.warning(f"Unexpected result format from create_visibility_plot: {result}")
-                except Exception as e:
-                    logger.error(f"Error creating visibility plot: {e}", exc_info=True)
-                    visibility_blocks = [
-                        {
-                            "type": "divider"
-                        },
-                        {
-                            "type": "section",
-                            "text": {
-                                "type": "mrkdwn",
-                                "text": f"*Visibility Analysis Error*\nCould not analyze visibility: {str(e)}"
-                            }
-                        }
-                    ]
-        
-        # Combine blocks for the main message
-        message_blocks = slack_message.get('blocks', []) if isinstance(slack_message, dict) else []
-        message_blocks = message_blocks + visibility_blocks
-        
-        # Send to Slack if configured
-        if TEST_SEND_TO_SLACK:
-            try:
-                # Send main message
-                main_response = slack_client.chat_postMessage(
-                    channel=SLACK_CHANNEL_TEST if SLACK_CHANNEL_TEST else SLACK_CHANNEL,
-                    blocks=message_blocks,
-                    text="GCN Alert Test Message",  # Add a text field for best practices
-                    unfurl_links=False,
-                    unfurl_media=False
-                )
-                
-                logger.info("Test message sent to Slack")
-                
-                # If we got a valid response with thread_ts
-                if 'ts' in main_response:
-                    thread_ts = main_response['ts']
-                    
-                    # Send LC URL as a clickable link in the thread if available
-                    if lc_url:
-                        try:
-                            # Create a message with a clickable link instead of embedding the image
-                            lc_message = f"*Light Curve Link for Test Message*\n<{lc_url}|Click here to view Light Curve>\n_(Note: Image may take a few minutes to generate)_"
-                            
-                            # Send as a message in the thread
-                            lc_response = slack_client.chat_postMessage(
-                                channel=SLACK_CHANNEL_TEST if SLACK_CHANNEL_TEST else SLACK_CHANNEL,
-                                thread_ts=thread_ts,
-                                text=lc_message,
-                                unfurl_links=False  # Prevent automatic unfurling of the link
-                            )
-                            
-                            logger.info(f"Sent light curve link to thread")
-                            
-                        except Exception as e:
-                            logger.error(f"Error sending LC link to thread: {e}")
-                    
-                    # Send visibility plot as thread reply if available
-                    if plot_path and os.path.exists(plot_path):
-                        plot_response = slack_client.files_upload_v2(
-                            file_uploads=[{"file": plot_path}],
-                            channel=SLACK_CHANNEL_TEST if SLACK_CHANNEL_TEST else SLACK_CHANNEL,
-                            thread_ts=thread_ts,
-                            title=f"TEST: Visibility Plot"
-                        )
-                        logger.info("Test plot sent as thread reply to Slack")
-            except Exception as e:
-                logger.error(f"Error sending test message to Slack: {e}", exc_info=True)
-        else:
-            if plot_path:
-                logger.info(f"TEST MODE: Would send message with plot as thread reply to Slack")
-            else:
-                logger.info(f"TEST MODE: Would send message to Slack")
-        
-        logger.info("=== TEST COMPLETE: Successfully processed test message ===")
-        
-    except Exception as e:
-        logger.error(f"Error processing test message: {e}", exc_info=True)
 
 ############################## PROCESS ##############################
 def _compare_event_data(old_data: Dict[str, Any], new_data: Dict[str, Any]) -> Dict[str, Any]:
