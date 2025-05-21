@@ -994,25 +994,24 @@ class GCNCircularHandler:
     def _update_ascii_database(self, processed_data: Dict[str, Any]) -> None:
         """
         Update the ASCII database with processed circular data.
+        Only updates fields that should be updated from circulars while preserving notice data.
         """
         # Skip if essential data is missing
         if not processed_data.get('event_name') or not processed_data.get('facility') or not processed_data.get('trigger_num'):
-            logger.warning(f"Skipping ASCII update due to missing essential data: event_name={processed_data.get('event_name')}, facility={processed_data.get('facility')}, trigger_num={processed_data.get('trigger_num')}")
+            logger.warning(f"Skipping ASCII update due to missing essential data")
             return
                     
         # Skip if it's a false trigger
         if processed_data.get('false_trigger'):
             logger.info(f"Skipping ASCII update for false trigger: {processed_data.get('event_name')}")
-            # Remove this event from ASCII if it exists
             self._remove_false_trigger_from_ascii(processed_data)
             return
                     
         with self.file_lock:
             try:
-                # Create directory if it doesn't exist
+                # Load existing ASCII file
                 os.makedirs(os.path.dirname(os.path.abspath(self.output_ascii)), exist_ok=True)
                 
-                # Read the file as raw lines to handle different GCN_ID formats
                 lines = []
                 header = None
                 if os.path.exists(self.output_ascii):
@@ -1026,15 +1025,14 @@ class GCNCircularHandler:
                     header = self.ascii_columns
                     logger.info(f"Created new ASCII file with columns: {header}")
                 
-                # Parse the lines into a DataFrame manually
+                # Parse lines into DataFrame
                 data = []
                 for line in lines:
-                    # Handle quoted strings properly
                     fields = []
                     in_quotes = False
                     current_field = ""
                     
-                    for char in line + " ":  # Add space at end to handle last field
+                    for char in line + " ":
                         if char == '"':
                             in_quotes = not in_quotes
                             current_field += char
@@ -1045,86 +1043,132 @@ class GCNCircularHandler:
                         else:
                             current_field += char
                     
-                    # Ensure we have exactly the right number of columns
                     if len(fields) == len(header):
                         data.append(dict(zip(header, fields)))
                     else:
                         logger.warning(f"Skipping line with incorrect number of fields: {line}")
                 
-                # Convert to DataFrame
                 df = pd.DataFrame(data) if data else pd.DataFrame(columns=header)
                 
-                # Get current circular info
+                # Get circular info
                 facility = processed_data['facility']
                 trigger_num = processed_data['trigger_num']
                 circular_id = processed_data.get('circular_id')
-                
-                # Get normalized facility name for matching
                 normalized_facility = self._normalize_facility_name(facility)
                 
-                # Check if this event is already in database by matching normalized facility and trigger_num
+                # Find existing entry by normalized facility and trigger number
                 existing_idx = None
-                
                 for idx, row in df.iterrows():
                     row_facility = row.get('Facility', '')
                     row_trigger = row.get('Trigger_num', '')
-                    
-                    # Normalize the row's facility
                     normalized_row_facility = self._normalize_facility_name(row_facility)
                     
-                    # Check if normalized facilities and trigger numbers match
                     if (normalized_row_facility == normalized_facility and 
                         str(row_trigger) == str(trigger_num)):
                         existing_idx = idx
                         break
                 
-                # Now proceed with update using the circular ID as GCN_ID
                 if existing_idx is not None:
-                    # Update existing entry
-                    logger.info(f"Found existing entry for normalized facility={normalized_facility}, trigger={trigger_num} at index {idx}")
+                    # UPDATE EXISTING ENTRY
+                    logger.info(f"Found existing entry for {normalized_facility} trigger {trigger_num} at index {existing_idx}")
                     
-                    # Always update GCN_ID to use the circular ID if available
-                    if circular_id:
-                        df.at[idx, 'GCN_ID'] = str(circular_id)
-                        logger.info(f"Updated GCN_ID to circular ID: {circular_id}")
+                    # Fields to UPDATE from circular data (these should be overwritten)
+                    update_fields = {
+                        'GCN_ID': str(circular_id) if circular_id else df.at[existing_idx, 'GCN_ID'],
+                        'Name': processed_data['event_name'],  # Update with official name from circular
+                        'Redshift': processed_data['redshift'] if processed_data['redshift'] is not None else df.at[existing_idx, 'Redshift'],
+                        'Host_info': processed_data['host_info'] if processed_data['host_info'] else df.at[existing_idx, 'Host_info']
+                    }
                     
-                    # Rest of the update logic...
-                    # [continue with your existing update logic]
+                    # Conditionally update coordinates only if they're better (more precise)
+                    if (processed_data['ra'] is not None and processed_data['dec'] is not None and 
+                        processed_data['error'] is not None):
+                        
+                        # Check if new coordinates are more precise (smaller error)
+                        existing_error = df.at[existing_idx, 'Error']
+                        new_error = self._convert_error_to_degrees(processed_data['error'], processed_data['error_unit'])
+                        
+                        try:
+                            existing_error_float = float(existing_error) if existing_error else float('inf')
+                            if new_error < existing_error_float:
+                                update_fields.update({
+                                    'RA': processed_data['ra'],
+                                    'DEC': processed_data['dec'],
+                                    'Error': new_error
+                                })
+                                logger.info(f"Updating coordinates with more precise values (error: {existing_error_float:.4f} → {new_error:.4f})")
+                            else:
+                                logger.info(f"Keeping existing coordinates (more precise: {existing_error_float:.4f} vs {new_error:.4f})")
+                        except (ValueError, TypeError):
+                            # If we can't compare errors, update anyway
+                            update_fields.update({
+                                'RA': processed_data['ra'],
+                                'DEC': processed_data['dec'], 
+                                'Error': new_error
+                            })
+                            logger.info("Updating coordinates (error comparison failed)")
+                    
+                    # Fields to PRESERVE from existing entry (these should NOT be overwritten)
+                    preserve_fields = [
+                        'Discovery_UTC',    # Keep original discovery time from notice
+                        'Facility',         # Keep original facility (might be more specific instrument)
+                        'Trigger_num',      # Keep original trigger number
+                        'Notice_date',      # Keep original notice date
+                        'thread_ts'         # Keep Slack thread timestamp if it exists
+                    ]
+                    
+                    # Apply updates while preserving specified fields
+                    for field, new_value in update_fields.items():
+                        if field in df.columns:
+                            old_value = df.at[existing_idx, field]
+                            df.at[existing_idx, field] = new_value
+                            if str(old_value) != str(new_value):
+                                logger.info(f"Updated {field}: '{old_value}' → '{new_value}'")
+                    
+                    # Log preserved fields
+                    for field in preserve_fields:
+                        if field in df.columns:
+                            preserved_value = df.at[existing_idx, field]
+                            logger.debug(f"Preserved {field}: '{preserved_value}'")
+                    
+                    logger.info(f"Successfully updated existing ASCII entry for {processed_data['event_name']}")
+                    
                 else:
-                    # Add new entry if we have coordinates
-                    if processed_data['ra'] is not None and processed_data['dec'] is not None and processed_data['error'] is not None:
+                    # ADD NEW ENTRY
+                    if (processed_data['ra'] is not None and processed_data['dec'] is not None and 
+                        processed_data['error'] is not None):
+                        
                         error_in_degrees = self._convert_error_to_degrees(processed_data['error'], processed_data['error_unit'])
                         
-                        # Use circular_id directly as GCN_ID
                         new_row = {
                             'GCN_ID': str(circular_id) if circular_id else f"GCN_{facility}_{trigger_num}",
-                            'Name': processed_data["event_name"],  # No quotes here - they'll be added during file writing
+                            'Name': processed_data["event_name"],
                             'RA': processed_data['ra'],
                             'DEC': processed_data['dec'],
                             'Error': error_in_degrees,
-                            'Discovery_UTC': datetime.fromtimestamp(processed_data["created_on"]/1000).strftime("%Y-%m-%d %H:%M:%S"),  # No quotes
+                            'Discovery_UTC': datetime.fromtimestamp(processed_data["created_on"]/1000).strftime("%Y-%m-%d %H:%M:%S"),
                             'Facility': processed_data['facility'],
                             'Trigger_num': processed_data['trigger_num'],
-                            'Notice_date': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),  # No quotes
+                            'Notice_date': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                             'Redshift': processed_data['redshift'] if processed_data['redshift'] is not None else '',
-                            'Host_info': processed_data["host_info"] if processed_data['host_info'] else ''  # No quotes
+                            'Host_info': processed_data["host_info"] if processed_data['host_info'] else '',
+                            'thread_ts': ''  # Empty for new entries from circulars
                         }
                         
-                        # Add to DataFrame
                         df = pd.concat([df, pd.DataFrame([new_row])], ignore_index=True)
-                        logger.info(f"Added new entry to ASCII database: {new_row['GCN_ID']} with RA={processed_data['ra']}, DEC={processed_data['dec']}")
+                        logger.info(f"Added new entry to ASCII database: {new_row['GCN_ID']}")
                 
-                # Save the DataFrame to the ASCII file with proper spacing and quoting
+                # Save updated DataFrame
                 with open(self.output_ascii, 'w') as f:
                     # Write header
                     f.write(" ".join(header) + "\n")
                     
-                    # Write each row manually to ensure proper formatting
+                    # Write each row with proper formatting
                     for _, row in df.iterrows():
                         row_values = []
                         for col in header:
                             val = row.get(col, '')
-                            # Ensure proper quoting for strings with spaces
+                            # Quote fields that typically contain spaces
                             if isinstance(val, str) and (' ' in val or col in ['Name', 'Discovery_UTC', 'Notice_date', 'Host_info']):
                                 if not (val.startswith('"') and val.endswith('"')):
                                     val = f'"{val}"'
@@ -1132,8 +1176,8 @@ class GCNCircularHandler:
                         
                         f.write(" ".join(row_values) + "\n")
                     
-                logger.info(f"ASCII database updated for event {processed_data['event_name']} - Saved to {self.output_ascii}")
-                    
+                logger.info(f"ASCII database saved successfully")
+                        
             except Exception as e:
                 logger.error(f"Error updating ASCII database: {e}", exc_info=True)
     
