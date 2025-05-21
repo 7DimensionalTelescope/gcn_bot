@@ -272,12 +272,12 @@ consumer = Consumer(
 
 # Try to import visibility_plotter
 try:
-    from supy.observer.visibility_plotter import VisibilityPlotter
+    from supy.supy.observer.visibility_plotter import VisibilityPlotter
     # Initialize the plotter
     plotter = VisibilityPlotter(logger=logger)
     visibility_available = True
-except ImportError:
-    logger.warning("visibility_plotter module not available. Visibility plots will be disabled.")
+except ImportError as e:
+    logger.warning(f"visibility_plotter module not available. Visibility plots will be disabled. Error: {e}")
     visibility_available = False
 
 # Import notice handler
