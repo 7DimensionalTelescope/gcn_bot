@@ -207,7 +207,6 @@ class Config:
     CONNECTION_TIMEOUT = 300
     SLACK_TOKEN = "your_slack_bot_token"
     SLACK_CHANNEL = "your_slack_channel"
-    SLACK_CHANNEL_TEST = "your_slack_channel"
     GCN_ID = 'your_gcn_client_id'
     GCN_SECRET = 'your_gcn_client_secret'
     MIN_ALTITUDE = 30
@@ -281,6 +280,14 @@ TURN_ON_TOO_EMAIL = config.TURN_ON_TOO_EMAIL
 EMAIL_FROM = config.EMAIL_FROM
 EMAIL_PASSWORD = config.EMAIL_PASSWORD
 TOO_CONFIG = config.TOO_CONFIG
+SLACK_TOKEN = config.SLACK_TOKEN
+SLACK_CHANNEL = config.SLACK_CHANNEL
+GCN_ID = config.GCN_ID
+GCN_SECRET = config.GCN_SECRET
+OUTPUT_CSV = config.OUTPUT_CSV
+OUTPUT_ASCII = config.OUTPUT_ASCII
+ASCII_MAX_EVENTS = config.ASCII_MAX_EVENTS
+DISPLAY_TOPICS = config.DISPLAY_TOPICS
 
 ############################## Global Flags and Variables ############################
 # Global flags and variables
@@ -292,21 +299,19 @@ os.environ["NUMEXPR_MAX_THREADS"] = "4"
 
 ############################## Initialize Clients ############################
 # Initialize Slack client
-slack_client = WebClient(token=config.SLACK_TOKEN)
-slack_channel = config.SLACK_CHANNEL
-slack_channel_test = config.SLACK_CHANNEL_TEST
+SLACK_CLIENT = WebClient(token=SLACK_TOKEN)
 
 # Initialize GCN consumer
 consumer = Consumer(
-    client_id=config.GCN_ID,
-    client_secret=config.GCN_SECRET
+    client_id=GCN_ID,
+    client_secret=GCN_SECRET
 )
 
 # Initialize notice handler
 notice_handler = GCNNoticeHandler(
-    output_csv=config.OUTPUT_CSV,
-    output_ascii=config.OUTPUT_ASCII,
-    ascii_max_events=config.ASCII_MAX_EVENTS
+    output_csv=OUTPUT_CSV,
+    output_ascii=OUTPUT_ASCII,
+    ascii_max_events=ASCII_MAX_EVENTS
 )
 
 ############################## Initialize argument parser ############################
@@ -332,7 +337,7 @@ signal.signal(signal.SIGTERM, signal_handler)
 
 ############################## Facility and Topic Management ############################
 # Subscribe to all topics including heartbeat
-all_topics = config.DISPLAY_TOPICS + ['gcn.heartbeat']
+all_topics = DISPLAY_TOPICS + ['gcn.heartbeat']
 consumer.subscribe(all_topics)
 
 ############################## Message Formatting ##############################
@@ -1349,8 +1354,8 @@ def check_connection() -> None:
                             
                             # Try to send slack notification about connection loss
                             try:
-                                slack_client.chat_postMessage(
-                                    channel=slack_channel,
+                                SLACK_CHANNEL.chat_postMessage(
+                                    channel=SLACK_CHANNEL,
                                     blocks=message["blocks"]
                                 )
                             except Exception as e:
@@ -1379,8 +1384,8 @@ def check_connection() -> None:
                             
                             # Try to send slack notification about connection restoration
                             try:
-                                slack_client.chat_postMessage(
-                                    channel=slack_channel,
+                                SLACK_CHANNEL.chat_postMessage(
+                                    channel=SLACK_CHANNEL,
                                     blocks=message["blocks"]
                                 )
                             except Exception as e:
@@ -1860,7 +1865,7 @@ def main():
     # Try to authenticate with Slack
     try:
         # Test Slack token by making a simple API call
-        test_response = slack_client.api_test()
+        test_response = SLACK_CHANNEL.api_test()
         if not test_response["ok"]:
             logger.error(f"Slack authentication failed: {test_response.get('error', 'Unknown error')}")
             logger.warning("Continuing without Slack notifications")
@@ -1888,8 +1893,8 @@ def main():
                         
                         # Add error notification to Slack when Consumer error
                         try:
-                            slack_client.chat_postMessage(
-                                channel=slack_channel,
+                            SLACK_CHANNEL.chat_postMessage(
+                                channel=SLACK_CHANNEL,
                                 blocks=[
                                     {
                                         "type": "header",
@@ -1926,7 +1931,7 @@ def main():
                     
                     # Process notice and send message
                     success, response = process_notice_and_send_message(
-                        topic, value, slack_client, slack_channel
+                        topic, value, SLACK_CHANNEL, SLACK_CHANNEL
                     )
                     
                     if success:
