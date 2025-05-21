@@ -179,6 +179,7 @@ config.py
 
 # Image
 *.png
+test_plots/
 
 # Old folder
 old/
