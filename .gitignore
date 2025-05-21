@@ -183,3 +183,6 @@ test_plots/
 
 # Old folder
 old/
+
+# csv
+*.csv
