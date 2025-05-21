@@ -1590,6 +1590,115 @@ def _format_thread_message(differences: Dict[str, Any], notice_data: Dict[str, A
         logger.error(f"Error formatting thread message: {e}")
         return f"🔄 **UPDATE: {notice_data.get('Facility', 'Unknown')}**\n> - ℹ️ **Status:** Updated information received"
 
+def _evaluate_too_criteria(notice_data: Dict[str, Any], visibility_info: Optional[Dict[str, Any]]) -> Tuple[bool, str]:
+    """
+    Evaluate whether a ToO request should be sent based on specific criteria.
+    
+    Args:
+        notice_data: Parsed notice data
+        visibility_info: Visibility analysis information
+        
+    Returns:
+        Tuple[bool, str]: (should_send, reason)
+    """
+    if not notice_data:
+        return False, "No notice data available"
+    
+    facility = notice_data.get('Facility', '')
+    target_name = notice_data.get('Name', 'Unknown Target')
+    
+    # Criteria 1: IceCube neutrino events
+    icecube_facilities = ['AMON', 'IceCubeCASCADE', 'HAWC', 'IceCubeBRONZE', 'IceCubeGOLD']
+    is_neutrino_event = any(ice_fac in facility for ice_fac in icecube_facilities)
+    
+    if is_neutrino_event:
+        logger.info(f"ToO Criteria Met - Neutrino Event: {facility}")
+        
+        # Return specific facility name as reason
+        if 'AMON' in facility:
+            return True, "AMON"
+        elif 'CASCADE' in facility:
+            return True, "IceCube CASCADE"
+        elif 'HAWC' in facility:
+            return True, "HAWC"
+        elif 'GOLD' in facility:
+            return True, "IceCube GOLD"
+        elif 'BRONZE' in facility:
+            return True, "IceCube BRONZE"
+        else:
+            return True, facility  # Fallback to full facility name
+    
+    # Criteria 2: Currently observable targets
+    if visibility_info and visibility_info.get('status') == 'observable_now':
+        remaining_hours = visibility_info.get('remaining_hours', 0)
+        current_altitude = visibility_info.get('current_altitude', 0)
+        
+        # Only send ToO if we have sufficient time and good altitude
+        if remaining_hours >= 1.0 and current_altitude >= 35:
+            logger.info(f"ToO Criteria Met - Currently Observable: {target_name}")
+            return True, "Currently Observable"
+        else:
+            logger.debug(f"Target observable but limited time/altitude (alt={current_altitude:.1f}°, {remaining_hours:.1f}h remaining)")
+            return False, f"Limited time/altitude (alt={current_altitude:.1f}°, {remaining_hours:.1f}h remaining)"
+    
+    # Default: No criteria met
+    logger.debug(f"No ToO criteria met for {facility} event")
+    return False, f"No ToO criteria met for {facility} event"
+
+
+def _send_too_email_if_criteria_met(notice_data: Dict[str, Any], visibility_info: Optional[Dict[str, Any]]) -> None:
+    """
+    Send ToO email if specific criteria are met.
+    
+    Args:
+        notice_data: Parsed notice data
+        visibility_info: Visibility analysis information
+    """
+    if not TURN_ON_TOO_EMAIL:
+        return
+        
+    # Evaluate ToO criteria
+    should_send, reason = _evaluate_too_criteria(notice_data, visibility_info)
+    
+    if not should_send:
+        logger.debug(f"ToO not sent: {reason}")
+        return
+        
+    try:
+        from gcn_too_emailer import GCNToOEmailer
+        
+        # Initialize emailer
+        emailer = GCNToOEmailer(
+            email_from=EMAIL_FROM,
+            email_to=["7dt.observation.alert@gmail.com"],
+            email_password=EMAIL_PASSWORD,
+            min_altitude=MIN_ALTITUDE,
+            min_moon_sep=MIN_MOON_SEP
+        )
+        
+        # Use base ToO config and add the specific reason
+        custom_too_config = TOO_CONFIG.copy()
+        custom_too_config['additional_comments'] = f"ToO Reason: {reason}"
+        
+        # For neutrino events, make them high priority and abort current observations
+        neutrino_reasons = ['AMON', 'IceCube CASCADE', 'HAWC', 'IceCube GOLD', 'IceCube BRONZE']
+        if reason in neutrino_reasons:
+            custom_too_config.update({
+                'priority': 'HIGH',
+                'abortObservation': 'Yes'
+            })
+        
+        # Send ToO request
+        email_sent = emailer.process_notice(notice_data, custom_too_config, visibility_info)
+        
+        if email_sent:
+            logger.info(f"ToO email sent for {notice_data.get('Name', 'target')} - Reason: {reason}")
+        else:
+            logger.warning(f"ToO email failed to send for {notice_data.get('Name', 'target')} - Reason: {reason}")
+            
+    except Exception as e:
+        logger.error(f"Error sending ToO email: {e}")
+
 def process_notice_and_send_message(topic, value, slack_client, slack_channel, is_test=False):
     """
     Process a GCN notice and send to Slack with visibility plot.
@@ -1705,20 +1814,8 @@ def process_notice_and_send_message(topic, value, slack_client, slack_channel, i
                             except Exception as plot_error:
                                 logger.error(f"Error uploading plot to thread: {plot_error}")
                         
-                        # Send ToO email if enabled and target becomes observable
-                        if (TURN_ON_TOO_EMAIL and visibility_info and 
-                            visibility_info.get('status') in ['observable_now', 'observable_later']):
-                            try:
-                                from gcn_too_emailer import GCNToOEmailer
-                                emailer = GCNToOEmailer(
-                                    email_from=EMAIL_FROM,
-                                    email_to=["7dt.observation.alert@gmail.com"],
-                                    email_password=EMAIL_PASSWORD
-                                )
-                                email_sent = emailer.process_notice(notice_data, TOO_CONFIG, visibility_info)
-                                logger.info(f"ToO email request sent: {email_sent}")
-                            except Exception as e:
-                                logger.error(f"Error sending ToO email: {e}")
+                        # Send ToO email if criteria are met
+                        _send_too_email_if_criteria_met(notice_data, visibility_info)
                                 
                     except Exception as e:
                         logger.error(f"Error sending thread update: {e}")
@@ -1817,20 +1914,8 @@ def process_notice_and_send_message(topic, value, slack_client, slack_channel, i
                             except Exception as e:
                                 logger.error(f"Error uploading plot: {e}")
                         
-                        # Send ToO email if enabled and target is observable
-                        if (TURN_ON_TOO_EMAIL and visibility_info and 
-                            visibility_info.get('status') in ['observable_now', 'observable_later']):
-                            try:
-                                from gcn_too_emailer import GCNToOEmailer
-                                emailer = GCNToOEmailer(
-                                    email_from=EMAIL_FROM,
-                                    email_to=["7dt.observation.alert@gmail.com"],
-                                    email_password=EMAIL_PASSWORD
-                                )
-                                email_sent = emailer.process_notice(notice_data, TOO_CONFIG, visibility_info)
-                                logger.info(f"ToO email request sent: {email_sent}")
-                            except Exception as e:
-                                logger.error(f"Error sending ToO email: {e}")
+                        # Send ToO email if criteria are met
+                        _send_too_email_if_criteria_met(notice_data, visibility_info)
                         
                         return True, "New message sent successfully"
                         
@@ -1938,11 +2023,6 @@ def main():
                         logger.info(f"Successfully processed notice from {topic}")
                     else:
                         logger.warning(f"Issue processing notice from {topic}: {response}")
-                    
-                    # Handle ToO emailing separately (if enabled)
-                    if TURN_ON_TOO_EMAIL:
-                        # [Keep your existing ToO email code here]
-                        pass
                     
             except Exception as e:
                 logger.error("Main loop error: %s", e)
