@@ -184,5 +184,6 @@ test_plots/
 # Old folder
 old/
 
-# csv
+# results
 *.csv
+*.ascii

@@ -589,7 +589,7 @@ def _filter_notice_text(text, topic):
         
         # Analysis fields
         'ENERGY:', 'SIGNALNESS:', 'FAR:', 'COINC_PAIR:', 'PVALUE:',
-        'SIGNIFICANCE:', 'GRB_INTEN:', 'GRB_MAG:', 'GRB_SIGNIF:', 'DATA_SIGNIF'
+        'SIGNIFICANCE:', 'GRB_INTEN:', 'GRB_MAG:', 'GRB_SIGNIF:', 'DATA_SIGNIF',
         'IMAGE_SNR:', 'SNR:', 'CHARGE:', 'NET_COUNT_RATE:',
         'DELTA_T:', 'SIGMA_T:', 'SIGNAL_TRACKNESS:',
         
