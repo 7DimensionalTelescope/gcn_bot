@@ -299,7 +299,7 @@ os.environ["NUMEXPR_MAX_THREADS"] = "4"
 
 ############################## Initialize Clients ############################
 # Initialize Slack client
-SLACK_CLIENT = WebClient(token=SLACK_TOKEN)
+slack_client = WebClient(token=SLACK_TOKEN)
 
 # Initialize GCN consumer
 consumer = Consumer(
@@ -1354,7 +1354,7 @@ def check_connection() -> None:
                             
                             # Try to send slack notification about connection loss
                             try:
-                                SLACK_CLIENT.chat_postMessage(
+                                slack_client.chat_postMessage(
                                     channel=SLACK_CHANNEL,
                                     blocks=message["blocks"]
                                 )
@@ -1384,7 +1384,7 @@ def check_connection() -> None:
                             
                             # Try to send slack notification about connection restoration
                             try:
-                                SLACK_CLIENT.chat_postMessage(
+                                slack_client.chat_postMessage(
                                     channel=SLACK_CHANNEL,
                                     blocks=message["blocks"]
                                 )
@@ -1950,7 +1950,7 @@ def main():
     # Try to authenticate with Slack
     try:
         # Test Slack token by making a simple API call
-        test_response = SLACK_CLIENT.api_test()
+        test_response = slack_client.api_test()
         if not test_response["ok"]:
             logger.error(f"Slack authentication failed: {test_response.get('error', 'Unknown error')}")
             logger.warning("Continuing without Slack notifications")
@@ -1978,7 +1978,7 @@ def main():
                         
                         # Add error notification to Slack when Consumer error
                         try:
-                            SLACK_CLIENT.chat_postMessage(
+                            slack_client.chat_postMessage(
                                 channel=SLACK_CHANNEL,
                                 blocks=[
                                     {
@@ -2016,7 +2016,7 @@ def main():
                     
                     # Process notice and send message
                     success, response = process_notice_and_send_message(
-                        topic, value, SLACK_CLIENT, SLACK_CHANNEL
+                        topic, value, slack_client, SLACK_CHANNEL
                     )
                     
                     if success:
