@@ -1354,7 +1354,7 @@ def check_connection() -> None:
                             
                             # Try to send slack notification about connection loss
                             try:
-                                SLACK_CHANNEL.chat_postMessage(
+                                SLACK_CLIENT.chat_postMessage(
                                     channel=SLACK_CHANNEL,
                                     blocks=message["blocks"]
                                 )
@@ -1384,7 +1384,7 @@ def check_connection() -> None:
                             
                             # Try to send slack notification about connection restoration
                             try:
-                                SLACK_CHANNEL.chat_postMessage(
+                                SLACK_CLIENT.chat_postMessage(
                                     channel=SLACK_CHANNEL,
                                     blocks=message["blocks"]
                                 )
@@ -1978,7 +1978,7 @@ def main():
                         
                         # Add error notification to Slack when Consumer error
                         try:
-                            SLACK_CHANNEL.chat_postMessage(
+                            SLACK_CLIENT.chat_postMessage(
                                 channel=SLACK_CHANNEL,
                                 blocks=[
                                     {
@@ -2016,7 +2016,7 @@ def main():
                     
                     # Process notice and send message
                     success, response = process_notice_and_send_message(
-                        topic, value, SLACK_CHANNEL, SLACK_CHANNEL
+                        topic, value, SLACK_CLIENT, SLACK_CHANNEL
                     )
                     
                     if success:
