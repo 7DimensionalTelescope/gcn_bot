@@ -1950,7 +1950,7 @@ def main():
     # Try to authenticate with Slack
     try:
         # Test Slack token by making a simple API call
-        test_response = SLACK_CHANNEL.api_test()
+        test_response = SLACK_CLIENT.api_test()
         if not test_response["ok"]:
             logger.error(f"Slack authentication failed: {test_response.get('error', 'Unknown error')}")
             logger.warning("Continuing without Slack notifications")
