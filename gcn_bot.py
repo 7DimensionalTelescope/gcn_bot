@@ -793,7 +793,7 @@ def format_message_for_slack(
         topic: The topic of the message
         value: The value of the message
         csv_status: The status of saving the message to CSV
-        ascii_status: The status of saving the message to ASCII text file
+        ascii_status: The status of saving the message to ASCII text file (None for new events)
         visibility_status: The status of generating visibility plot
         test_mode: Whether the function is being called in test mode
         custom_facility: Override the facility name detection with a custom name
@@ -892,6 +892,8 @@ def format_message_for_slack(
         if csv_status is not None:
             csv_status_icon = "✅" if csv_status else "❌"
             status_lines.append(f"{csv_status_icon} CSV Database: {'Parsed' if csv_status and test_mode else 'Saved' if csv_status else 'Failed'}")
+        
+        # Only show ASCII status if it's not None (for updates, not new events)
         if ascii_status is not None:
             ascii_status_icon = "✅" if ascii_status else "❌"
             status_lines.append(f"{ascii_status_icon} ASCII Database: {'Parsed' if ascii_status and test_mode else 'Saved' if ascii_status else 'Failed'}")
@@ -1015,10 +1017,30 @@ def _standardize_time_format(time_str, format=None):
         dt = None
         for fmt in formats:
             try:
-                dt = datetime.strptime(time_str, fmt)
+                # Special handling for ISO format with milliseconds
+                if fmt == '%Y-%m-%dT%H:%M:%S.%fZ' and 'T' in time_str and time_str.endswith('Z'):
+                    # Check if it has milliseconds (3 digits) vs microseconds (6 digits)
+                    if re.match(r'\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$', time_str):
+                        # Convert 3-digit milliseconds to 6-digit microseconds
+                        time_str_padded = time_str[:-1] + '000Z'  # .201Z -> .201000Z
+                        dt = datetime.strptime(time_str_padded, fmt)
+                    else:
+                        dt = datetime.strptime(time_str, fmt)
+                else:
+                    dt = datetime.strptime(time_str, fmt)
                 break
             except (ValueError, TypeError):
                 continue
+        
+        # Additional fallback for ISO format parsing
+        if dt is None and 'T' in time_str and time_str.endswith('Z'):
+            try:
+                # Try parsing with fromisoformat after removing Z and adding timezone info
+                iso_time = time_str.replace('Z', '+00:00')
+                dt = datetime.fromisoformat(iso_time)
+                logger.debug(f"Successfully parsed time using fromisoformat: {dt}")
+            except Exception as e:
+                logger.debug(f"fromisoformat also failed: {e}")
         
         # Special handling for NOTICE_DATE format (e.g., "Thu 27 Mar 25 22:22:04 UT")
         if dt is None:
@@ -1039,6 +1061,7 @@ def _standardize_time_format(time_str, format=None):
                     logger.warning(f"Could not parse special NOTICE_DATE format: {e}")
         
         if not dt:
+            logger.warning(f"Could not parse time string: '{time_str}'")
             return time_str  # Return original if parsing fails
         
         # Ensure UTC timezone
@@ -1110,16 +1133,36 @@ def _calculate_time_diff(notice_time_str, trigger_time_str):
                 except (ValueError, AttributeError) as e:
                     logger.error(f"Could not parse special NOTICE_DATE format: {e}")
         
-        # Try to parse trigger time
+        # Try to parse trigger time with enhanced ISO format handling
         for fmt in formats:
             try:
-                trigger_dt = datetime.strptime(trigger_time_str, fmt)
+                # Special handling for ISO format with milliseconds
+                if fmt == '%Y-%m-%dT%H:%M:%S.%fZ' and 'T' in trigger_time_str and trigger_time_str.endswith('Z'):
+                    # Check if it has milliseconds (3 digits) vs microseconds (6 digits)
+                    if re.match(r'\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$', trigger_time_str):
+                        # Convert 3-digit milliseconds to 6-digit microseconds
+                        trigger_time_padded = trigger_time_str[:-1] + '000Z'  # .201Z -> .201000Z
+                        trigger_dt = datetime.strptime(trigger_time_padded, fmt)
+                    else:
+                        trigger_dt = datetime.strptime(trigger_time_str, fmt)
+                else:
+                    trigger_dt = datetime.strptime(trigger_time_str, fmt)
+                    
                 if trigger_dt.tzinfo is None:
                     trigger_dt = trigger_dt.replace(tzinfo=timezone.utc)
                 break
             except (ValueError, TypeError):
-                logger.error(f"Error parsing trigger time: {trigger_time_str}")
                 continue
+        
+        # Additional fallback for ISO format parsing
+        if trigger_dt is None and 'T' in trigger_time_str and trigger_time_str.endswith('Z'):
+            try:
+                # Try parsing with fromisoformat after removing Z and adding timezone info
+                iso_time = trigger_time_str.replace('Z', '+00:00')
+                trigger_dt = datetime.fromisoformat(iso_time)
+                logger.info(f"Successfully parsed trigger time using fromisoformat: {trigger_dt}")
+            except Exception as e:
+                logger.warning(f"fromisoformat also failed for trigger time: {e}")
         
         if notice_dt and trigger_dt:
             # Calculate difference in seconds
@@ -1134,6 +1177,8 @@ def _calculate_time_diff(notice_time_str, trigger_time_str):
                 return f"+{int(hours):02d}:{int(minutes):02d}:{int(seconds):02d} (Notice after Trigger)"
             else:
                 return f"-{int(hours):02d}:{int(minutes):02d}:{int(seconds):02d} (Notice before Trigger)"
+        
+        logger.warning(f"Could not parse both times: notice='{notice_time_str}', trigger='{trigger_time_str}'")
         return "Time difference could not be calculated"
     except Exception as e:
         logger.error(f"Error calculating time difference: {e}")
@@ -1776,14 +1821,17 @@ def process_notice_and_send_message(topic, value, slack_client, slack_channel, i
         
         # 4. Save to databases (skip if this is a test message)
         csv_status = False
-        ascii_status = False
+        ascii_status = None  # Initialize as None for new events
         
         if not is_test:
             # Save to CSV (always append new records)
             csv_status = notice_handler.save_to_csv(notice_data)
             
-            # If this is an update, send thread message
+            # If this is an update, save ASCII first and send thread message
             if is_update and thread_ts:
+                # For updates, save ASCII with existing thread_ts first
+                ascii_status = notice_handler.save_to_ascii(notice_data, thread_ts)
+                
                 # Compare data and generate thread message
                 differences = _compare_event_data(existing_event, notice_data)
                 
@@ -1820,9 +1868,6 @@ def process_notice_and_send_message(topic, value, slack_client, slack_channel, i
                     except Exception as e:
                         logger.error(f"Error sending thread update: {e}")
                 
-                # Update ASCII with new data (preserving thread_ts)
-                ascii_status = notice_handler.save_to_ascii(notice_data, thread_ts)
-                
                 # Clean up plot file if it was created
                 if plot_path and os.path.exists(plot_path) and not plot_path.startswith('./test_plots'):
                     try:
@@ -1834,12 +1879,15 @@ def process_notice_and_send_message(topic, value, slack_client, slack_channel, i
             
             # If this is a new event, send full message
             else:
-                # 5. Format the full message for Slack
+                # For new events, don't show ASCII status in initial message
+                # because it depends on getting thread_ts from Slack response
+                
+                # 5. Format the full message for Slack (without ASCII status for new events)
                 slack_message, lc_url = format_message_for_slack(
                     topic=topic,
                     value=value,
                     csv_status=csv_status,
-                    ascii_status=ascii_status,
+                    ascii_status=None,  # Don't show ASCII status for new events
                     test_mode=is_test,
                     notice_data=notice_data
                 )
@@ -1880,8 +1928,25 @@ def process_notice_and_send_message(topic, value, slack_client, slack_channel, i
                         new_thread_ts = response['ts']
                         logger.info(f"Sent new message for {facility} trigger {trigger_num}, thread_ts: {new_thread_ts}")
                         
-                        # Save ASCII with the new thread_ts
+                        # Now save ASCII with the new thread_ts
                         ascii_status = notice_handler.save_to_ascii(notice_data, new_thread_ts)
+                        
+                        # Send a small context update about database save status
+                        if ascii_status:
+                            context_message = "✅ Event data saved to databases successfully"
+                        else:
+                            context_message = "⚠️ Event data partially saved (CSV: ✅, ASCII: ❌)"
+                        
+                        try:
+                            slack_client.chat_postMessage(
+                                channel=slack_channel,
+                                thread_ts=new_thread_ts,
+                                text=context_message,
+                                unfurl_links=False,
+                                unfurl_media=False
+                            )
+                        except Exception as e:
+                            logger.error(f"Error sending database status update: {e}")
                         
                         # Add LC URL as thread reply if available
                         if lc_url:
