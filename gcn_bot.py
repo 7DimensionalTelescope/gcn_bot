@@ -893,7 +893,7 @@ def format_message_for_slack(
             csv_status_icon = "✅" if csv_status else "❌"
             status_lines.append(f"{csv_status_icon} CSV Database: {'Parsed' if csv_status and test_mode else 'Saved' if csv_status else 'Failed'}")
         
-        # Only show ASCII status if it's not None (for updates, not new events)
+        # Show ASCII status for all events (both new and updates)
         if ascii_status is not None:
             ascii_status_icon = "✅" if ascii_status else "❌"
             status_lines.append(f"{ascii_status_icon} ASCII Database: {'Parsed' if ascii_status and test_mode else 'Saved' if ascii_status else 'Failed'}")
