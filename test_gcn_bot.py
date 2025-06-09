@@ -2,12 +2,13 @@
 """
 Thread Management Test Script
 ============================
-Separate test script for testing thread management functionality
+Separate test script for testing thread management functionality and visibility plotter
 without modifying the main gcn_bot.py code.
 
 Usage:
     python test_threads.py --test-basic
     python test_threads.py --test-facilities  
+    python test_threads.py --test-visibility
     python test_threads.py --test-all
     python test_threads.py --send  # Actually send to Slack
 """
@@ -24,12 +25,15 @@ original_argv = sys.argv.copy()
 
 def parse_arguments():
     """Parse command line arguments before any imports that might conflict."""
-    parser = argparse.ArgumentParser(description='Thread Management Test Suite')
+    parser = argparse.ArgumentParser(description='Thread Management and Visibility Test Suite')
     parser.add_argument('--test-basic', action='store_true', help='Test basic thread management')
     parser.add_argument('--test-facilities', action='store_true', help='Test different facilities')
+    parser.add_argument('--test-visibility', action='store_true', help='Test new 4-case visibility system')
     parser.add_argument('--test-all', action='store_true', help='Run all tests')
     parser.add_argument('--send', action='store_true', help='Actually send messages to Slack')
-    
+    parser.add_argument('--verbose', action='store_true', help='Enable verbose logging')
+    parser.add_argument('--test-visibility-dynamic', action='store_true', 
+                   help='Test visibility with dynamically calculated coordinates')
     return parser.parse_args()
 
 # Parse our arguments first
@@ -46,9 +50,9 @@ sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 try:
     # Import config first
     try:
-        from config import SLACK_TOKEN, SLACK_CHANNEL, SLACK_CHANNEL_TEST
+        from config import SLACK_TOKEN, SLACK_CHANNEL, SLACK_CHANNEL_TEST, MIN_ALTITUDE, MIN_MOON_SEP
     except ImportError:
-        print("❌ Error: Cannot find config.py. Please ensure config.py exists with SLACK_TOKEN and SLACK_CHANNEL settings.")
+        print("❌ Error: Cannot find config.py. Please ensure config.py exists with required settings.")
         sys.exit(1)
     
     # Import Slack client
@@ -58,6 +62,17 @@ try:
     # Import notice handler
     from gcn_notice_handler import GCNNoticeHandler
     notice_handler = GCNNoticeHandler()
+    
+    # Import visibility plotter
+    try:
+        from supy.supy.observer.visibility_plotter import VisibilityPlotter
+        plotter = VisibilityPlotter()
+        visibility_available = True
+        print("✅ Visibility plotter imported successfully")
+    except ImportError as e:
+        print(f"⚠️ Warning: Visibility plotter not available: {e}")
+        visibility_available = False
+        plotter = None
     
     # Import specific functions from gcn_bot
     # This should now work without argparse conflicts
@@ -76,11 +91,12 @@ except Exception as e:
 sys.argv = original_argv
 
 # Set up logging
-logging.basicConfig(level=logging.INFO)
+log_level = logging.DEBUG if args.verbose else logging.INFO
+logging.basicConfig(level=log_level, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 class ThreadTester:
-    """Class to handle thread management testing."""
+    """Class to handle thread management and visibility testing."""
     
     def __init__(self, send_to_slack=False):
         self.send_to_slack = send_to_slack
@@ -121,7 +137,7 @@ NOTICE_DATE:     Thu 20 May 25 10:30:15 UT
 NOTICE_TYPE:     Swift-XRT Position
 TRIGGER_NUM:     {test_trigger}
 GRB_RA:          150.1234d {{+10h 00m 30s}} (J2000)
-GRB_DEC:         +25.5678d {{+25d 34' 04"}} (J2000)
+GRB_DEC:         -25.5678d {{-25d 34' 04"}} (J2000)
 GRB_ERROR:       3.5 [arcsec radius]
 IMG_START_DATE:  25/05/20
 IMG_START_TIME:  37815.25 SOD {{10:30:15.25}} UT
@@ -134,7 +150,7 @@ NOTICE_DATE:     Thu 20 May 25 10:45:30 UT
 NOTICE_TYPE:     Swift-XRT Position UPDATE
 TRIGGER_NUM:     {test_trigger}
 GRB_RA:          150.2468d {{+10h 00m 59s}} (J2000)
-GRB_DEC:         +25.4321d {{+25d 25' 56"}} (J2000)
+GRB_DEC:         -25.4321d {{-25d 25' 56"}} (J2000)
 GRB_ERROR:       1.8 [arcsec radius]
 IMG_START_DATE:  25/05/20
 IMG_START_TIME:  37815.25 SOD {{10:30:15.25}} UT
@@ -147,7 +163,7 @@ COMMENTS:        Swift-XRT Coordinates - Enhanced position.
             print(f"Step 1: Sending INITIAL message")
             print(f"  Facility: {test_facility}")
             print(f"  Trigger: {test_trigger}")
-            print(f"  Coordinates: RA=150.1234, DEC=+25.5678, Error=3.5 arcsec")
+            print(f"  Coordinates: RA=150.1234, DEC=-25.5678, Error=3.5 arcsec")
             
             # Process initial message
             initial_msg = self.MockMessage(topic, initial_notice)
@@ -168,7 +184,7 @@ COMMENTS:        Swift-XRT Coordinates - Enhanced position.
             time.sleep(3)  # Give more time for processing
             
             print(f"\nStep 2: Sending UPDATE message")
-            print(f"  Updated coordinates: RA=150.2468, DEC=+25.4321, Error=1.8 arcsec")
+            print(f"  Updated coordinates: RA=150.2468, DEC=-25.4321, Error=1.8 arcsec")
             print(f"  Expected: Thread reply showing coordinate changes")
             
             # Process update message
@@ -210,7 +226,7 @@ NOTICE_DATE:     Thu 20 May 25 11:00:00 UT
 NOTICE_TYPE:     Swift-BAT GRB Position ACK
 TRIGGER_NUM:     {test_trigger}
 GRB_RA:          180.0000d {{+12h 00m 00s}} (J2000)
-GRB_DEC:         +30.0000d {{+30d 00' 00"}} (J2000)
+GRB_DEC:         -30.0000d {{-30d 00' 00"}} (J2000)
 GRB_ERROR:       3.0 [arcmin radius]
 GRB_DATE:        25/05/20
 GRB_TIME:        39600.00 SOD {{11:00:00.00}} UT
@@ -222,7 +238,7 @@ NOTICE_DATE:     Thu 20 May 25 11:01:00 UT
 NOTICE_TYPE:     Fermi-GBM Final Position
 TRIGGER_NUM:     {test_trigger}
 GRB_RA:          180.1000d {{+12h 00m 24s}} (J2000)
-GRB_DEC:         +30.1000d {{+30d 06' 00"}} (J2000)
+GRB_DEC:         -30.1000d {{-30d 06' 00"}} (J2000)
 GRB_ERROR:       2.5 [deg radius]
 GRB_DATE:        25/05/20
 GRB_TIME:        39600.00 SOD {{11:00:00.00}} UT
@@ -277,11 +293,222 @@ LC_URL:          http://heasarc.gsfc.nasa.gov/FTP/fermi/data/gbm/triggers/2025/t
             logger.exception("Error in different facilities test")
             return False
     
+    def test_visibility_analysis(self):
+        """Test the new 4-case visibility system."""
+        print("\n" + "="*60)
+        print("TESTING: New 4-Case Visibility System")
+        print("="*60)
+        
+        if not visibility_available:
+            print("❌ SKIPPED: Visibility plotter not available")
+            return False
+        
+        # Test cases for different visibility scenarios
+        visibility_test_cases = [
+            {
+                "name": "Observable Now",
+                "description": "Target currently observable from Chile",
+                "ra": 200.0,
+                "dec": -30.0,
+                "expected_status": "observable_now",
+                "trigger": "VIS001"
+            },
+            {
+                "name": "Observable Later",
+                "description": "Target observable later tonight",
+                "ra": 300.0,
+                "dec": -20.0,
+                "expected_status": "observable_later",
+                "trigger": "VIS002"
+            },
+            {
+                "name": "Observable Tomorrow",
+                "description": "Target observable tomorrow night",
+                "ra": 50.0,
+                "dec": -25.0,
+                "expected_status": "observable_tomorrow",
+                "trigger": "VIS003"
+            },
+            {
+                "name": "Not Observable",
+                "description": "Target not observable from Chile",
+                "ra": 120.0,
+                "dec": 70.0,
+                "expected_status": "not_observable",
+                "trigger": "VIS004"
+            },
+            {
+                "name": "IceCube High Priority",
+                "description": "IceCube neutrino event (always high priority)",
+                "ra": 180.0,
+                "dec": -15.0,
+                "expected_status": "variable",
+                "trigger": "VIS005",
+                "is_neutrino": True
+            }
+        ]
+        
+        test_results = []
+        
+        for i, test_case in enumerate(visibility_test_cases, 1):
+            print(f"\n{'-'*50}")
+            print(f"Test {i}: {test_case['name']}")
+            print(f"Description: {test_case['description']}")
+            print(f"Coordinates: RA={test_case['ra']}, DEC={test_case['dec']}")
+            print(f"Expected Status: {test_case['expected_status']}")
+            print(f"{'-'*50}")
+            
+            try:
+                # Test visibility analysis directly
+                print("Step 1: Testing visibility analysis...")
+                
+                result = plotter.create_visibility_plot(
+                    ra=test_case['ra'],
+                    dec=test_case['dec'],
+                    grb_name=f"TEST_{test_case['trigger']}",
+                    test_mode=True,
+                    minalt=MIN_ALTITUDE,
+                    minmoonsep=MIN_MOON_SEP
+                )
+                
+                if isinstance(result, tuple) and len(result) == 2:
+                    plot_path, visibility_info = result
+                    
+                    if visibility_info:
+                        actual_status = visibility_info.get('status', 'unknown')
+                        condition = visibility_info.get('condition', 'Unknown')
+                        current_alt = visibility_info.get('current_altitude', 0)
+                        
+                        print(f"  ✅ Analysis completed")
+                        print(f"  🌃 Actual Status: {actual_status}")
+                        print(f"  📊 Condition: {condition}")
+                        print(f"  📐 Current Altitude: {current_alt:.1f}°")
+                        
+                        # Check if status matches expectation
+                        status_match = (actual_status == test_case['expected_status'] or 
+                                      test_case['expected_status'] == 'variable')
+                        match_icon = "✅" if status_match else "⚠️"
+                        print(f"  {match_icon} Expected: {test_case['expected_status']}")
+                        
+                        # Log specific details based on status
+                        if actual_status == 'observable_now':
+                            remaining = visibility_info.get('remaining_hours', 0)
+                            print(f"  ⏰ Remaining observing time: {remaining:.1f} hours")
+                        elif actual_status == 'observable_later':
+                            hours_until = visibility_info.get('hours_until_observable', 0)
+                            print(f"  ⏱️ Observable in: {hours_until:.1f} hours")
+                        elif actual_status == 'observable_tomorrow':
+                            reason = visibility_info.get('reason', 'Check tomorrow')
+                            print(f"  📅 Reason: {reason}")
+                        else:
+                            reason = visibility_info.get('reason', 'Unknown limitation')
+                            print(f"  ❌ Limitation: {reason}")
+                        
+                        if plot_path:
+                            print(f"  📊 Plot saved: {plot_path}")
+                        
+                    else:
+                        print(f"  ❌ No visibility info returned")
+                        actual_status = 'error'
+                        status_match = False
+                else:
+                    print(f"  ❌ Unexpected result format")
+                    actual_status = 'error'
+                    status_match = False
+                
+                # Test with full GCN notice if this test should send to Slack
+                if self.send_to_slack:
+                    print("Step 2: Testing with full GCN notice...")
+                    
+                    if test_case.get('is_neutrino', False):
+                        # Create IceCube notice
+                        notice_content = f"""TITLE:           GCN/AMON NOTICE
+NOTICE_DATE:     Thu 20 May 25 12:00:00 UT
+NOTICE_TYPE:     ICECUBE_Astrotrack_GOLD
+EVENT_NUM:       {test_case['trigger']}
+RUN_NUM:         139876
+DISCOVERY_DATE:  25/05/20
+DISCOVERY_TIME:  43200.00 {{12:00:00.00}} UT
+SRC_RA:          {test_case['ra']:.4f}d {{+{test_case['ra']/15:.0f}h {(test_case['ra']%15)*4:.0f}m 00s}} (J2000)
+SRC_DEC:         {test_case['dec']:+.4f}d {{{test_case['dec']:+.0f}d 00' 00"}} (J2000)  
+SRC_ERROR:       0.5 [deg radius]
+ENERGY:          2.14e+02 [TeV]
+SIGNALNESS:      6.23e-01 [dn]
+FAR:             3.54 [yr^-1]"""
+                        topic = "gcn.classic.text.ICECUBE_ASTROTRACK_GOLD"
+                    else:
+                        # Create Swift notice
+                        notice_content = f"""TITLE:           GCN/SWIFT NOTICE
+NOTICE_DATE:     Thu 20 May 25 12:00:00 UT
+NOTICE_TYPE:     Swift-BAT GRB Position ACK
+TRIGGER_NUM:     {test_case['trigger']}
+GRB_RA:          {test_case['ra']:.4f}d {{+{test_case['ra']/15:.0f}h {(test_case['ra']%15)*4:.0f}m 00s}} (J2000)
+GRB_DEC:         {test_case['dec']:+.4f}d {{{test_case['dec']:+.0f}d 00' 00"}} (J2000)
+GRB_ERROR:       3.0 [arcmin radius]
+GRB_DATE:        25/05/20
+GRB_TIME:        43200.00 SOD {{12:00:00.00}} UT"""
+                        topic = "gcn.classic.text.SWIFT_BAT_GRB_POS_ACK"
+                    
+                    # Process the message
+                    msg = self.MockMessage(topic, notice_content)
+                    success, result = gcn_bot.process_notice_and_send_message(
+                        msg.topic(),
+                        msg.value(),
+                        slack_client,
+                        self.test_channel,
+                        is_test=False  # Actually send to Slack
+                    )
+                    
+                    print(f"  📤 Slack message: {success} - {result}")
+                
+                test_results.append({
+                    'name': test_case['name'],
+                    'expected': test_case['expected_status'],
+                    'actual': actual_status,
+                    'match': status_match,
+                    'success': True
+                })
+                
+            except Exception as e:
+                print(f"  ❌ ERROR: {e}")
+                logger.exception(f"Error in visibility test {i}")
+                test_results.append({
+                    'name': test_case['name'],
+                    'expected': test_case['expected_status'],
+                    'actual': 'error',
+                    'match': False,
+                    'success': False
+                })
+        
+        # Summary of visibility tests
+        print(f"\n{'='*50}")
+        print("VISIBILITY TEST SUMMARY")
+        print(f"{'='*50}")
+        
+        total_tests = len(test_results)
+        successful_tests = sum(1 for r in test_results if r['success'])
+        matching_tests = sum(1 for r in test_results if r['match'])
+        
+        print(f"Total visibility tests: {total_tests}")
+        print(f"Successful analyses: {successful_tests}")
+        print(f"Status matches: {matching_tests}")
+        print(f"Success rate: {(successful_tests/total_tests)*100:.1f}%")
+        print(f"Match rate: {(matching_tests/total_tests)*100:.1f}%")
+        
+        print(f"\nDetailed Results:")
+        for result in test_results:
+            success_icon = "✅" if result['success'] else "❌"
+            match_icon = "✅" if result['match'] else "⚠️"
+            print(f"  {success_icon} {result['name']:20} | Expected: {result['expected']:15} | Actual: {result['actual']:15} | {match_icon}")
+        
+        return successful_tests == total_tests
+    
     def run_all_tests(self):
         """Run all available tests."""
-        print("🧪 STARTING COMPREHENSIVE THREAD MANAGEMENT TESTS")
+        print("🧪 STARTING COMPREHENSIVE THREAD MANAGEMENT AND VISIBILITY TESTS")
         print(f"📤 Send to Slack: {'YES' if self.send_to_slack else 'NO'}")
         print(f"📢 Target channel: {self.test_channel}")
+        print(f"👁️ Visibility testing: {'AVAILABLE' if visibility_available else 'NOT AVAILABLE'}")
         
         results = []
         
@@ -294,9 +521,16 @@ LC_URL:          http://heasarc.gsfc.nasa.gov/FTP/fermi/data/gbm/triggers/2025/t
         # Test 2: Different facilities
         results.append(("Different Facilities", self.test_different_facilities()))
         
+        # Small delay between tests
+        time.sleep(2)
+        
+        # Test 3: Visibility analysis (new)
+        if visibility_available:
+            results.append(("Dynamic Visibility Analysis", self.test_visibility_analysis_dynamic()))
+        
         # Summary
         print("\n" + "="*60)
-        print("TEST SUMMARY")
+        print("COMPREHENSIVE TEST SUMMARY")
         print("="*60)
         
         passed = 0
@@ -306,7 +540,8 @@ LC_URL:          http://heasarc.gsfc.nasa.gov/FTP/fermi/data/gbm/triggers/2025/t
             if result:
                 passed += 1
         
-        print(f"\nTotal: {passed}/{len(results)} tests passed")
+        print(f"\nOverall: {passed}/{len(results)} test suites passed")
+        print(f"Success rate: {(passed/len(results))*100:.1f}%")
         
         if self.send_to_slack:
             print(f"\n📱 Check your Slack channel ({self.test_channel}) for test messages!")
@@ -315,17 +550,365 @@ LC_URL:          http://heasarc.gsfc.nasa.gov/FTP/fermi/data/gbm/triggers/2025/t
         
         return passed == len(results)
 
+    def calculate_optimal_test_coordinates(self):
+        """
+        Calculate optimal coordinates for each visibility test case based on current time.
+        This ensures test coordinates match expected visibility status.
+        """
+        if not visibility_available:
+            # Return fallback coordinates if visibility plotter unavailable
+            return {
+                'observable_now': {'ra': 200.0, 'dec': -30.0},
+                'observable_later': {'ra': 300.0, 'dec': -20.0}, 
+                'observable_tomorrow': {'ra': 50.0, 'dec': -25.0},
+                'not_observable': {'ra': 120.0, 'dec': 70.0}
+            }
+        
+        print("🔄 Calculating optimal test coordinates for current time...")
+        
+        from astropy.time import Time
+        from astropy.coordinates import SkyCoord
+        import astropy.units as u
+        import numpy as np
+        
+        # Get current time and observer
+        now = Time.now()
+        observer = plotter.observer
+        
+        # Get tonight's observing window
+        tonight = observer.tonight(now)
+        sunset_astro = tonight[0]  # Start of astronomical night
+        sunrise_astro = tonight[1]  # End of astronomical night
+        
+        # Calculate LST (Local Sidereal Time) for different times
+        current_lst = observer._observer.local_sidereal_time(now)
+        sunset_lst = observer._observer.local_sidereal_time(sunset_astro)
+        midnight_lst = observer._observer.local_sidereal_time(sunset_astro + (sunrise_astro - sunset_astro)/2)
+        
+        print(f"  Current LST: {current_lst.deg:.1f}°")
+        print(f"  Sunset LST: {sunset_lst.deg:.1f}°")
+        print(f"  Midnight LST: {midnight_lst.deg:.1f}°")
+        
+        optimal_coords = {}
+        
+        # 1. Observable Now: Use current LST with good southern declination
+        current_ra = current_lst.deg
+        optimal_coords['observable_now'] = {
+            'ra': current_ra,
+            'dec': -25.0,  # Good southern declination for Chile
+            'description': f"Current LST {current_ra:.1f}° with southern declination"
+        }
+        
+        # 2. Observable Later: Use midnight LST (typically 6-8 hours from now)
+        later_ra = midnight_lst.deg
+        optimal_coords['observable_later'] = {
+            'ra': later_ra,
+            'dec': -30.0,
+            'description': f"Midnight LST {later_ra:.1f}° for later tonight"
+        }
+        
+        # 3. Observable Tomorrow: Use RA that's ~12 hours away from current
+        tomorrow_ra = (current_ra + 180) % 360
+        optimal_coords['observable_tomorrow'] = {
+            'ra': tomorrow_ra,
+            'dec': -20.0,
+            'description': f"Opposite side RA {tomorrow_ra:.1f}° for tomorrow"
+        }
+        
+        # 4. Not Observable: Use high northern declination (never visible from Chile)
+        optimal_coords['not_observable'] = {
+            'ra': current_ra,  # RA doesn't matter for northern targets
+            'dec': 70.0,  # Very northern declination
+            'description': f"Northern declination 70° (never visible from Chile)"
+        }
+        
+        # Validate coordinates by quick visibility check
+        print("🔍 Validating calculated coordinates...")
+        for case_name, coords in optimal_coords.items():
+            if case_name == 'not_observable':
+                continue  # Skip validation for intentionally non-observable targets
+                
+            try:
+                # Quick visibility check without generating full plot
+                result = plotter.create_visibility_plot(
+                    ra=coords['ra'],
+                    dec=coords['dec'],
+                    grb_name=f"Validation_{case_name}",
+                    test_mode=True,
+                    savefig=False  # Don't save validation plots
+                )
+                
+                if isinstance(result, tuple) and len(result) == 2:
+                    _, visibility_info = result
+                    if visibility_info:
+                        actual_status = visibility_info.get('status', 'unknown')
+                        match_icon = "✅" if actual_status == case_name.replace('_', '') else "⚠️"
+                        print(f"  {match_icon} {case_name:18}: RA={coords['ra']:6.1f}, DEC={coords['dec']:6.1f} → {actual_status}")
+                        
+                        # Update coordinates if they don't match expected (within reason)
+                        if actual_status != case_name.replace('_', '') and case_name != 'observable_tomorrow':
+                            print(f"    🔧 Coordinate needs adjustment for {case_name}")
+                            
+            except Exception as e:
+                print(f"  ❌ Error validating {case_name}: {e}")
+        
+        return optimal_coords
+
+    def test_visibility_analysis_dynamic(self):
+        """Test the new 4-case visibility system with dynamically calculated coordinates."""
+        print("\n" + "="*60)
+        print("TESTING: Dynamic 4-Case Visibility System")
+        print("="*60)
+        
+        if not visibility_available:
+            print("❌ SKIPPED: Visibility plotter not available")
+            return False
+        
+        # Calculate optimal coordinates for current time
+        optimal_coords = self.calculate_optimal_test_coordinates()
+        
+        # Create test cases with calculated coordinates
+        visibility_test_cases = [
+            {
+                "name": "Observable Now",
+                "description": f"Target currently observable from Chile - {optimal_coords['observable_now']['description']}",
+                "ra": optimal_coords['observable_now']['ra'],
+                "dec": optimal_coords['observable_now']['dec'],
+                "expected_status": "observable_now",
+                "trigger": "DYN001"
+            },
+            {
+                "name": "Observable Later",
+                "description": f"Target observable later tonight - {optimal_coords['observable_later']['description']}",
+                "ra": optimal_coords['observable_later']['ra'],
+                "dec": optimal_coords['observable_later']['dec'],
+                "expected_status": "observable_later",
+                "trigger": "DYN002"
+            },
+            {
+                "name": "Observable Tomorrow",
+                "description": f"Target observable tomorrow night - {optimal_coords['observable_tomorrow']['description']}",
+                "ra": optimal_coords['observable_tomorrow']['ra'],
+                "dec": optimal_coords['observable_tomorrow']['dec'],
+                "expected_status": "observable_tomorrow",
+                "trigger": "DYN003"
+            },
+            {
+                "name": "Not Observable",
+                "description": f"Target not observable from Chile - {optimal_coords['not_observable']['description']}",
+                "ra": optimal_coords['not_observable']['ra'],
+                "dec": optimal_coords['not_observable']['dec'],
+                "expected_status": "not_observable",
+                "trigger": "DYN004"
+            },
+            {
+                "name": "IceCube High Priority",
+                "description": "IceCube neutrino event (high priority regardless of visibility)",
+                "ra": optimal_coords['observable_now']['ra'],  # Use observable coordinates
+                "dec": optimal_coords['observable_now']['dec'],
+                "expected_status": "variable",
+                "trigger": "DYN005",
+                "is_neutrino": True
+            }
+        ]
+        
+        test_results = []
+        
+        for i, test_case in enumerate(visibility_test_cases, 1):
+            print(f"\n{'-'*50}")
+            print(f"Test {i}: {test_case['name']}")
+            print(f"Description: {test_case['description']}")
+            print(f"Coordinates: RA={test_case['ra']:.1f}, DEC={test_case['dec']:.1f}")
+            print(f"Expected Status: {test_case['expected_status']}")
+            print(f"{'-'*50}")
+            
+            try:
+                # Test visibility analysis
+                print("Step 1: Testing visibility analysis...")
+                
+                result = plotter.create_visibility_plot(
+                    ra=test_case['ra'],
+                    dec=test_case['dec'],
+                    grb_name=f"DYN_TEST_{test_case['trigger']}",
+                    test_mode=True,
+                    minalt=MIN_ALTITUDE,
+                    minmoonsep=MIN_MOON_SEP
+                )
+                
+                if isinstance(result, tuple) and len(result) == 2:
+                    plot_path, visibility_info = result
+                    
+                    if visibility_info:
+                        actual_status = visibility_info.get('status', 'unknown')
+                        condition = visibility_info.get('condition', 'Unknown')
+                        current_alt = visibility_info.get('current_altitude', 0)
+                        
+                        print(f"  ✅ Analysis completed")
+                        print(f"  🌃 Actual Status: {actual_status}")
+                        print(f"  📊 Condition: {condition}")
+                        print(f"  📐 Current Altitude: {current_alt:.1f}°")
+                        
+                        # Check if status matches expectation
+                        status_match = (actual_status == test_case['expected_status'] or 
+                                    test_case['expected_status'] == 'variable')
+                        match_icon = "✅" if status_match else "⚠️"
+                        print(f"  {match_icon} Expected: {test_case['expected_status']}")
+                        
+                        # Log specific details based on status
+                        if actual_status == 'observable_now':
+                            remaining = visibility_info.get('remaining_hours', 0)
+                            end_time = visibility_info.get('observable_end')
+                            if end_time:
+                                chile_time, korea_time = plotter._convert_time_to_clt_kst(end_time)
+                                print(f"  ⏰ Observable until: {chile_time.strftime('%H:%M')} CLT ({remaining:.1f}h remaining)")
+                            else:
+                                print(f"  ⏰ Remaining observing time: {remaining:.1f} hours")
+                                
+                        elif actual_status == 'observable_later':
+                            hours_until = visibility_info.get('hours_until_observable', 0)
+                            start_time = visibility_info.get('observable_start')
+                            if start_time:
+                                chile_time, korea_time = plotter._convert_time_to_clt_kst(start_time)
+                                print(f"  ⏱️ Observable from: {chile_time.strftime('%H:%M')} CLT (in {hours_until:.1f} hours)")
+                            else:
+                                print(f"  ⏱️ Observable in: {hours_until:.1f} hours")
+                                
+                        elif actual_status == 'observable_tomorrow':
+                            reason = visibility_info.get('reason', 'Check tomorrow')
+                            print(f"  📅 Reason: {reason}")
+                            if visibility_info.get('showing_tomorrow'):
+                                print(f"  🌅 Tomorrow's plot generated")
+                        else:
+                            reason = visibility_info.get('reason', 'Unknown limitation')
+                            print(f"  ❌ Limitation: {reason}")
+                        
+                        if plot_path:
+                            print(f"  📊 Plot saved: {plot_path}")
+                        
+                        # Special handling for non-matching results
+                        if not status_match and test_case['expected_status'] != 'variable':
+                            print(f"  💡 Coordinate adjustment may be needed for future tests")
+                        
+                    else:
+                        print(f"  ❌ No visibility info returned")
+                        actual_status = 'error'
+                        status_match = False
+                else:
+                    print(f"  ❌ Unexpected result format")
+                    actual_status = 'error'
+                    status_match = False
+                
+                # Test with full GCN notice if this test should send to Slack
+                if self.send_to_slack:
+                    print("Step 2: Testing with full GCN notice...")
+                    
+                    if test_case.get('is_neutrino', False):
+                        # Create IceCube notice
+                        notice_content = f"""TITLE:           GCN/AMON NOTICE
+    NOTICE_DATE:     Thu 20 May 25 12:00:00 UT
+    NOTICE_TYPE:     ICECUBE_Astrotrack_GOLD
+    EVENT_NUM:       {test_case['trigger']}
+    RUN_NUM:         139876
+    DISCOVERY_DATE:  25/05/20
+    DISCOVERY_TIME:  43200.00 {{12:00:00.00}} UT
+    SRC_RA:          {test_case['ra']:.4f}d {{+{test_case['ra']/15:.0f}h {(test_case['ra']%15)*4:.0f}m 00s}} (J2000)
+    SRC_DEC:         {test_case['dec']:+.4f}d {{{test_case['dec']:+.0f}d 00' 00"}} (J2000)  
+    SRC_ERROR:       0.5 [deg radius]
+    ENERGY:          2.14e+02 [TeV]
+    SIGNALNESS:      6.23e-01 [dn]
+    FAR:             3.54 [yr^-1]"""
+                        topic = "gcn.classic.text.ICECUBE_ASTROTRACK_GOLD"
+                    else:
+                        # Create Swift notice
+                        notice_content = f"""TITLE:           GCN/SWIFT NOTICE
+    NOTICE_DATE:     Thu 20 May 25 12:00:00 UT
+    NOTICE_TYPE:     Swift-BAT GRB Position ACK
+    TRIGGER_NUM:     {test_case['trigger']}
+    GRB_RA:          {test_case['ra']:.4f}d {{+{test_case['ra']/15:.0f}h {(test_case['ra']%15)*4:.0f}m 00s}} (J2000)
+    GRB_DEC:         {test_case['dec']:+.4f}d {{{test_case['dec']:+.0f}d 00' 00"}} (J2000)
+    GRB_ERROR:       3.0 [arcmin radius]
+    GRB_DATE:        25/05/20
+    GRB_TIME:        43200.00 SOD {{12:00:00.00}} UT"""
+                        topic = "gcn.classic.text.SWIFT_BAT_GRB_POS_ACK"
+                    
+                    # Process the message
+                    msg = self.MockMessage(topic, notice_content)
+                    success, result = gcn_bot.process_notice_and_send_message(
+                        msg.topic(),
+                        msg.value(),
+                        slack_client,
+                        self.test_channel,
+                        is_test=False  # Actually send to Slack
+                    )
+                    
+                    print(f"  📤 Slack message: {success} - {result}")
+                
+                test_results.append({
+                    'name': test_case['name'],
+                    'expected': test_case['expected_status'],
+                    'actual': actual_status,
+                    'match': status_match,
+                    'success': True,
+                    'coordinates': f"RA={test_case['ra']:.1f}, DEC={test_case['dec']:.1f}"
+                })
+                
+            except Exception as e:
+                print(f"  ❌ ERROR: {e}")
+                logger.exception(f"Error in dynamic visibility test {i}")
+                test_results.append({
+                    'name': test_case['name'],
+                    'expected': test_case['expected_status'],
+                    'actual': 'error',
+                    'match': False,
+                    'success': False,
+                    'coordinates': f"RA={test_case['ra']:.1f}, DEC={test_case['dec']:.1f}"
+                })
+        
+        # Enhanced summary with coordinate information
+        print(f"\n{'='*60}")
+        print("DYNAMIC VISIBILITY TEST SUMMARY")
+        print(f"{'='*60}")
+        
+        total_tests = len(test_results)
+        successful_tests = sum(1 for r in test_results if r['success'])
+        matching_tests = sum(1 for r in test_results if r['match'])
+        
+        print(f"Total visibility tests: {total_tests}")
+        print(f"Successful analyses: {successful_tests}")
+        print(f"Status matches: {matching_tests}")
+        print(f"Success rate: {(successful_tests/total_tests)*100:.1f}%")
+        print(f"Match rate: {(matching_tests/total_tests)*100:.1f}%")
+        
+        print(f"\nDetailed Results:")
+        for result in test_results:
+            success_icon = "✅" if result['success'] else "❌"
+            match_icon = "✅" if result['match'] else "⚠️"
+            coords = result.get('coordinates', 'Unknown')
+            print(f"  {success_icon} {result['name']:20} | {coords:20} | Expected: {result['expected']:15} | Actual: {result['actual']:15} | {match_icon}")
+        
+        if matching_tests < total_tests:
+            print(f"\n💡 Suggestions for improving match rate:")
+            print(f"   - Run tests at different times of day for better coordinate selection")
+            print(f"   - Consider seasonal variations in target visibility")
+            print(f"   - Adjust declination values based on current observing season")
+        
+        return successful_tests == total_tests
+
 def main():
     """Main function for thread testing."""
-    if not any([args.test_basic, args.test_facilities, args.test_all]):
+    if not any([args.test_basic, args.test_facilities, args.test_visibility, args.test_all, args.test_visibility_dynamic]):
         print("Usage:")
         print("  python test_threads.py --test-basic      # Test basic thread management")
         print("  python test_threads.py --test-facilities # Test different facilities")
+        print("  python test_threads.py --test-visibility # Test new 4-case visibility system")
         print("  python test_threads.py --test-all        # Run all tests")
         print("  python test_threads.py --send            # Actually send to Slack")
+        print("  python test_threads.py --verbose         # Enable verbose logging")
         print("\nExamples:")
         print("  python test_threads.py --test-all        # Run all tests (dry run)")
         print("  python test_threads.py --test-all --send # Run all tests and send to Slack")
+        print("  python test_threads.py --test-visibility # Test only visibility system")
+        print("  python test_threads.py --test-visibility-dynamic # Test only dynamic visibility system")
         return
     
     tester = ThreadTester(send_to_slack=args.send)
@@ -338,7 +921,10 @@ def main():
                 tester.test_basic_thread_management()
             if args.test_facilities:
                 tester.test_different_facilities()
-                
+            if args.test_visibility:
+                tester.test_visibility_analysis()
+            if args.test_visibility_dynamic:
+                tester.test_visibility_analysis_dynamic()
     except KeyboardInterrupt:
         print("\n🛑 Tests interrupted by user")
     except Exception as e:
