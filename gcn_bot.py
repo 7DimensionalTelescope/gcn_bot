@@ -393,6 +393,7 @@ def _filter_notice_text(text, topic):
         r"AMPLIFIER",
         r"COMMENTS:",
         r"TRIGGER_INDEX",
+        r"TITLE"
     ]
     
     # Store sections for structured output
@@ -823,7 +824,7 @@ def format_message_for_slack(
     test_mode: bool = False, 
     custom_facility: Optional[str] = None,
     notice_data: Optional[Dict[str, Any]] = None
-) -> Tuple[Optional[Dict[str, Any]], Optional[str], Optional[str]]:
+    ) -> Tuple[Optional[Dict[str, Any]], Optional[str], Optional[str]]:
     """
     Format message based on topic type and content into section-based format
     with unnecessary information removed.
