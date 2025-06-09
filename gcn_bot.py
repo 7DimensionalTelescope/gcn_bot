@@ -391,7 +391,8 @@ def _filter_notice_text(text, topic):
         r"POS_MAP_URL",
         r"DATA_INTERVAL",
         r"AMPLIFIER",
-        r"COMMENTS:"
+        r"COMMENTS:",
+        r"TRIGGER_INDEX",
     ]
     
     # Store sections for structured output
@@ -435,11 +436,12 @@ def _filter_notice_text(text, topic):
             trigger_time_line = line
             continue  # Skip to next iteration if found
         
+        # Extract LC_URL if available
         if "LC_URL:" in line:
             match = re.search(r"LC_URL:\s*([^\s]+)", line)
             if match:
                 lc_url = match.group(1)
-    
+
     # Process each line
     for line in lines:
         # Skip lines matching exclude patterns
@@ -526,7 +528,7 @@ def _filter_notice_text(text, topic):
             continue
         
         # Determine line section
-        if any(x in line for x in ["NOTICE_DATE:", "NOTICE_TYPE:", "TRIGGER_NUM:", "EVENT_NUM:", "RUN_NUM:", "STREAM:", "ID:"]):
+        if any(x in line for x in ["NOTICE_DATE:", "TRIGGER_NUM:", "EVENT_NUM:", "RUN_NUM:", "STREAM:", "ID:"]):
             current_section = "basic"
         elif any(x in line for x in ["GRB_RA:", "GRB_DEC:", "SRC_RA:", "SRC_DEC:", "POINT_RA:", "POINT_DEC:", "RA:", "DEC:", "GRB_ERROR:", "SRC_ERROR", "RA_DEC_ERROR"]):
             current_section = "location" 
@@ -575,11 +577,12 @@ def _filter_notice_text(text, topic):
         
         # Analysis fields
         'ENERGY:', 'SIGNALNESS:', 'FAR:', 'COINC_PAIR:', 'PVALUE:',
-        'SIGNIFICANCE:', 'GRB_INTEN:', 'GRB_MAG:', 'GRB_SIGNIF:', 'DATA_SIGNIF',
+        'SIGNIFICANCE:', 'GRB_INTEN:', 'GRB_MAG:', 'GRB_SIGNIF:', 'DATA_SIGNIF:', 'IMAGE_SIGNIF:',
         'IMAGE_SNR:', 'SNR:', 'CHARGE:', 'NET_COUNT_RATE:',
         'DELTA_T:', 'SIGMA_T:', 'SIGNAL_TRACKNESS:',
+        'TRIGGER_DUR:',
         
-        # Basic info fields (added NOTICE_DATE)
+        # Basic info fields
         'NOTICE_DATE:', 'TRIGGER_NUM:', 'EVENT_NUM:', 'ID:'
     ]
 
@@ -754,7 +757,6 @@ def format_message_for_slack(
     value: Union[str, bytes], 
     csv_status: Optional[bool] = None, 
     ascii_status: Optional[bool] = None, 
-    visibility_status: Optional[bool] = None, 
     test_mode: bool = False, 
     custom_facility: Optional[str] = None,
     notice_data: Optional[Dict[str, Any]] = None
@@ -768,7 +770,6 @@ def format_message_for_slack(
         value: The value of the message
         csv_status: The status of saving the message to CSV
         ascii_status: The status of saving the message to ASCII text file (None for new events)
-        visibility_status: The status of generating visibility plot
         test_mode: Whether the function is being called in test mode
         custom_facility: Override the facility name detection with a custom name
         notice_data: Parsed notice data (optional, used for GRB name display)
