@@ -752,6 +752,69 @@ def _format_json_notice(json_data, facility):
     
     return formatted_text.strip()
 
+def _get_facility_emoji(facility):
+    """
+    Get appropriate emoji for each facility type to improve visual distinction.
+    
+    Args:
+        facility (str): Facility name
+        
+    Returns:
+        str: Emoji representation for the facility
+    """
+    facility_upper = facility.upper()
+    
+    # Swift telescopes - Lightning bolt for Swift
+    if 'SWIFT' in facility_upper:
+        if 'BAT' in facility_upper:
+            return '💥'  # Lightning for Burst Alert Telescope
+        elif 'XRT' in facility_upper:
+            return '💥'  # Lightning for X-Ray Telescope  
+        elif 'UVOT' in facility_upper:
+            return '💥'  # Lightning for UV/Optical Telescope
+        else:
+            return '💥'  # Generic Swift
+    
+    # Fermi telescopes - Galaxy/cosmic rays
+    elif 'FERMI' in facility_upper:
+        if 'GBM' in facility_upper:
+            return '⚛️'  # Galaxy for Gamma-ray Burst Monitor
+        elif 'LAT' in facility_upper:
+            return '⚛️'  # Galaxy for Large Area Telescope
+        else:
+            return '⚛️'  # Generic Fermi
+    
+    # Einstein Probe - Telescope
+    elif 'EINSTEIN' in facility_upper:
+        return '👨‍🦳'  # Telescope for Einstein Probe
+    
+    # IceCube neutrino detectors - Ice/snow
+    elif 'ICECUBE' in facility_upper:
+        if 'CASCADE' in facility_upper:
+            return '❄️'  # Snowflake for CASCADE events
+        elif 'GOLD' in facility_upper:
+            return '🧊'  # Ice cube for GOLD tracks
+        elif 'BRONZE' in facility_upper:
+            return '🧊'  # Ice cube for BRONZE tracks
+        else:
+            return '🧊'  # Generic IceCube
+    
+    # AMON - Network/cooperation symbol
+    elif 'AMON' in facility_upper:
+        return '🔗'  # Link for multi-messenger network
+    
+    # HAWC - Mountain for high altitude
+    elif 'HAWC' in facility_upper:
+        return '🏔️'  # Mountain for High-Altitude Water Cherenkov
+    
+    # CALET - Satellite
+    elif 'CALET' in facility_upper:
+        return '🛰️'  # Satellite for CALorimetric Electron Telescope
+    
+    # Default fallback
+    else:
+        return '📡'  # Generic antenna/detector symbol
+
 def format_message_for_slack(
     topic: str, 
     value: Union[str, bytes], 
@@ -862,7 +925,7 @@ def format_message_for_slack(
                 "type": "header",
                 "text": {
                     "type": "plain_text",
-                    "text": f"{facility}"
+                    "text": f"{_get_facility_emoji(facility)} {facility}"
                 }
             },
             {
