@@ -1581,13 +1581,13 @@ def _format_thread_message(differences: Dict[str, Any], notice_data: Dict[str, A
         sections = []
         
         # Header
-        sections.append(f"🔄 **UPDATE: {facility}**")
-        sections.append("> **New Information:**")
+        sections.append(f"🔄 *UPDATE: {facility}*")
+        sections.append("> *New Information:*")
         
         # Facility/instrument change
         if 'facility_change' in differences:
             change = differences['facility_change']
-            sections.append(f"> - 🔬 **Instrument:** {change['from']} → **{change['to']}**")
+            sections.append(f"> - 🔬 *Instrument:* {change['from']} → *{change['to']}*")
         
         # Coordinate changes
         if 'coordinates' in differences:
@@ -1603,7 +1603,7 @@ def _format_thread_message(differences: Dict[str, Any], notice_data: Dict[str, A
             
             if coord_parts:
                 coord_str = ", ".join(coord_parts)
-                sections.append(f"> - 📍 **Coordinates:** {coord_str}")
+                sections.append(f"> - 📍 *Coordinates:* {coord_str}")
         
         # Visibility changes
         if 'visibility' in differences:
@@ -1613,27 +1613,27 @@ def _format_thread_message(differences: Dict[str, Any], notice_data: Dict[str, A
             if status == 'observable_now':
                 end_time = vis_info.get('observable_end')
                 end_time_str = end_time.strftime('%H:%M') if end_time else "Unknown"
-                sections.append(f"> - 🌃 **Visibility:** 🟢 Currently Observable until {end_time_str} CLT")
+                sections.append(f"> - 🌃 *Visibility:* 🟢 Currently Observable until {end_time_str} CLT")
                 
             elif status == 'observable_later':
                 hours_until = vis_info.get('hours_until_observable', 0)
                 start_time = vis_info.get('observable_start')
                 start_time_str = start_time.strftime('%H:%M') if start_time else "Unknown"
-                sections.append(f"> - 🌃 **Visibility:** 🟠 Observable in {hours_until:.1f} hours (from {start_time_str} CLT)")
+                sections.append(f"> - 🌃 *Visibility:* 🟠 Observable in {hours_until:.1f} hours (from {start_time_str} CLT)")
                 
             else:
                 reason = vis_info.get('reason', 'Unknown limitation')
-                sections.append(f"> - 🌃 **Visibility:** 🔴 Not Observable ({reason})")
+                sections.append(f"> - 🌃 *Visibility:* 🔴 Not Observable ({reason})")
         
         # If no differences found, show a generic update message
         if len(sections) <= 2:
-            sections.append("> - ℹ️ **Status:** Updated information received")
+            sections.append("> - ℹ️ *Status:* Updated information received")
         
         return "\n".join(sections)
         
     except Exception as e:
         logger.error(f"Error formatting thread message: {e}")
-        return f"🔄 **UPDATE: {notice_data.get('Facility', 'Unknown')}**\n> - ℹ️ **Status:** Updated information received"
+        return f"🔄 *UPDATE: {notice_data.get('Facility', 'Unknown')}*\n> - ℹ️ *Status:* Updated information received"
 
 def _evaluate_too_criteria(notice_data: Dict[str, Any], visibility_info: Optional[Dict[str, Any]]) -> Tuple[bool, str]:
     """
