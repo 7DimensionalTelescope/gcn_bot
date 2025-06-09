@@ -893,7 +893,7 @@ def format_message_for_slack(
             csv_status_icon = "✅" if csv_status else "❌"
             status_lines.append(f"{csv_status_icon} CSV Database: {'Parsed' if csv_status and test_mode else 'Saved' if csv_status else 'Failed'}")
         
-        # Show ASCII status for all events (both new and updates)
+        # Show ASCII status for all events
         if ascii_status is not None:
             ascii_status_icon = "✅" if ascii_status else "❌"
             status_lines.append(f"{ascii_status_icon} ASCII Database: {'Parsed' if ascii_status and test_mode else 'Saved' if ascii_status else 'Failed'}")
@@ -1821,12 +1821,13 @@ def process_notice_and_send_message(topic, value, slack_client, slack_channel, i
         
         # 4. Save to databases (skip if this is a test message)
         csv_status = False
-        ascii_status = None  # Initialize as None for new events
+        ascii_status = False
         
         if not is_test:
             # Save to CSV (always append new records)
             csv_status = notice_handler.save_to_csv(notice_data)
             
+            # 4-1. Update existing event
             # If this is an update, save ASCII first and send thread message
             if is_update and thread_ts:
                 # For updates, save ASCII with existing thread_ts first
@@ -1877,17 +1878,23 @@ def process_notice_and_send_message(topic, value, slack_client, slack_channel, i
                 
                 return True, "Thread update sent successfully"
             
+            # 4-2. New event
             # If this is a new event, send full message
             else:
-                # For new events, don't show ASCII status in initial message
-                # because it depends on getting thread_ts from Slack response
+                # For new events, save ASCII without thread_ts first
+                try:
+                    ascii_status = notice_handler.save_to_ascii(notice_data, new_thread_ts)
+                    logger.info(f"Updated ASCII entry with thread_ts: {new_thread_ts}")
+                except Exception as e:
+                    logger.error(f"Error updating ASCII entry with thread_ts: {e}")
+                    ascii_status = False
                 
-                # 5. Format the full message for Slack (without ASCII status for new events)
+                # Format the full message for Slack
                 slack_message, lc_url = format_message_for_slack(
                     topic=topic,
                     value=value,
                     csv_status=csv_status,
-                    ascii_status=None,  # Don't show ASCII status for new events
+                    ascii_status=ascii_status,
                     test_mode=is_test,
                     notice_data=notice_data
                 )
@@ -1927,27 +1934,7 @@ def process_notice_and_send_message(topic, value, slack_client, slack_channel, i
                         
                         new_thread_ts = response['ts']
                         logger.info(f"Sent new message for {facility} trigger {trigger_num}, thread_ts: {new_thread_ts}")
-                        
-                        # Now save ASCII with the new thread_ts
-                        ascii_status = notice_handler.save_to_ascii(notice_data, new_thread_ts)
-                        
-                        # Send a small context update about database save status
-                        if ascii_status:
-                            context_message = "✅ Event data saved to databases successfully"
-                        else:
-                            context_message = "⚠️ Event data partially saved (CSV: ✅, ASCII: ❌)"
-                        
-                        try:
-                            slack_client.chat_postMessage(
-                                channel=slack_channel,
-                                thread_ts=new_thread_ts,
-                                text=context_message,
-                                unfurl_links=False,
-                                unfurl_media=False
-                            )
-                        except Exception as e:
-                            logger.error(f"Error sending database status update: {e}")
-                        
+                                                
                         # Add LC URL as thread reply if available
                         if lc_url:
                             try:
