@@ -787,7 +787,7 @@ def _get_facility_emoji(facility):
     
     # Einstein Probe - Telescope
     elif 'EINSTEIN' in facility_upper:
-        return '👨‍🦳'  # Telescope for Einstein Probe
+        return '👴'  # Telescope for Einstein Probe
     
     # IceCube neutrino detectors - Ice/snow
     elif 'ICECUBE' in facility_upper:
