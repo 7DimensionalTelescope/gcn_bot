@@ -94,9 +94,18 @@ except Exception as e:
 # Restore original sys.argv after imports
 sys.argv = original_argv
 
-# Set up logging
+# Set up logging to file
 log_level = logging.DEBUG if args.verbose else logging.INFO
-logging.basicConfig(level=log_level, format='%(asctime)s - %(levelname)s - %(message)s')
+
+# Configure logging to write to file
+logging.basicConfig(
+    level=log_level,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('./test_plots/visibility_test_improved.log', mode='w'),  # Write to file
+        logging.StreamHandler() if args.verbose else logging.NullHandler()  # Console only if verbose
+    ]
+)
 logger = logging.getLogger(__name__)
 
 class ThreadTester:
