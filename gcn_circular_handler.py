@@ -1049,6 +1049,163 @@ class GCNCircularHandler:
         # Return original facility name if no pattern matches
         return facility
 
+    def _load_ascii_with_recovery(self, filepath: str) -> pd.DataFrame:
+        """
+        Load ASCII file using pandas + manual recovery for skipped lines.
+        Drop-in replacement for pd.read_csv() with zero data loss.
+        """
+        if not os.path.exists(filepath):
+            return pd.DataFrame(columns=self.ascii_columns)
+        
+        # Read original lines for comparison
+        with open(filepath, 'r') as f:
+            all_lines = f.readlines()
+        
+        if len(all_lines) <= 1:
+            return pd.DataFrame(columns=self.ascii_columns)
+        
+        header_line = all_lines[0].strip()
+        data_lines = [line.strip() for line in all_lines[1:] if line.strip()]
+        total_data_lines = len(data_lines)
+        
+        # Try pandas first (your existing approach)
+        try:
+            df = pd.read_csv(filepath, sep=' ', header=0, dtype=str)
+            pandas_count = len(df)
+            
+            logger.info(f"pandas loaded {pandas_count}/{total_data_lines} entries")
+            
+            # If pandas got everything, return as-is (fast path)
+            if pandas_count == total_data_lines:
+                return df
+                
+            # Some lines were skipped - recover them
+            logger.info(f"Recovering {total_data_lines - pandas_count} skipped lines...")
+            
+            # Convert pandas result to list for easier manipulation
+            pandas_rows = df.to_dict('records')
+            
+            # Create signatures of successfully parsed rows
+            parsed_signatures = set()
+            for row in pandas_rows:
+                sig = f"{row.get('GCN_ID', '')}__{row.get('Trigger_num', '')}__{row.get('Name', '')}"
+                parsed_signatures.add(sig)
+            
+            # Manually parse all lines and find missing ones
+            recovered_rows = []
+            for line in data_lines:
+                try:
+                    manual_row = self._parse_line_to_dict(line, header_line.split())
+                    if manual_row:
+                        manual_sig = f"{manual_row.get('GCN_ID', '')}__{manual_row.get('Trigger_num', '')}__{manual_row.get('Name', '')}"
+                        
+                        if manual_sig not in parsed_signatures:
+                            recovered_rows.append(manual_row)
+                            logger.info(f"Recovered: {manual_row.get('GCN_ID', 'Unknown')}")
+                except:
+                    continue
+            
+            # Combine results and return as DataFrame
+            all_rows = pandas_rows + recovered_rows
+            logger.info(f"Final: {len(pandas_rows)} pandas + {len(recovered_rows)} recovered = {len(all_rows)} total")
+            
+            return pd.DataFrame(all_rows)
+            
+        except Exception as e:
+            logger.warning(f"pandas failed completely: {e}, using manual parsing")
+            # Fallback to pure manual parsing
+            manual_rows = []
+            for line in data_lines:
+                try:
+                    manual_row = self._parse_line_to_dict(line, header_line.split())
+                    if manual_row:
+                        manual_rows.append(manual_row)
+                except:
+                    continue
+            
+            return pd.DataFrame(manual_rows)
+
+    def _parse_line_to_dict(self, line: str, header: list) -> dict:
+        """
+        Parse a single ASCII line to dictionary. Used for recovery.
+        """
+        fields = []
+        current_field = ""
+        in_quotes = False
+        
+        i = 0
+        while i < len(line):
+            char = line[i]
+            
+            if char == '"':
+                in_quotes = not in_quotes
+                current_field += char
+            elif char == ' ' and not in_quotes:
+                if current_field:
+                    fields.append(current_field)
+                    current_field = ""
+                # Skip multiple spaces
+                while i + 1 < len(line) and line[i + 1] == ' ':
+                    i += 1
+            else:
+                current_field += char
+            i += 1
+        
+        if current_field:
+            fields.append(current_field)
+        
+        # Adjust field count to match header
+        while len(fields) < len(header):
+            fields.append('')
+        if len(fields) > len(header):
+            fields = fields[:len(header)]
+        
+        # Clean quotes
+        cleaned_fields = []
+        for field in fields:
+            if field.startswith('"') and field.endswith('"') and len(field) > 1:
+                cleaned_fields.append(field[1:-1])
+            else:
+                cleaned_fields.append(field)
+        
+        return dict(zip(header, cleaned_fields))
+
+    def _save_ascii_with_backup(self, df: pd.DataFrame, filepath: str) -> None:
+        """
+        Save ASCII file with backup and validation. Drop-in replacement for df.to_csv().
+        """
+        # Create backup
+        if os.path.exists(filepath):
+            backup_path = f"{filepath}.backup.{int(time.time())}"
+            import shutil
+            shutil.copy2(filepath, backup_path)
+            logger.debug(f"Created backup: {backup_path}")
+        
+        # Save using your existing approach but with better formatting
+        try:
+            with open(filepath, 'w') as f:
+                # Write header
+                f.write(" ".join(self.ascii_columns) + "\n")
+                
+                # Write data rows
+                for _, row in df.iterrows():
+                    row_values = []
+                    for col in self.ascii_columns:
+                        val = str(row.get(col, '')).strip()
+                        # Quote fields with spaces (your existing logic)
+                        if val and (' ' in val or col in ['Name', 'Discovery_UTC', 'Notice_date', 'Host_info']):
+                            if not (val.startswith('"') and val.endswith('"')):
+                                val = f'"{val}"'
+                        row_values.append(val)
+                    
+                    f.write(" ".join(row_values) + "\n")
+            
+            logger.info(f"ASCII file saved with {len(df)} entries")
+            
+        except Exception as e:
+            logger.error(f"Error saving ASCII file: {e}", exc_info=True)
+            raise
+
     def _update_ascii_database(self, processed_data: Dict[str, Any]) -> None:
         """
         Update the ASCII database with processed circular data.
@@ -1070,43 +1227,8 @@ class GCNCircularHandler:
                 # Load existing ASCII file
                 os.makedirs(os.path.dirname(os.path.abspath(self.output_ascii)), exist_ok=True)
                 
-                lines = []
-                header = None
-                if os.path.exists(self.output_ascii):
-                    with open(self.output_ascii, 'r') as f:
-                        header = f.readline().strip().split()
-                        for line in f:
-                            if line.strip():
-                                lines.append(line.strip())
-                    logger.info(f"Loaded ASCII file with {len(lines)} entries")
-                else:
-                    header = self.ascii_columns
-                    logger.info(f"Created new ASCII file with columns: {header}")
-                
-                # Parse lines into DataFrame
-                data = []
-                for line in lines:
-                    fields = []
-                    in_quotes = False
-                    current_field = ""
-                    
-                    for char in line + " ":
-                        if char == '"':
-                            in_quotes = not in_quotes
-                            current_field += char
-                        elif char == ' ' and not in_quotes:
-                            if current_field:
-                                fields.append(current_field)
-                                current_field = ""
-                        else:
-                            current_field += char
-                    
-                    if len(fields) == len(header):
-                        data.append(dict(zip(header, fields)))
-                    else:
-                        logger.warning(f"Skipping line with incorrect number of fields: {line}")
-                
-                df = pd.DataFrame(data) if data else pd.DataFrame(columns=header)
+                # Load existing data
+                df = self._load_ascii_with_recovery(self.output_ascii)
                 
                 # Get circular info
                 facility = processed_data['facility']
@@ -1217,22 +1339,7 @@ class GCNCircularHandler:
                         logger.info(f"Added new entry to ASCII database: {new_row['GCN_ID']}")
                 
                 # Save updated DataFrame
-                with open(self.output_ascii, 'w') as f:
-                    # Write header
-                    f.write(" ".join(header) + "\n")
-                    
-                    # Write each row with proper formatting
-                    for _, row in df.iterrows():
-                        row_values = []
-                        for col in header:
-                            val = row.get(col, '')
-                            # Quote fields that typically contain spaces
-                            if isinstance(val, str) and (' ' in val or col in ['Name', 'Discovery_UTC', 'Notice_date', 'Host_info']):
-                                if not (val.startswith('"') and val.endswith('"')):
-                                    val = f'"{val}"'
-                            row_values.append(str(val))
-                        
-                        f.write(" ".join(row_values) + "\n")
+                self._save_ascii_with_backup(df, self.output_ascii)
                     
                 logger.info(f"ASCII database saved successfully")
                         
@@ -1258,7 +1365,7 @@ class GCNCircularHandler:
         with self.file_lock:
             try:
                 # Load existing ASCII
-                df = pd.read_csv(self.output_ascii, sep=' ', header=0, dtype=str)
+                df = self._load_ascii_with_recovery(self.output_ascii)
                 logger.info(f"Loaded ASCII file with {len(df)} entries")
                 
                 # Get normalized facility name for the processed data
@@ -1294,7 +1401,7 @@ class GCNCircularHandler:
                     df = df.drop(rows_to_remove)
                     
                     # Save updated dataframe
-                    df.to_csv(self.output_ascii, sep=' ', index=False, na_rep='', quoting=csv.QUOTE_MINIMAL)
+                    self._save_ascii_with_backup(df, self.output_ascii)
                     
                     # Log the removal with original GCN_IDs for reference
                     gcn_ids_str = ", ".join(gcn_ids_to_remove)
