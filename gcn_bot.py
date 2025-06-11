@@ -1926,12 +1926,20 @@ def process_notice_and_send_message(topic, value, slack_client, slack_channel, i
             
             # 4-2. New event
             else:
-                # Format the full message for Slack
+                # First save to ASCII without thread_ts to get correct status
+                try:
+                    ascii_status = notice_handler.save_to_ascii(notice_data)
+                    logger.info(f"Initial ASCII save completed with status: {ascii_status}")
+                except Exception as e:
+                    logger.error(f"Error with initial ASCII save: {e}")
+                    ascii_status = False
+                
+                # Format the full message for Slack with correct ASCII status
                 slack_message, lc_url, notice_url = format_message_for_slack(
                     topic=topic,
                     value=value,
                     csv_status=csv_status,
-                    ascii_status=ascii_status,
+                    ascii_status=ascii_status,  # Now shows correct status
                     test_mode=is_test,
                     notice_data=notice_data
                 )
@@ -1972,13 +1980,13 @@ def process_notice_and_send_message(topic, value, slack_client, slack_channel, i
                         new_thread_ts = response['ts']
                         logger.info(f"Sent new message for {facility} trigger {trigger_num}, thread_ts: {new_thread_ts}")
                         
-                        # For new events, save ASCII with thread_ts
+                        # Update ASCII entry with thread_ts
                         try:
-                            ascii_status = notice_handler.save_to_ascii(notice_data, new_thread_ts)
-                            logger.info(f"Updated ASCII entry with thread_ts: {new_thread_ts}")
+                            ascii_update_status = notice_handler.save_to_ascii(notice_data, new_thread_ts)
+                            logger.info(f"Updated ASCII entry with thread_ts: {new_thread_ts}, status: {ascii_update_status}")
                         except Exception as e:
                             logger.error(f"Error updating ASCII entry with thread_ts: {e}")
-                            ascii_status = False
+                            # Note: Don't update ascii_status here as the message already shows correct initial status
                         
                         # Send consolidated URL message to thread
                         url_messages = []
@@ -2018,23 +2026,32 @@ def process_notice_and_send_message(topic, value, slack_client, slack_channel, i
                                     title=plot_title
                                 )
                                 logger.info(f"Uploaded visibility plot to thread")
-                                
-                                # Clean up plot file
-                                if not plot_path.startswith('./test_plots'):
-                                    os.remove(plot_path)
-                            except Exception as e:
-                                logger.error(f"Error uploading plot: {e}")
+                            except Exception as plot_error:
+                                logger.error(f"Error uploading plot to thread: {plot_error}")
                         
                         # Send ToO email if criteria are met
                         _send_too_email_if_criteria_met(notice_data, visibility_info)
                         
-                        return True, "New message sent successfully"
+                        # Clean up plot file if it was created (for successful message sending)
+                        if plot_path and os.path.exists(plot_path) and not plot_path.startswith('./test_plots'):
+                            try:
+                                os.remove(plot_path)
+                            except Exception as e:
+                                logger.warning(f"Error removing plot file: {e}")
                         
+                        return True, "New message sent successfully"
+                                
                     except Exception as e:
                         logger.error(f"Error sending Slack message: {e}")
                         return False, f"Error sending message: {str(e)}"
                 else:
                     logger.info("Test mode without --send flag: Skipping Slack message")
+                    # Clean up plot file if it was created (even in test mode)
+                    if plot_path and os.path.exists(plot_path) and not plot_path.startswith('./test_plots'):
+                        try:
+                            os.remove(plot_path)
+                        except Exception as e:
+                            logger.warning(f"Error removing plot file: {e}")
                     return True, "Test completed (no messages sent)"
         else:
             logger.info("Test mode: Skipping database save")
