@@ -970,6 +970,7 @@ class GCNCircularHandler:
     def _normalize_facility_name(self, facility: str) -> str:
         """
         Normalize facility names to group instruments from the same mission.
+        Enhanced to handle various formats from both notices and circulars.
         
         Args:
             facility (str): Original facility name
@@ -979,17 +980,74 @@ class GCNCircularHandler:
         """
         if not facility:
             return ""
-            
-        if "Swift" in facility:
+        
+        # Convert to lower case for case-insensitive matching
+        facility_lower = facility.lower()
+        
+        # Swift facilities - check for various formats
+        swift_patterns = [
+            'swift', 'swift-bat', 'swift-xrt', 'swift-uvot', 'swift/bat', 
+            'swift/xrt', 'swift/uvot', 'swift bat', 'swift xrt', 'swift uvot',
+            'swiftbat', 'swiftxrt', 'swiftuvot'
+        ]
+        if any(pattern in facility_lower for pattern in swift_patterns):
             return "Swift"
-        elif "Fermi" in facility:
+        
+        # Fermi facilities - check for various formats including full names
+        fermi_patterns = [
+            'fermi', 'fermi-gbm', 'fermi-lat', 'fermi gbm', 'fermi lat',
+            'fermigbm', 'fermilat', 'fermi gamma-ray burst monitor',
+            'fermi gamma ray burst monitor', 'fermi large area telescope',
+            'gbm', 'lat'
+        ]
+        if any(pattern in facility_lower for pattern in fermi_patterns):
             return "Fermi"
-        elif "IceCube" in facility or "AMON" in facility:
-            return "IceCube"
-        elif "Einstein" in facility:
+        
+        # Einstein Probe facilities
+        einstein_patterns = [
+            'einstein', 'einstein probe', 'einstein-probe', 'einsteinprobe',
+            'ep-wxt', 'ep-fxt', 'ep/wxt', 'ep/fxt', 'ep wxt', 'ep fxt'
+        ]
+        if any(pattern in facility_lower for pattern in einstein_patterns):
             return "EinsteinProbe"
-        else:
-            return facility
+        
+        # IceCube and AMON facilities
+        icecube_patterns = [
+            'icecube', 'ice-cube', 'ice cube', 'amon', 'hawc',
+            'icecubecascade', 'icecubebronze', 'icecubegold', 'icecube_cascade',
+            'icecube_bronze', 'icecube_gold', 'icecube cascade', 'icecube bronze', 
+            'icecube gold'
+        ]
+        if any(pattern in facility_lower for pattern in icecube_patterns):
+            return "IceCube"
+        
+        # MAXI facilities
+        maxi_patterns = ['maxi', 'maxi-gsc', 'maxi/gsc', 'maxi gsc']
+        if any(pattern in facility_lower for pattern in maxi_patterns):
+            return "MAXI"
+        
+        # INTEGRAL facilities
+        integral_patterns = ['integral', 'integral-spi', 'integral/spi', 'integral spi']
+        if any(pattern in facility_lower for pattern in integral_patterns):
+            return "INTEGRAL"
+        
+        # Konus facilities
+        konus_patterns = ['konus', 'konus-wind', 'konus/wind', 'konus wind']
+        if any(pattern in facility_lower for pattern in konus_patterns):
+            return "Konus"
+        
+        # CALET facilities
+        calet_patterns = ['calet', 'calet-gbm', 'calet/gbm', 'calet gbm']
+        if any(pattern in facility_lower for pattern in calet_patterns):
+            return "CALET"
+        
+        # Insight-HXMT facilities
+        hxmt_patterns = ['insight-hxmt', 'insight/hxmt', 'insight hxmt', 'hxmt']
+        if any(pattern in facility_lower for pattern in hxmt_patterns):
+            return "HXMT"
+        
+        # Return original facility name if no pattern matches
+        return facility
 
     def _update_ascii_database(self, processed_data: Dict[str, Any]) -> None:
         """
@@ -1184,44 +1242,52 @@ class GCNCircularHandler:
     def _remove_false_trigger_from_ascii(self, processed_data: Dict[str, Any]) -> None:
         """
         Remove a false trigger from the ASCII database if it exists.
-        Uses normalized facility names for matching but preserves original GCN_IDs.
+        Enhanced with better facility name matching and detailed logging.
         
         Args:
             processed_data (Dict[str, Any]): The processed circular data containing false trigger
         """
         if not os.path.exists(self.output_ascii):
+            logger.warning("ASCII file does not exist, skipping false trigger removal")
             return
             
         if not processed_data.get('facility') or not processed_data.get('trigger_num'):
+            logger.warning("Missing facility or trigger_num in processed data, skipping ASCII update")
             return
             
         with self.file_lock:
             try:
                 # Load existing ASCII
                 df = pd.read_csv(self.output_ascii, sep=' ', header=0, dtype=str)
+                logger.info(f"Loaded ASCII file with {len(df)} entries")
                 
                 # Get normalized facility name for the processed data
                 facility = processed_data['facility']
-                trigger_num = processed_data['trigger_num']
+                trigger_num = str(processed_data['trigger_num'])
                 normalized_facility = self._normalize_facility_name(facility)
+                
+                logger.info(f"Looking for false trigger to remove: facility='{facility}' (normalized='{normalized_facility}'), trigger='{trigger_num}'")
                 
                 # Find rows to remove - any with matching normalized facility and trigger
                 rows_to_remove = []
                 gcn_ids_to_remove = []
                 
                 for idx, row in df.iterrows():
-                    row_facility = row.get('Facility', '')
-                    row_trigger = row.get('Trigger_num', '')
-                    row_gcn_id = row.get('GCN_ID', '')
+                    row_facility = str(row.get('Facility', '')).strip()
+                    row_trigger = str(row.get('Trigger_num', '')).strip()
+                    row_gcn_id = str(row.get('GCN_ID', '')).strip()
                     
                     # Normalize the row's facility
                     normalized_row_facility = self._normalize_facility_name(row_facility)
                     
+                    logger.debug(f"Checking row {idx}: facility='{row_facility}' (normalized='{normalized_row_facility}'), trigger='{row_trigger}', gcn_id='{row_gcn_id}'")
+                    
                     # Check if normalized facilities and trigger numbers match
                     if (normalized_row_facility == normalized_facility and 
-                        str(row_trigger) == str(trigger_num)):
+                        row_trigger == trigger_num):
                         rows_to_remove.append(idx)
                         gcn_ids_to_remove.append(row_gcn_id)
+                        logger.info(f"Found matching entry to remove: {row_gcn_id} (original facility: {row_facility})")
                 
                 if rows_to_remove:
                     # Remove the false triggers
@@ -1232,10 +1298,24 @@ class GCNCircularHandler:
                     
                     # Log the removal with original GCN_IDs for reference
                     gcn_ids_str = ", ".join(gcn_ids_to_remove)
-                    logger.info(f"Removed {len(rows_to_remove)} false trigger entries matching {normalized_facility}_{trigger_num} from ASCII database. GCN_IDs: {gcn_ids_str}")
-                else:
-                    logger.debug(f"No entries found to remove for false trigger {normalized_facility}_{trigger_num}")
+                    logger.info(f"Successfully removed {len(rows_to_remove)} false trigger entries matching {normalized_facility}_{trigger_num} from ASCII database. GCN_IDs: {gcn_ids_str}")
                     
+                    # Log summary of remaining entries for this facility
+                    remaining_count = len(df[df['Facility'].apply(lambda x: self._normalize_facility_name(str(x)) == normalized_facility)])
+                    logger.info(f"Remaining entries for {normalized_facility}: {remaining_count}")
+                    
+                else:
+                    logger.warning(f"No entries found to remove for false trigger {normalized_facility}_{trigger_num}")
+                    
+                    # Debug: show all existing entries for this facility
+                    facility_entries = df[df['Facility'].apply(lambda x: self._normalize_facility_name(str(x)) == normalized_facility)]
+                    if len(facility_entries) > 0:
+                        logger.debug(f"Existing {normalized_facility} entries:")
+                        for _, entry in facility_entries.iterrows():
+                            logger.debug(f"  - Trigger: {entry.get('Trigger_num', 'N/A')}, GCN_ID: {entry.get('GCN_ID', 'N/A')}")
+                    else:
+                        logger.debug(f"No existing entries found for facility {normalized_facility}")
+                        
             except Exception as e:
                 logger.error(f"Error removing false trigger from ASCII database: {e}", exc_info=True)
                 
