@@ -143,168 +143,206 @@ class GCNCircularHandler:
         Define and precompile regex patterns for extracting information from circulars.
         This improves performance for repeated pattern matching.
         """
-        # Raw pattern definitions (not compiled)
         self.patterns = {
-            # Position patterns for different facilities
             'position': {
                 'Swift-XRT': [
-                    # Enhanced Swift-XRT position with decimal degrees
                     r"Enhanced Swift-XRT position.*?RA,\s*Dec\s*=\s*([\d.]+),\s*([-+]?[\d.]+).*?uncertainty\s+of\s+([\d.]+)\s*([\"\'arcsec]+)",
-                    # Enhanced Swift-XRT position with sexagesimal format
                     r"RA\s*\(J2000\):\s*(\d{2})h\s*(\d{2})m\s*([\d.]+)s.*?Dec\s*\(J2000\):\s*([-+]?\d{2})d\s*(\d{2})\'\s*([\d.]+)\".*?uncertainty\s+of\s+([\d.]+)\s*([\"\'arcsec]+)",
-                    # General XRT position format
-                    r"XRT.*?RA,Dec\s*=\s*([\d.]+),\s*([-+]?[\d.]+).*?uncertainty\s+of\s+([\d.]+)\s*([\"\'arcsec]+)",
+                    r"RA,\s*Dec[:\s]*=?\s*([\d.]+),\s*([-+]?[\d.]+).*?uncertainty\s+of\s+([\d.]+)\s*([\"\'arcsec]+)",
+                    r"RA,\s*Dec[:\s]*=?\s*([\d.]+),\s*([-+]?[\d.]+).*?with\s+an\s+uncertainty\s+of\s+([\d.]+)\s*([\"\'arcsec]+)",
+                    r"RA,\s*Dec:\s*([\d.]+),\s*([-+]?[\d.]+).*?uncertainty\s+of\s+([\d.]+)\s*([\"\'arcsec]+)",
+                    r"located\s+at\s+RA,\s*Dec\s*([\d.]+),\s*([-+]?[\d.]+).*?uncertainty\s+of\s+([\d.]+)\s*([\"\'arcsec]+)",
                 ],
                 'Swift-BAT': [
-                    # BAT position format
-                    r"Swift.*?BAT.*?RA,\s*Dec\s*=\s*([\d.]+),\s*([-+]?[\d.]+).*?error\s+radius\s+of\s+([\d.]+)\s*([\"\'arcsec]+)",
-                ],
-                'Fermi-GBM': [
-                    # Fermi GBM position
-                    r"best\s+(?:LAT\s+)?(?:on-ground\s+)?location.*?RA,\s*Dec\s*=\s*([\d.]+),\s*([-+]?[\d.]+).*?\(J2000\).*?error\s+radius\s+of\s+([\d.]+)\s*deg",
-                ],
-                'Fermi-LAT': [
-                    # Fermi LAT position
-                    r"LAT.*?RA,\s*Dec\s*=\s*([\d.]+),\s*([-+]?[\d.]+).*?\(J2000\).*?error\s+radius\s+of\s+([\d.]+)\s*deg",
-                    # Added specific format seen in sample5
-                    r"best LAT on-ground location.*?RA,\s*Dec\s*=\s*([\d.]+),\s*([-+]?[\d.]+).*?\(J2000\).*?error\s+radius\s+of\s+([\d.]+)\s*deg",
-                ],
-                'Einstein-Probe': [
-                    # EP position formats
-                    r"EP.*?RA,\s*Dec\s*=\s*([\d.]+),\s*([-+]?[\d.]+).*?uncertainty\s+of\s+([\d.]+)\s*([\"\'arcsec]+)",
-                    r"EP.*?RA\s*=\s*([\d.]+),\s*Dec\s*=\s*([-+]?[\d.]+).*?error\s+of\s+([\d.]+)\s*([\"\'arcsec]+)",
-                ],
-            },
-            # False trigger patterns
-            'false_trigger': {
-                'general': [
-                    r"(?:is\s+not\s+a\s+GRB|is\s+not\s+due\s+to\s+a\s+GRB|not\s+a\s+real\s+source|false\s+trigger|retraction)",
-                    # Add this pattern to catch "in fact not due to a GRB"
-                    r"in\s+fact\s+not\s+due\s+to\s+a\s+GRB",
-                    # Add pattern to detect from the subject line
-                    r"is\s+not\s+a\s+GRB"
-                ],
-                'Fermi': [
-                    r"Fermi.*?trigger\s+([\d/]+).*?is\s+not\s+a\s+GRB",
-                    r"Fermi.*?trigger\s+([\d/]+).*?not\s+due\s+to\s+a\s+GRB",
-                    # Add more specific pattern for Fermi false triggers
-                    r"Fermi.*?trigger.*?tentatively\s+classified\s+as\s+a\s+GRB.*?not\s+due\s+to"
+                    r"BAT.*?RA,\s*Dec\s*([\d.]+),\s*([-+]?[\d.]+).*?uncertainty\s+of\s+([\d.]+)\s*([\"\'arcmin]+)",
+                    r"RA,\s*Dec\s*([\d.]+),\s*([-+]?[\d.]+).*?uncertainty\s+of\s+([\d.]+)\s*([\"\'arcmin]+)",
                 ],
                 'Swift': [
-                    r"Swift\s+Trigger\s+(\d+)\s+is\s+not\s+a\s+GRB",
-                ]
+                    r"RA\s*\(J2000\)\s*=\s*(\d{2})h\s*(\d{2})m\s*([\d.]+)s.*?Dec\s*\(J2000\)\s*=\s*([-+]?\d{2})d\s*(\d{2})\'\s*([\d.]+)\".*?uncertainty\s+of\s+([\d.]+)\s*([\"\'arcsec]+)",
+                ],
+                'Fermi': [
+                    r"RA,\s*Dec\s*=\s*([\d.]+),\s*([-+]?[\d.]+).*?error\s+radius\s+of\s+([\d.]+)\s*([\"\'deg]+)",
+                ],
+                'IceCube': [
+                    r"RA,\s*Dec\s*=\s*([\d.]+),\s*([-+]?[\d.]+).*?uncertainty\s+of\s+([\d.]+)\s*([\"\'deg]+)",
+                    r"best\s+fit\s+position.*?RA\s*[=:]\s*([\d.]+).*?Dec\s*[=:]\s*([-+]?[\d.]+).*?uncertainty.*?([\d.]+)\s*([\"\'deg]+)",
+                ],
+                'CALET': [
+                    r"RA,\s*Dec\s*=\s*([\d.]+),\s*([-+]?[\d.]+).*?error\s+(?:radius|box)\s+of\s+([\d.]+)\s*([\"\'deg]+)",
+                ],
+                'SVOM': [
+                    r"R\.A\.,\s*Dec\.\s*([\d.]+),\s*([-+]?[\d.]+)\s*degrees.*?radius\s+of\s+([\d.]+)\s*([\"\'arcmin]+)",
+                    r"RA,\s*Dec\s*([\d.]+),\s*([-+]?[\d.]+).*?error\s+radius\s+of\s+([\d.]+)\s*([\"\'arcmin\s]+)",
+                ],
+                'GECAM': [
+                    r"RA,\s*Dec\s*=\s*([\d.]+),\s*([-+]?[\d.]+).*?error\s+radius\s+of\s+([\d.]+)\s*([\"\'deg]+)",
+                ],
+                'AMON': [
+                    r"RA,\s*Dec\s*=\s*([\d.]+),\s*([-+]?[\d.]+).*?uncertainty.*?([\d.]+)\s*([\"\'deg]+)",
+                ],
+                'HAWC': [
+                    r"RA,\s*Dec\s*=\s*([\d.]+),\s*([-+]?[\d.]+).*?containment.*?([\d.]+)\s*([\"\'deg]+)",
+                ],
             },
-            # Enhanced redshift patterns
+            'false_trigger': {
+                'general': [
+                    r"not\s+(?:due\s+to\s+)?(?:a\s+)?GRB",
+                    r"false\s+(?:positive|trigger|alarm)",
+                    r"not\s+a\s+(?:real\s+)?(?:burst|GRB)",
+                    r"(?:likely\s+)?(?:due\s+to|caused\s+by)\s+(?:local\s+particles|SAA|background)",
+                    r"retraction",
+                ],
+                'Swift': [
+                    r"Swift.*?(?:false|not\s+a\s+GRB)",
+                ],
+                'Fermi': [
+                    r"Fermi.*?(?:not\s+due\s+to\s+a\s+GRB|false\s+trigger)",
+                    r"GBM.*?(?:not\s+due\s+to\s+a\s+GRB|false\s+trigger)",
+                ],
+                'GECAM': [
+                    r"GECAM.*?(?:false|not\s+a\s+GRB)",
+                ],
+                'SVOM': [
+                    r"SVOM.*?(?:false|not\s+a\s+GRB)",
+                ],
+            },
             'redshift': {
                 'general': [
-                    # Common redshift notations
-                    r"redshift\s*(?:=|of)\s*([\d.]+)(?:\s*(?:±|\+/-)\s*([\d.]+))?",
-                    r"common\s+redshift\s+(?:of\s+)?z\s*=\s*([\d.]+)(?:\s*(?:±|\+/-)\s*([\d.]+))?",
+                    r"redshift\s+(?:of\s+)?z\s*[=~]\s*([\d.]+)(?:\s*(?:±|\+/-)\s*([\d.]+))?",
+                    r"at\s+z\s*[=~]\s*([\d.]+)(?:\s*(?:±|\+/-)\s*([\d.]+))?",
+                    r"common\s+redshift\s+(?:of\s+)?z?\s*=?\s*([\d.]+)(?:\s*(?:±|\+/-)\s*([\d.]+))?",
                     r"redshift\s+at\s+z\s*(?:=|~)\s*([\d.]+)(?:\s*(?:±|\+/-)\s*([\d.]+))?",
                     r"z\s*=\s*([\d.]+)(?:\s*(?:±|\+/-)\s*([\d.]+))?",
-                    # Added formats - separated from general pattern for clarity
                     r"spectroscopic\s+redshift.*?(?:of|=)\s*([\d.]+)(?:\s*(?:±|\+/-)\s*([\d.]+))?",
                     r"measured\s+redshift.*?(?:of|=)\s*([\d.]+)(?:\s*(?:±|\+/-)\s*([\d.]+))?",
                     r"confirmed\s+redshift.*?(?:of|=)\s*([\d.]+)(?:\s*(?:±|\+/-)\s*([\d.]+))?",
-                    # Pattern to catch format in sample3 (very specific)
                     r"common\s+redshift\s+of\s+([\d.]+)±([\d.]+)",
                 ]
             },
-            # Host galaxy patterns
             'host_galaxy': {
                 'general': [
                     r"host\s+galaxy.*?([^\.;]+(?:galaxy|mag|magnitude)[^\.;]+)",
                     r"([^\.;]+host\s+galaxy[^\.;]+)",
                     r"putative\s+host.*?([^\.;]+)",
-                    # Add more specific pattern to match sample3
                     r"bright\s+galaxy\s+within\s+the\s+localization.*?([^\.;]+)",
-                    # Pattern to catch the last sentence in sample3
                     r"supporting\s+it\s+as\s+a\s+likely\s+host\s+galaxy\s+of\s+the\s+GRB",
-                    # Additional general patterns
                     r"coincidence\s+between\s+the\s+(?:bright\s+)?galaxy\s+and\s+the\s+XRT\s+localization.*?([^\.;]+)",
                     r"([^\.;]+likely\s+host\s+galaxy[^\.;]+)",
                 ]
             },
-            # Trigger number patterns - IMPROVED
             'trigger_num': {
                 'Swift': [
+                    r"\(trigger\s*=\s*(\d+)\)",
+                    r"trigger\s*=\s*(\d+)",
+                    r"trigger\s*[:\s]\s*(\d+)",
                     r"(?:Swift|BAT).*?trigger(?:[=:])?\s*(\d+)",
                     r"Swift\s+Trigger\s+(\d+)",
                     r"BAT\s+trigger\s+#?(\d+)",
                     r"(?:after|of)\s+the\s+BAT\s+trigger\s+\(.*?GCN\s+Circ\.\s+(\d+)\)",
-                    # Added patterns
                     r"Trigger\s+Number\s*:\s*(\d+)",
                     r"\(Gupta\s+et\s+al\.,\s+GCN\s+Circ\.\s+(\d+)\)",
-                ],
-                'Einstein-Probe': [
-                    r"EP-WXT\s+trigger\s+([\w\d]+)",
-                    r"EP.*?ID\s*(?::|=)\s*(?:\[)?[\'\"]*(\d+)[\'\"]*(?:\])?",
-                    r"EP.*?trigger\s+#?(\d+)",
+                    r"GCN\s+Circ\.\s+(\d+)",
+                    r"GCN\s+Circular\s+(\d+)",
+                    r"for\s+GRB.*?\(.*?(\d{6,})\)",
                 ],
                 'Fermi': [
                     r"(?:Fermi-GBM|GBM)\s+(?:\()?trigger\s+([\d/]+)",
                     r"trigger(?:[=:])?\s*(\d+)/(\d+)",
                     r"Fermi.*?trigger\s+(\d+)",
                     r"GBM.*?trigger\s+#?(\d+)",
-                    # Add pattern for specific format "(trigger 764205327 / 250320969, GCN 39792)"
                     r"Fermi-GBM\s+\(trigger\s+(\d+)\s*/\s*\d+",
                     r"\(trigger\s+(\d+)\s*/\s*\d+",
-                ]
+                ],
+                'Einstein-Probe': [
+                    r"EP-WXT\s+trigger\s+([\w\d]+)",
+                    r"EP.*?ID\s*(?::|=)\s*(?:\[)?[\'\"]*(\d+)[\'\"]*(?:\])?",
+                    r"EP.*?trigger\s+#?(\d+)",
+                ],
+                'IceCube': [
+                    r"IceCube.*?event\s+(\w+)",
+                    r"Event\s+ID[:\s]*(\w+)",
+                    r"IC\d+\s+(\w+)",
+                    r"alert\s+(\w+)",
+                    r"neutrino\s+event.*?(\w+)",
+                ],
+                'CALET': [
+                    r"CALET.*?trigger\s+(\d+)",
+                    r"trigger\s+(\d+).*?CALET",
+                    r"event\s+(\d+).*?CALET",
+                ],
+                'SVOM': [
+                    r"sb\d+",
+                    r"SVOM.*?burst-id\s+(sb\d+)",
+                    r"SVOM.*?trigger\s+(\w+)",
+                ],
+                'GECAM': [
+                    r"GECAM.*?GRB\s+(\d{6}[A-Z])",
+                    r"burst\s+GRB\s+(\d{6}[A-Z])",
+                    r"GRB\s+(\d{6}[A-Z]).*?GECAM",
+                ],
+                'AMON': [
+                    r"Event\s+(\d+)",
+                    r"AMON.*?(\d+)",
+                    r"coincidence.*?(\d+)",
+                ],
+                'HAWC': [
+                    r"HAWC.*?trigger\s+(\d+)",
+                    r"burst.*?(\d+)",
+                ],
+                'LVC': [
+                    r"(S\d+\w+)",
+                    r"LIGO.*?(S\d+\w+)",
+                    r"Virgo.*?(S\d+\w+)",
+                    r"LVK.*?(S\d+\w+)",
+                    r"GW\d+",
+                ],
             },
-            # Facility patterns
             'facility': [
                 (r'Swift[\s/\-]?(?:BAT|XRT|UVOT)', 'Swift'),
                 (r'Fermi[\s/\-]?(?:GBM|LAT)', 'Fermi'),
-                (r'Einstein\s+Probe|EP[\s/\-]?(?:WXT|FXT)', 'EinsteinProbe')
+                (r'GECAM', 'GECAM'),
+                (r'SVOM|ECLAIRs', 'SVOM'),
+                (r'CALET', 'CALET'),
             ],
-            # GRB event name patterns
             'event_name': [
-                r'(?:GRB|grb)\s+(\d{6}[A-Za-z])',   # e.g., GRB 250322A
-                r'(?:EP)(\d{6}[a-z])',              # e.g., EP250321a
-                r'(AT20\d{2}[a-z]{3})'              # e.g., AT2025dws
-            ]
+                r'(?:GRB|grb)\s+(\d{6}[A-Za-z])',
+                r'(?:GRB|grb)(\d{6}[A-Za-z])',
+            ],
         }
         
-        # Compiled pattern storage
-        self.compiled_patterns = {
-            'position': {},
-            'false_trigger': {},
-            'redshift': {},
-            'host_galaxy': {},
-            'trigger_num': {},
-            'facility': [],
-            'event_name': []
-        }
+        # Compile all patterns for performance
+        self.compiled_patterns = {}
         
         # Compile position patterns
+        self.compiled_patterns['position'] = {}
         for facility, patterns in self.patterns['position'].items():
             self.compiled_patterns['position'][facility] = [
                 re.compile(pattern, re.IGNORECASE | re.DOTALL) for pattern in patterns
             ]
         
-        # Compile false trigger patterns
-        for category, patterns in self.patterns['false_trigger'].items():
-            self.compiled_patterns['false_trigger'][category] = [
-                re.compile(pattern, re.IGNORECASE) for pattern in patterns
-            ]
-        
-        # Compile redshift patterns
-        for category, patterns in self.patterns['redshift'].items():
-            self.compiled_patterns['redshift'][category] = [
-                re.compile(pattern, re.IGNORECASE) for pattern in patterns
-            ]
-        
-        # Compile host galaxy patterns
-        for category, patterns in self.patterns['host_galaxy'].items():
-            self.compiled_patterns['host_galaxy'][category] = [
-                re.compile(pattern, re.IGNORECASE) for pattern in patterns
-            ]
-        
         # Compile trigger number patterns
+        self.compiled_patterns['trigger_num'] = {}
         for facility, patterns in self.patterns['trigger_num'].items():
             self.compiled_patterns['trigger_num'][facility] = [
                 re.compile(pattern, re.IGNORECASE) for pattern in patterns
             ]
+        
+        # Compile false trigger patterns
+        self.compiled_patterns['false_trigger'] = {}
+        for facility, patterns in self.patterns['false_trigger'].items():
+            self.compiled_patterns['false_trigger'][facility] = [
+                re.compile(pattern, re.IGNORECASE) for pattern in patterns
+            ]
+        
+        # Compile redshift patterns
+        self.compiled_patterns['redshift'] = [
+            re.compile(pattern, re.IGNORECASE) for pattern in self.patterns['redshift']['general']
+        ]
+        
+        # Compile host galaxy patterns
+        self.compiled_patterns['host_galaxy'] = [
+            re.compile(pattern, re.IGNORECASE) for pattern in self.patterns['host_galaxy']['general']
+        ]
         
         # Compile facility patterns
         self.compiled_patterns['facility'] = [
@@ -313,8 +351,10 @@ class GCNCircularHandler:
         
         # Compile event name patterns
         self.compiled_patterns['event_name'] = [
-            re.compile(pattern) for pattern in self.patterns['event_name']
+            re.compile(pattern, re.IGNORECASE) for pattern in self.patterns['event_name']
         ]
+        
+        logger.info("Compiled all regex patterns for GCN circular processing")
         
     def _extract_redshift(self, body: str) -> Tuple[Optional[float], Optional[float]]:
         """
@@ -969,84 +1009,52 @@ class GCNCircularHandler:
                 
     def _normalize_facility_name(self, facility: str) -> str:
         """
-        Normalize facility names to group instruments from the same mission.
-        Enhanced to handle various formats from both notices and circulars.
-        
-        Args:
-            facility (str): Original facility name
-            
-        Returns:
-            str: Normalized facility name (e.g., SwiftBAT, SwiftXRT -> Swift)
+        Normalize facility names for consistent matching.
+        Focused on core GRB detection facilities.
         """
         if not facility:
             return ""
+            
+        facility = facility.strip()
         
-        # Convert to lower case for case-insensitive matching
-        facility_lower = facility.lower()
+        # Swift family normalization
+        swift_mappings = {
+            'Swift': 'Swift',
+            'SwiftBAT': 'Swift',
+            'SwiftXRT': 'Swift', 
+            'SwiftUVOT': 'Swift',
+            'Swift-BAT': 'Swift',
+            'Swift-XRT': 'Swift',
+            'Swift-UVOT': 'Swift',
+            'Swift/BAT': 'Swift',
+            'Swift/XRT': 'Swift',
+            'Swift/UVOT': 'Swift',
+            'Swift BAT': 'Swift',
+            'Swift XRT': 'Swift',
+            'Swift UVOT': 'Swift',
+        }
         
-        # Swift facilities - check for various formats
-        swift_patterns = [
-            'swift', 'swift-bat', 'swift-xrt', 'swift-uvot', 'swift/bat', 
-            'swift/xrt', 'swift/uvot', 'swift bat', 'swift xrt', 'swift uvot',
-            'swiftbat', 'swiftxrt', 'swiftuvot'
-        ]
-        if any(pattern in facility_lower for pattern in swift_patterns):
-            return "Swift"
-        
-        # Fermi facilities - check for various formats including full names
-        fermi_patterns = [
-            'fermi', 'fermi-gbm', 'fermi-lat', 'fermi gbm', 'fermi lat',
-            'fermigbm', 'fermilat', 'fermi gamma-ray burst monitor',
-            'fermi gamma ray burst monitor', 'fermi large area telescope',
-            'gbm', 'lat'
-        ]
-        if any(pattern in facility_lower for pattern in fermi_patterns):
-            return "Fermi"
-        
-        # Einstein Probe facilities
-        einstein_patterns = [
-            'einstein', 'einstein probe', 'einstein-probe', 'einsteinprobe',
-            'ep-wxt', 'ep-fxt', 'ep/wxt', 'ep/fxt', 'ep wxt', 'ep fxt'
-        ]
-        if any(pattern in facility_lower for pattern in einstein_patterns):
-            return "EinsteinProbe"
-        
-        # IceCube and AMON facilities
-        icecube_patterns = [
-            'icecube', 'ice-cube', 'ice cube', 'amon', 'hawc',
-            'icecubecascade', 'icecubebronze', 'icecubegold', 'icecube_cascade',
-            'icecube_bronze', 'icecube_gold', 'icecube cascade', 'icecube bronze', 
-            'icecube gold'
-        ]
-        if any(pattern in facility_lower for pattern in icecube_patterns):
-            return "IceCube"
-        
-        # MAXI facilities
-        maxi_patterns = ['maxi', 'maxi-gsc', 'maxi/gsc', 'maxi gsc']
-        if any(pattern in facility_lower for pattern in maxi_patterns):
-            return "MAXI"
-        
-        # INTEGRAL facilities
-        integral_patterns = ['integral', 'integral-spi', 'integral/spi', 'integral spi']
-        if any(pattern in facility_lower for pattern in integral_patterns):
-            return "INTEGRAL"
-        
-        # Konus facilities
-        konus_patterns = ['konus', 'konus-wind', 'konus/wind', 'konus wind']
-        if any(pattern in facility_lower for pattern in konus_patterns):
-            return "Konus"
-        
-        # CALET facilities
-        calet_patterns = ['calet', 'calet-gbm', 'calet/gbm', 'calet gbm']
-        if any(pattern in facility_lower for pattern in calet_patterns):
-            return "CALET"
-        
-        # Insight-HXMT facilities
-        hxmt_patterns = ['insight-hxmt', 'insight/hxmt', 'insight hxmt', 'hxmt']
-        if any(pattern in facility_lower for pattern in hxmt_patterns):
-            return "HXMT"
-        
-        # Return original facility name if no pattern matches
+        # Check Swift mappings first
+        for key, value in swift_mappings.items():
+            if key.lower() in facility.lower():
+                return value
+                
+        # Fermi family normalization  
+        if 'Fermi' in facility or 'GBM' in facility or 'LAT' in facility:
+            return 'Fermi'
+            
+        # GECAM normalization
+        if 'GECAM' in facility:
+            return 'GECAM'
+            
+        # SVOM normalization
+        if 'SVOM' in facility or 'ECLAIRs' in facility:
+            return 'SVOM'
+            
+        # CALET normalization
+        if 'CALET' in facility:
+            return 'CALET'
+            
         return facility
 
     def _load_ascii_with_recovery(self, filepath: str) -> pd.DataFrame:
@@ -1209,17 +1217,48 @@ class GCNCircularHandler:
     def _update_ascii_database(self, processed_data: Dict[str, Any]) -> None:
         """
         Update the ASCII database with processed circular data.
-        Only updates fields that should be updated from circulars while preserving notice data.
+        Enhanced multi-facility design: one row per GRB with facility tracking.
         """
-        # Skip if essential data is missing
-        if not processed_data.get('event_name') or not processed_data.get('facility') or not processed_data.get('trigger_num'):
-            logger.warning(f"Skipping ASCII update due to missing essential data")
-            return
-                    
-        # Skip if it's a false trigger
+        
+        # Check for false triggers first (they need different handling)
         if processed_data.get('false_trigger'):
-            logger.info(f"Skipping ASCII update for false trigger: {processed_data.get('event_name')}")
+            logger.info(f"Processing false trigger for removal: {processed_data.get('facility')} trigger {processed_data.get('trigger_num')}")
+            
+            # For false triggers, we only need facility and trigger_num
+            if not processed_data.get('facility') or not processed_data.get('trigger_num'):
+                logger.warning(f"Skipping false trigger removal due to missing facility or trigger_num")
+                return
+                
             self._remove_false_trigger_from_ascii(processed_data)
+            return
+        
+        # Now check for essential data for real GRBs
+        event_name = processed_data.get('event_name')
+        facility = processed_data.get('facility')
+        trigger_num = processed_data.get('trigger_num')
+        
+        # For Swift facilities, we can proceed without trigger number if we have coordinates
+        is_swift_facility = facility and 'Swift' in facility
+        has_coordinates = (processed_data.get('ra') is not None and 
+                        processed_data.get('dec') is not None)
+        
+        # Essential data check - more flexible for Swift
+        if not event_name or not facility:
+            logger.warning(f"Skipping ASCII update due to missing essential data (event_name or facility)")
+            return
+            
+        # For non-Swift facilities, trigger number is still required
+        if not is_swift_facility and not trigger_num:
+            logger.warning(f"Skipping ASCII update due to missing trigger number for {facility}")
+            return
+            
+        # For Swift, if no trigger number but has coordinates, create a pseudo-trigger ID
+        if is_swift_facility and not trigger_num and has_coordinates:
+            trigger_num = f"SWIFT_{event_name.replace(' ', '_')}"
+            processed_data['trigger_num'] = trigger_num
+            logger.info(f"Generated pseudo trigger number for Swift circular: {trigger_num}")
+        elif is_swift_facility and not trigger_num and not has_coordinates:
+            logger.warning(f"Skipping ASCII update for Swift circular without trigger number or coordinates")
             return
                     
         with self.file_lock:
@@ -1227,116 +1266,120 @@ class GCNCircularHandler:
                 # Load existing ASCII file
                 os.makedirs(os.path.dirname(os.path.abspath(self.output_ascii)), exist_ok=True)
                 
-                # Load existing data
+                # Load existing data with backward compatibility
                 df = self._load_ascii_with_recovery(self.output_ascii)
+                df = self._ensure_ascii_columns(df)  # Add new columns if missing
                 
                 # Get circular info
-                facility = processed_data['facility']
-                trigger_num = processed_data['trigger_num']
                 circular_id = processed_data.get('circular_id')
-                normalized_facility = self._normalize_facility_name(facility)
+                current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 
-                # Find existing entry by normalized facility and trigger number
+                # Find existing entry for the same GRB event
                 existing_idx = None
+                
+                # Search by event name (most reliable for same GRB from different facilities)
                 for idx, row in df.iterrows():
-                    row_facility = row.get('Facility', '')
-                    row_trigger = row.get('Trigger_num', '')
-                    normalized_row_facility = self._normalize_facility_name(row_facility)
+                    row_event = str(row.get('Name', '')).strip().strip('"')
                     
-                    if (normalized_row_facility == normalized_facility and 
-                        str(row_trigger) == str(trigger_num)):
+                    if row_event == event_name:
                         existing_idx = idx
+                        logger.info(f"Found existing entry for {event_name} at index {existing_idx}")
                         break
                 
                 if existing_idx is not None:
-                    # UPDATE EXISTING ENTRY
-                    logger.info(f"Found existing entry for {normalized_facility} trigger {trigger_num} at index {existing_idx}")
+                    # UPDATE EXISTING ENTRY (same GRB, different facility)
+                    current_best = str(df.at[existing_idx, 'Best_Facility']).strip()
+                    current_all = str(df.at[existing_idx, 'All_Facilities']).strip()
+                    current_gcn_id = str(df.at[existing_idx, 'GCN_ID']).strip()
                     
-                    # Fields to UPDATE from circular data (these should be overwritten)
-                    update_fields = {
-                        'GCN_ID': str(circular_id) if circular_id else df.at[existing_idx, 'GCN_ID'],
-                        'Name': processed_data['event_name'],  # Update with official name from circular
-                        'Redshift': processed_data['redshift'] if processed_data['redshift'] is not None else df.at[existing_idx, 'Redshift'],
-                        'Host_info': processed_data['host_info'] if processed_data['host_info'] else df.at[existing_idx, 'Host_info']
-                    }
+                    should_update_position = self._should_update_position(current_best, facility)
                     
-                    # Conditionally update coordinates only if they're better (more precise)
-                    if (processed_data['ra'] is not None and processed_data['dec'] is not None and 
-                        processed_data['error'] is not None):
+                    logger.info(f"Updating {event_name}: current_best={current_best}, new={facility}, update_position={should_update_position}")
+                    
+                    # Update Best_Facility and position if higher priority
+                    if should_update_position and has_coordinates:
+                        df.at[existing_idx, 'Best_Facility'] = facility
+                        df.at[existing_idx, 'RA'] = f"{processed_data['ra']:.5f}"
+                        df.at[existing_idx, 'DEC'] = f"{processed_data['dec']:.5f}"
                         
-                        # Check if new coordinates are more precise (smaller error)
-                        existing_error = df.at[existing_idx, 'Error']
-                        new_error = self._convert_error_to_degrees(processed_data['error'], processed_data['error_unit'])
+                        if (processed_data.get('error') is not None and 
+                            processed_data.get('error_unit') is not None):
+                            error_in_degrees = self._convert_error_to_degrees(
+                                processed_data['error'], 
+                                processed_data['error_unit']
+                            )
+                            if error_in_degrees is not None:
+                                df.at[existing_idx, 'Error'] = f"{error_in_degrees:.6f}"
                         
-                        try:
-                            existing_error_float = float(existing_error) if existing_error else float('inf')
-                            if new_error < existing_error_float:
-                                update_fields.update({
-                                    'RA': processed_data['ra'],
-                                    'DEC': processed_data['dec'],
-                                    'Error': new_error
-                                })
-                                logger.info(f"Updating coordinates with more precise values (error: {existing_error_float:.4f} → {new_error:.4f})")
-                            else:
-                                logger.info(f"Keeping existing coordinates (more precise: {existing_error_float:.4f} vs {new_error:.4f})")
-                        except (ValueError, TypeError):
-                            # If we can't compare errors, update anyway
-                            update_fields.update({
-                                'RA': processed_data['ra'],
-                                'DEC': processed_data['dec'], 
-                                'Error': new_error
-                            })
-                            logger.info("Updating coordinates (error comparison failed)")
+                        logger.info(f"Updated position with {facility} data (higher priority)")
                     
-                    # Fields to PRESERVE from existing entry (these should NOT be overwritten)
-                    preserve_fields = [
-                        'Discovery_UTC',    # Keep original discovery time from notice
-                        'Facility',         # Keep original facility (might be more specific instrument)
-                        'Trigger_num',      # Keep original trigger number
-                        'Notice_date',      # Keep original notice date
-                        'thread_ts'         # Keep Slack thread timestamp if it exists
-                    ]
+                    # Add facility to All_Facilities if not already present
+                    all_facilities_list = [f.strip() for f in current_all.split(',') if f.strip()]
+                    if facility not in all_facilities_list:
+                        all_facilities_list.append(facility)
+                        df.at[existing_idx, 'All_Facilities'] = ','.join(all_facilities_list)
                     
-                    # Apply updates while preserving specified fields
-                    for field, new_value in update_fields.items():
-                        if field in df.columns:
-                            old_value = df.at[existing_idx, field]
-                            df.at[existing_idx, field] = new_value
-                            if str(old_value) != str(new_value):
-                                logger.info(f"Updated {field}: '{old_value}' → '{new_value}'")
+                    # Add circular ID to GCN_ID if not already present
+                    gcn_ids = [g.strip() for g in current_gcn_id.split(',') if g.strip()]
+                    if str(circular_id) not in gcn_ids:
+                        gcn_ids.append(str(circular_id))
+                        df.at[existing_idx, 'GCN_ID'] = ','.join(gcn_ids)
                     
-                    # Log preserved fields
-                    for field in preserve_fields:
-                        if field in df.columns:
-                            preserved_value = df.at[existing_idx, field]
-                            logger.debug(f"Preserved {field}: '{preserved_value}'")
+                    # Always update redshift if available
+                    if processed_data.get('redshift') is not None:
+                        df.at[existing_idx, 'Redshift'] = f"{processed_data['redshift']:.4f}"
+                        
+                    # Always update host info if new info is more detailed
+                    if processed_data.get('host_info'):
+                        current_host_info = str(df.at[existing_idx, 'Host_info']).strip()
+                        new_host_info = processed_data['host_info'].strip()
+                        
+                        if len(new_host_info) > len(current_host_info):
+                            if not (new_host_info.startswith('"') and new_host_info.endswith('"')):
+                                new_host_info = f'"{new_host_info}"'
+                            df.at[existing_idx, 'Host_info'] = new_host_info
                     
-                    logger.info(f"Successfully updated existing ASCII entry for {processed_data['event_name']}")
+                    # Update Last_Update but keep Notice_date unchanged
+                    df.at[existing_idx, 'Last_Update'] = current_time
+                    
+                    logger.info(f"Updated existing entry: {df.at[existing_idx, 'GCN_ID']}")
                     
                 else:
-                    # ADD NEW ENTRY
-                    if (processed_data['ra'] is not None and processed_data['dec'] is not None and 
-                        processed_data['error'] is not None):
+                    # ADD NEW ENTRY (first detection of this GRB)
+                    if (processed_data.get('ra') is not None and 
+                        processed_data.get('dec') is not None and 
+                        processed_data.get('error') is not None and
+                        processed_data.get('error_unit') is not None):
                         
-                        error_in_degrees = self._convert_error_to_degrees(processed_data['error'], processed_data['error_unit'])
+                        error_in_degrees = self._convert_error_to_degrees(
+                            processed_data['error'], 
+                            processed_data['error_unit']
+                        )
+                        
+                        discovery_time = datetime.fromtimestamp(processed_data["created_on"]/1000).strftime("%Y-%m-%d %H:%M:%S")
                         
                         new_row = {
-                            'GCN_ID': str(circular_id) if circular_id else f"GCN_{facility}_{trigger_num}",
-                            'Name': processed_data["event_name"],
-                            'RA': processed_data['ra'],
-                            'DEC': processed_data['dec'],
-                            'Error': error_in_degrees,
-                            'Discovery_UTC': datetime.fromtimestamp(processed_data["created_on"]/1000).strftime("%Y-%m-%d %H:%M:%S"),
-                            'Facility': processed_data['facility'],
-                            'Trigger_num': processed_data['trigger_num'],
-                            'Notice_date': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                            'Redshift': processed_data['redshift'] if processed_data['redshift'] is not None else '',
-                            'Host_info': processed_data["host_info"] if processed_data['host_info'] else '',
-                            'thread_ts': ''  # Empty for new entries from circulars
+                            'GCN_ID': str(circular_id),
+                            'Name': f'"{event_name}"',
+                            'RA': f"{processed_data['ra']:.5f}",
+                            'DEC': f"{processed_data['dec']:.5f}",
+                            'Error': f"{error_in_degrees:.6f}",
+                            'Discovery_UTC': discovery_time,
+                            'Primary_Facility': facility,       # First detector
+                            'Best_Facility': facility,          # Initially same as primary
+                            'All_Facilities': facility,         # Start with just this facility
+                            'Trigger_num': trigger_num,         # From primary facility
+                            'Notice_date': current_time,        # First circular time
+                            'Last_Update': current_time,        # Same as notice_date initially
+                            'Redshift': f"{processed_data['redshift']:.4f}" if processed_data.get('redshift') is not None else '',
+                            'Host_info': f'"{processed_data["host_info"]}"' if processed_data.get('host_info') else '',
+                            'thread_ts': ''
                         }
                         
                         df = pd.concat([df, pd.DataFrame([new_row])], ignore_index=True)
                         logger.info(f"Added new entry to ASCII database: {new_row['GCN_ID']}")
+                    else:
+                        logger.info(f"Circular {circular_id} doesn't contain sufficient position data for new entry")
                 
                 # Save updated DataFrame
                 self._save_ascii_with_backup(df, self.output_ascii)
@@ -1345,7 +1388,112 @@ class GCNCircularHandler:
                         
             except Exception as e:
                 logger.error(f"Error updating ASCII database: {e}", exc_info=True)
-    
+
+    def _ensure_ascii_columns(self, df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Ensure ASCII DataFrame has all required columns for backward compatibility.
+        Gradually migrate old format to new multi-facility format.
+        """
+        try:
+            # Check if this is old format (has 'Facility' instead of 'Primary_Facility')
+            if 'Facility' in df.columns and 'Primary_Facility' not in df.columns:
+                logger.info("Migrating ASCII format from old to new multi-facility structure")
+                
+                # Rename and add columns for gradual migration
+                if 'Facility' in df.columns:
+                    df['Primary_Facility'] = df['Facility']
+                    df['Best_Facility'] = df['Facility']
+                    df['All_Facilities'] = df['Facility']
+                    # Keep old 'Facility' column temporarily for compatibility
+                
+                # Add new columns if missing
+                if 'Last_Update' not in df.columns:
+                    df['Last_Update'] = df.get('Notice_date', '')
+            
+            # Ensure all required columns exist
+            for col in self.ascii_columns:
+                if col not in df.columns:
+                    df[col] = ''
+                    logger.debug(f"Added missing column: {col}")
+            
+            # Reorder columns to match expected format
+            df = df[self.ascii_columns]
+            
+            return df
+            
+        except Exception as e:
+            logger.error(f"Error ensuring ASCII columns: {e}")
+            return df
+
+    def _get_facility_priority(self, facility: str) -> int:
+        """
+        Get facility priority for position accuracy.
+        Higher number = higher priority/accuracy.
+        """
+        if not facility:
+            return 0
+            
+        facility_priorities = {
+            'SwiftXRT': 10,      # Highest - arcsec precision
+            'Swift-XRT': 10,
+            'SwiftBAT': 7,       # Good - arcmin precision  
+            'Swift-BAT': 7,
+            'Swift': 6,          # General Swift
+            'FermiLAT': 5,       # Degree precision but good
+            'Fermi-LAT': 5,
+            'SVOM': 4,           # Arcmin precision
+            'FermiGBM': 3,       # Detection mainly
+            'Fermi-GBM': 3,
+            'Fermi': 3,
+            'GECAM': 2,          # Detection confirmation
+            'CALET': 2,          # Detection confirmation
+        }
+        
+        return facility_priorities.get(facility, 1)
+
+
+    def _should_update_position(self, current_facility: str, new_facility: str) -> bool:
+        """
+        Determine if position should be updated based on facility priority.
+        Only update if new facility has higher priority (more accurate).
+        """
+        current_priority = self._get_facility_priority(current_facility)
+        new_priority = self._get_facility_priority(new_facility)
+        
+        return new_priority > current_priority
+
+
+    def get_facility_summary(self) -> None:
+        """
+        Display a summary of facilities and their tracking for debugging.
+        Useful for understanding the multi-facility system.
+        """
+        try:
+            if not os.path.exists(self.output_ascii):
+                logger.info("No ASCII file found")
+                return
+                
+            df = self._load_ascii_with_recovery(self.output_ascii)
+            df = self._ensure_ascii_columns(df)
+            
+            logger.info("=== FACILITY TRACKING SUMMARY ===")
+            
+            for _, row in df.iterrows():
+                name = str(row.get('Name', '')).strip().strip('"')
+                primary = str(row.get('Primary_Facility', '')).strip()
+                best = str(row.get('Best_Facility', '')).strip() 
+                all_fac = str(row.get('All_Facilities', '')).strip()
+                gcn_id = str(row.get('GCN_ID', '')).strip()
+                
+                logger.info(f"{name}:")
+                logger.info(f"  Primary: {primary} | Best: {best} | All: {all_fac}")
+                logger.info(f"  Circulars: {gcn_id}")
+                logger.info(f"  Position: RA={row.get('RA', '')}, DEC={row.get('DEC', '')}, Error={row.get('Error', '')}")
+                logger.info("")
+                
+        except Exception as e:
+            logger.error(f"Error generating facility summary: {e}")
+        
     def _remove_false_trigger_from_ascii(self, processed_data: Dict[str, Any]) -> None:
         """
         Remove a false trigger from the ASCII database if it exists.
