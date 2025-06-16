@@ -188,6 +188,7 @@ old/
 *.csv
 *.ascii
 grb_targets.ascii
+grb_targets.ascii.backup.*
 
 # test
 *test*.py
