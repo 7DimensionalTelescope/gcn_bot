@@ -998,7 +998,7 @@ class GCNCircularHandler:
                             df[col] = None
                     
                     # Concatenate with original dataframe
-                    df = pd.concat([df, new_df], ignore_index=True)
+                    df = self._safe_concat_dataframes(df, new_df, ignore_index=True)
                 
                 # Save updated dataframe
                 df.to_csv(self.output_csv, index=False)
@@ -1006,7 +1006,34 @@ class GCNCircularHandler:
                 
             except Exception as e:
                 logger.error(f"Error updating CSV database: {e}", exc_info=True)
+    
+    def _safe_concat_dataframes(self, df1: pd.DataFrame, df2: pd.DataFrame, ignore_index: bool = True) -> pd.DataFrame:
+        """
+        Safely concatenate two DataFrames, handling empty DataFrames and avoiding FutureWarnings.
+        """
+        # If first DataFrame is empty, return the second one
+        if df1.empty:
+            return df2.copy() if not df2.empty else df2
+        
+        # If second DataFrame is empty, return the first one
+        if df2.empty:
+            return df1.copy()
+        
+        # Both DataFrames have data - ensure column compatibility
+        for col in df1.columns:
+            if col not in df2.columns:
+                df2[col] = None
                 
+        for col in df2.columns:
+            if col not in df1.columns:
+                df1[col] = None
+        
+        # Reorder columns to match
+        df2 = df2[df1.columns]
+        
+        # Now safe to concatenate
+        return pd.concat([df1, df2], ignore_index=ignore_index)
+    
     def _normalize_facility_name(self, facility: str) -> str:
         """
         Normalize facility names for consistent matching.
@@ -1376,7 +1403,7 @@ class GCNCircularHandler:
                             'thread_ts': ''
                         }
                         
-                        df = pd.concat([df, pd.DataFrame([new_row])], ignore_index=True)
+                        df = self._safe_concat_dataframes(df, pd.DataFrame([new_row]), ignore_index=True)
                         logger.info(f"Added new entry to ASCII database: {new_row['GCN_ID']}")
                     else:
                         logger.info(f"Circular {circular_id} doesn't contain sufficient position data for new entry")
