@@ -489,6 +489,85 @@ class GCNNoticeHandler:
             self._cache_loaded = True
             self._last_cache_refresh = now
 
+    def _normalize_facility_name(self, facility: str) -> str:
+        """
+        Normalize facility names for consistent comparison across different instruments.
+        
+        This method standardizes facility names to group related instruments together.
+        For example, all Swift instruments (SwiftBAT, SwiftXRT, SwiftUVOT) are normalized to 'Swift'.
+        
+        Args:
+            facility (str): The original facility name
+            
+        Returns:
+            str: The normalized facility name
+        """
+        if not facility:
+            return ""
+        
+        facility = facility.strip()
+        
+        # Swift family - all Swift instruments are considered the same mission
+        swift_names = ['Swift', 'SwiftBAT', 'SwiftXRT', 'SwiftUVOT', 'Swift-BAT', 'Swift-XRT', 'Swift-UVOT']
+        for name in swift_names:
+            if name.lower() in facility.lower():
+                return 'Swift'
+        
+        # Fermi family - all Fermi instruments are considered the same mission
+        if any(x in facility for x in ['Fermi', 'GBM', 'LAT']):
+            return 'Fermi'
+        
+        # GECAM instruments
+        if 'GECAM' in facility:
+            return 'GECAM'
+        
+        # SVOM instruments
+        if 'SVOM' in facility:
+            return 'SVOM'
+        
+        # Einstein Probe instruments
+        if 'Einstein' in facility or 'EP' in facility:
+            return 'Einstein Probe'
+        
+        # IceCube variations
+        if 'IceCube' in facility or 'ICECUBE' in facility:
+            return 'IceCube'
+        
+        # For other facilities, return as-is
+        return facility
+
+    def _get_facility_priority(self, facility: str) -> int:
+        """
+        Get facility priority for position accuracy.
+        Higher number = higher priority/accuracy.
+        
+        Args:
+            facility (str): The facility name
+            
+        Returns:
+            int: Priority score (higher = more accurate)
+        """
+        if not facility:
+            return 0
+            
+        facility_priorities = {
+            'SwiftXRT': 10,      # Highest - arcsec precision
+            'Swift-XRT': 10,
+            'SwiftBAT': 7,       # Good - arcmin precision  
+            'Swift-BAT': 7,
+            'Swift': 6,          # General Swift
+            'FermiLAT': 5,       # Degree precision but good
+            'Fermi-LAT': 5,
+            'SVOM': 4,           # Arcmin precision
+            'FermiGBM': 3,       # Detection mainly
+            'Fermi-GBM': 3,
+            'Fermi': 3,
+            'GECAM': 2,          # Detection confirmation
+            'CALET': 2,          # Detection confirmation
+        }
+        
+        return facility_priorities.get(facility, 1)
+
     def _event_exists(self, facility: str, trigger_num: str) -> Optional[str]:
         """
         Check if an event with the given facility and trigger number already exists.
@@ -1588,38 +1667,6 @@ class GCNNoticeHandler:
                 event_name = str(formatted_data.get('Name', ''))
                 current_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
                 
-                # INTEGRATED: Facility priority logic (was _get_facility_priority)
-                def get_priority(fac):
-                    priorities = {
-                        'SwiftXRT': 10, 'Swift-XRT': 10,
-                        'SwiftBAT': 7, 'Swift-BAT': 7, 'Swift': 6,
-                        'FermiLAT': 5, 'Fermi-LAT': 5,
-                        'FermiGBM': 3, 'Fermi-GBM': 3, 'Fermi': 3,
-                        'SVOM': 4, 'GECAM': 2, 'CALET': 2,
-                    }
-                    return priorities.get(fac, 1)
-                
-                # INTEGRATED: Facility normalization (was _normalize_facility_name)
-                def normalize_facility(fac):
-                    if not fac:
-                        return ""
-                    fac = fac.strip()
-                    # Swift family
-                    swift_names = ['Swift', 'SwiftBAT', 'SwiftXRT', 'SwiftUVOT', 'Swift-BAT', 'Swift-XRT', 'Swift-UVOT']
-                    for name in swift_names:
-                        if name.lower() in fac.lower():
-                            return 'Swift'
-                    # Other facilities
-                    if any(x in fac for x in ['Fermi', 'GBM', 'LAT']):
-                        return 'Fermi'
-                    if 'GECAM' in fac:
-                        return 'GECAM'
-                    if any(x in fac for x in ['SVOM', 'ECLAIRs']):
-                        return 'SVOM'
-                    if 'CALET' in fac:
-                        return 'CALET'
-                    return fac
-                
                 logger.info(f"Saving notice for {event_name}, facility={facility}, trigger={trigger_num}")
                 
                 # PRESERVED: Load existing ASCII file with recovery
@@ -1729,11 +1776,11 @@ class GCNNoticeHandler:
                 
                 # Strategy 2: Search by facility+trigger (backward compatibility)
                 if existing_idx is None and facility and trigger_num:
-                    normalized_facility = normalize_facility(facility)
+                    normalized_facility = self._normalize_facility_name(facility)
                     for idx, row in df.iterrows():
                         row_facility = str(row.get('Primary_Facility', row.get('Facility', ''))).strip()
                         row_trigger = str(row.get('Trigger_num', '')).strip()
-                        normalized_row_facility = normalize_facility(row_facility)
+                        normalized_row_facility = self._normalize_facility_name(row_facility)
                         
                         if (normalized_row_facility == normalized_facility and 
                             row_trigger == trigger_num):
@@ -1748,7 +1795,7 @@ class GCNNoticeHandler:
                     existing_thread_ts = str(df.at[existing_idx, 'thread_ts']).strip()
                     
                     # Check if this notice has higher priority
-                    should_update_position = get_priority(facility) > get_priority(current_best)
+                    should_update_position = self._get_facility_priority(facility) > self._get_facility_priority(facility)
                     
                     logger.info(f"Updating {event_name}: current_best={current_best}, new_notice={facility}, update_position={should_update_position}")
                     
@@ -1849,30 +1896,16 @@ class GCNNoticeHandler:
     def get_existing_event(self, facility: str, trigger_num: str) -> Optional[Dict[str, Any]]:
         """
         ENHANCED: Get existing event data from ASCII file.
-        INTEGRATED: Normalization logic moved inline to reduce function count.
         PRESERVED: All existing functionality.
         """
         try:
-            # INTEGRATED: Normalization logic
-            def normalize_facility(fac):
-                if not fac:
-                    return ""
-                fac = fac.strip()
-                swift_names = ['Swift', 'SwiftBAT', 'SwiftXRT', 'SwiftUVOT', 'Swift-BAT', 'Swift-XRT', 'Swift-UVOT']
-                for name in swift_names:
-                    if name.lower() in fac.lower():
-                        return 'Swift'
-                if any(x in fac for x in ['Fermi', 'GBM', 'LAT']):
-                    return 'Fermi'
-                return fac
+            normalized_facility = self._normalize_facility_name(facility)
             
-            normalized_facility = normalize_facility(facility)
-            
-            # PRESERVED: Load with recovery (simplified)
+            # Load with recovery (simplified)
             try:
                 df = pd.read_csv(self.output_ascii, sep=r'\s+', 
-                               quotechar='"', quoting=csv.QUOTE_MINIMAL, 
-                               dtype=str)
+                            quotechar='"', quoting=csv.QUOTE_MINIMAL, 
+                            dtype=str)
             except:
                 return None
             
@@ -1883,7 +1916,7 @@ class GCNNoticeHandler:
             for _, row in df.iterrows():
                 row_facility = str(row.get('Primary_Facility', row.get('Facility', ''))).strip()
                 row_trigger = str(row.get('Trigger_num', '')).strip()
-                normalized_row_facility = normalize_facility(row_facility)
+                normalized_row_facility = self._normalize_facility_name(row_facility)
                 
                 if (normalized_row_facility == normalized_facility and 
                     row_trigger == trigger_num):
