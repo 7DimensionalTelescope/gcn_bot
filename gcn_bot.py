@@ -296,6 +296,9 @@ last_heartbeat = datetime.now()
 heartbeat_lock = Lock()
 last_connection_status = True  # True = connected, False = disconnected
 os.environ["NUMEXPR_MAX_THREADS"] = "4"
+reconnect_attempts = 0
+max_reconnect_attempts = 5
+consumer_lock = Lock()  # For thread-safe consumer replacement
 
 ############################## Initialize Clients ############################
 # Initialize Slack client
@@ -1343,8 +1346,9 @@ def update_heartbeat() -> None:
         logger.debug(f"Updated last heartbeat time to {last_heartbeat}")
 
 def check_connection() -> None:
-    """Monitor connection status and authentication."""
+    """Monitor connection status and authentication with improved reconnection logic."""
     global last_connection_status, last_heartbeat, consumer, running, all_topics
+    global reconnect_attempts, max_reconnect_attempts
     
     while running:
         try:
@@ -1388,6 +1392,8 @@ def check_connection() -> None:
                                 logger.error(f"Error sending connection alert to Slack: {e}")
                                 
                         else:
+                            # Connection restored - reset reconnect attempts
+                            reconnect_attempts = 0
                             logger.info("Connection restored. Last heartbeat: %s", last_heartbeat)
                             message = {
                                 "blocks": [
@@ -1423,50 +1429,111 @@ def check_connection() -> None:
                     except Exception as e:
                         logger.error(f"Error sending connection status to Slack: {e}")
                 
-                # Try to reconnect if needed
+                # Try to reconnect if needed with exponential backoff
                 if not currently_connected:
-                    logger.info("Attempting to reconnect to GCN...")
-                    try:
-                        # Create a new consumer
-                        try:
-                            # Close existing consumer first
-                            consumer.close()
-                            logger.info("Closed existing consumer connection")
-                        except Exception as close_err:
-                            logger.warning(f"Error closing existing consumer: {close_err}")
-                        
-                        # Initialize new consumer with a short timeout to check connection quickly
-                        new_consumer = Consumer(
-                            client_id=GCN_ID,
-                            client_secret=GCN_SECRET
-                        )
-                        
-                        # Try to subscribe to topics
-                        new_consumer.subscribe(all_topics)
-                        
-                        # Test the connection by consuming with a short timeout
-                        test_msgs = new_consumer.consume(timeout=1)
-                        
-                        # If we get here without an exception, the connection works
-                        logger.info("Successfully established new GCN connection")
-                        
-                        # Replace the global consumer with the new one
-                        consumer = new_consumer
-                        
-                        # Update the heartbeat time to reflect successful reconnection
+                    if reconnect_attempts >= max_reconnect_attempts:
+                        logger.error(f"Max reconnection attempts ({max_reconnect_attempts}) reached. "
+                                   f"Waiting longer before retry...")
+                        time.sleep(300)  # Wait 5 minutes before resetting attempts
+                        reconnect_attempts = 0
+                        continue
+                    
+                    # Calculate backoff delay
+                    base_delay = min(2 ** reconnect_attempts, 60)  # Cap at 60 seconds
+                    jitter = random.uniform(0, 1)
+                    delay = base_delay + jitter
+                    
+                    logger.info(f"Attempting to reconnect to GCN (attempt {reconnect_attempts + 1}/{max_reconnect_attempts}) "
+                              f"in {delay:.1f} seconds...")
+                    
+                    time.sleep(delay)
+                    
+                    success = attempt_reconnection()
+                    if success:
+                        logger.info("Reconnection successful")
+                        reconnect_attempts = 0
+                        # Update heartbeat to reflect successful reconnection
                         last_heartbeat = datetime.now()
-                        
-                    except Exception as e:
-                        logger.error(f"Reconnection attempt failed: {e}")
-                        # Wait before trying again to avoid rapid reconnection attempts
-                        time.sleep(5)
+                    else:
+                        reconnect_attempts += 1
+                        logger.warning(f"Reconnection attempt {reconnect_attempts} failed")
             
         except Exception as e:
-            logger.error("Error in connection monitoring: %s", e)
+            logger.error("Error in connection monitoring: %s", e, exc_info=True)
         
-        # Wait before checking again
-        time.sleep(60)  # Check connection every minute
+        # Dynamic check interval based on connection status
+        if currently_connected:
+            time.sleep(60)  # Check every minute when connected
+        else:
+            time.sleep(30)  # Check more frequently when disconnected
 
+def attempt_reconnection() -> bool:
+    """
+    Attempt to reconnect to GCN with proper error handling.
+    
+    Returns:
+        bool: True if reconnection successful, False otherwise
+    """
+    global consumer, all_topics
+    
+    try:
+        # Thread-safe consumer replacement
+        with consumer_lock:
+            old_consumer = consumer
+            
+            try:
+                # Close existing consumer with timeout
+                if old_consumer:
+                    logger.debug("Closing existing consumer connection")
+                    old_consumer.close()
+                    logger.debug("Successfully closed existing consumer")
+            except Exception as close_err:
+                logger.warning(f"Error closing existing consumer: {close_err}")
+            
+            # Create new consumer
+            logger.debug("Creating new consumer instance")
+            new_consumer = Consumer(
+                client_id=GCN_ID,
+                client_secret=GCN_SECRET
+            )
+            
+            # Subscribe to topics
+            logger.debug(f"Subscribing to topics: {all_topics}")
+            new_consumer.subscribe(all_topics)
+            
+            # Test the connection with a short consume call
+            logger.debug("Testing new connection")
+            test_msgs = new_consumer.consume(timeout=2.0)
+            
+            # If we get here without exception, connection is working
+            logger.debug("Connection test passed")
+            consumer = new_consumer
+            
+            return True
+            
+    except Exception as e:
+        logger.error(f"Reconnection attempt failed: {e}")
+        # Clean up failed consumer if it was created
+        try:
+            if 'new_consumer' in locals():
+                new_consumer.close()
+        except Exception as cleanup_err:
+            logger.debug(f"Error cleaning up failed consumer: {cleanup_err}")
+        
+        return False
+
+def trigger_reconnection():
+    """
+    Trigger immediate reconnection attempt from main loop.
+    Call this function when main loop detects connection errors.
+    """
+    global last_heartbeat
+    
+    logger.info("Main loop triggered reconnection")
+    
+    # Set last_heartbeat to old time to trigger reconnection logic
+    with heartbeat_lock:
+        last_heartbeat = datetime.now() - timedelta(seconds=CONNECTION_TIMEOUT + 1)
 ############################## PROCESS ##############################
 def _compare_event_data(old_data: Dict[str, Any], new_data: Dict[str, Any]) -> Dict[str, Any]:
     """
@@ -2063,8 +2130,8 @@ def process_notice_and_send_message(topic, value, slack_client, slack_channel, i
 
 ############################## Main Loop ##############################
 def main():
-    """Main function to start the GCN Slack Bot."""
-    global running, TEST_SEND_TO_SLACK
+    """Main function with improved error handling and reconnection triggering."""
+    global running, TEST_SEND_TO_SLACK, consumer
     
     # Update TEST_SEND_TO_SLACK based on args
     TEST_SEND_TO_SLACK = args.send
@@ -2077,7 +2144,6 @@ def main():
     
     # Try to authenticate with Slack
     try:
-        # Test Slack token by making a simple API call
         test_response = slack_client.api_test()
         if not test_response["ok"]:
             logger.error(f"Slack authentication failed: {test_response.get('error', 'Unknown error')}")
@@ -2088,13 +2154,26 @@ def main():
     
     # Run test if requested
     if args.test:
-        test_message()  # Change to False if you want separate messages
-        sys.exit(0)  # Exit after running the test
+        test_message()
+        sys.exit(0)
+    
+    consecutive_errors = 0
+    max_consecutive_errors = 5
     
     try:
         while running:
             try:
-                for message in consumer.consume(timeout=1):
+                # Use consumer with lock for thread safety
+                with consumer_lock:
+                    current_consumer = consumer
+                
+                # Consume messages with timeout
+                messages = current_consumer.consume(timeout=1)
+                
+                # Reset error counter on successful consume
+                consecutive_errors = 0
+                
+                for message in messages:
                     # Check if we should stop
                     if not running: 
                         break
@@ -2102,9 +2181,21 @@ def main():
                     # Check for errors
                     if message.error():
                         error_msg = str(message.error())
-                        logger.error("Consumer error: %s", error_msg)
+                        error_code = message.error().code() if hasattr(message.error(), 'code') else None
                         
-                        # Add error notification to Slack when Consumer error
+                        logger.error("Consumer error: %s (code: %s)", error_msg, error_code)
+                        
+                        # Check if this is a connection-related error
+                        connection_error_keywords = [
+                            'transport', 'broker', 'connection', 'ssl', 'handshake', 
+                            'timeout', 'disconnected', 'refused'
+                        ]
+                        
+                        if any(keyword in error_msg.lower() for keyword in connection_error_keywords):
+                            logger.warning("Detected connection error, triggering reconnection")
+                            trigger_reconnection()
+                        
+                        # Send error notification to Slack
                         try:
                             slack_client.chat_postMessage(
                                 channel=SLACK_CHANNEL,
@@ -2120,7 +2211,7 @@ def main():
                                         "type": "section",
                                         "text": {
                                             "type": "mrkdwn",
-                                            "text": f"*Error:* ```{error_msg}```"
+                                            "text": f"*Error:* ```{error_msg}```\n*Code:* {error_code}"
                                         }
                                     }
                                 ]
@@ -2136,31 +2227,70 @@ def main():
                     # Update heartbeat timestamp if it's a heartbeat message
                     if topic == 'gcn.heartbeat':
                         update_heartbeat()
-                        continue  # Skip further processing for heartbeat messages
+                        continue
                     
                     # For topic logging
                     logger.info('topic=%s, offset=%d', topic, message.offset())
                     logger.debug("Message value: %s", value)
                     
                     # Process notice and send message
-                    success, response = process_notice_and_send_message(
-                        topic, value, slack_client, SLACK_CHANNEL
-                    )
-                    
-                    if success:
-                        logger.info(f"Successfully processed notice from {topic}")
-                    else:
-                        logger.warning(f"Issue processing notice from {topic}: {response}")
+                    try:
+                        success, response = process_notice_and_send_message(
+                            topic, value, slack_client, SLACK_CHANNEL
+                        )
+                        
+                        if success:
+                            logger.info(f"Successfully processed notice from {topic}")
+                        else:
+                            logger.warning(f"Issue processing notice from {topic}: {response}")
+                    except Exception as process_error:
+                        logger.error(f"Error processing message from {topic}: {process_error}", exc_info=True)
                     
             except Exception as e:
-                logger.error("Main loop error: %s", e)
-                if running:
-                    time.sleep(5)  # Wait before retrying only if we're still running
+                consecutive_errors += 1
+                error_msg = str(e)
+                
+                logger.error(f"Main loop error ({consecutive_errors}/{max_consecutive_errors}): {error_msg}")
+                
+                # Check if this looks like a connection error
+                connection_error_keywords = [
+                    'transport', 'broker', 'connection', 'ssl', 'handshake', 
+                    'timeout', 'disconnected', 'refused', 'kafka'
+                ]
+                
+                if any(keyword in error_msg.lower() for keyword in connection_error_keywords):
+                    logger.warning("Main loop detected connection error, triggering reconnection")
+                    trigger_reconnection()
+                
+                # If too many consecutive errors, take a longer break
+                if consecutive_errors >= max_consecutive_errors:
+                    logger.error(f"Too many consecutive errors ({max_consecutive_errors}). "
+                               f"Taking longer break...")
+                    if running:
+                        time.sleep(30)  # Longer wait after many errors
+                    consecutive_errors = 0  # Reset counter
+                elif running:
+                    # Brief pause before retrying
+                    time.sleep(min(consecutive_errors * 2, 10))  # Gradual backoff up to 10 seconds
+                    
+    except KeyboardInterrupt:
+        logger.info("Received interrupt signal")
+        running = False
     except Exception as e:
         logger.error(f"Critical error in main process: {e}", exc_info=True)
     finally:
         logger.info("Shutting down...")
-        consumer.close()
+        running = False
+        
+        # Close consumer safely
+        with consumer_lock:
+            if consumer:
+                try:
+                    consumer.close()
+                    logger.info("Consumer closed successfully")
+                except Exception as e:
+                    logger.warning(f"Error closing consumer: {e}")
+
 
 if __name__ == "__main__":
     main()
