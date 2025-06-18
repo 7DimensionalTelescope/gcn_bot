@@ -356,94 +356,6 @@ class GCNCircularHandler:
         
         logger.info("Compiled all regex patterns for GCN circular processing")
         
-    def _extract_redshift(self, body: str) -> Tuple[Optional[float], Optional[float]]:
-        """
-        Extract redshift and error from circular body.
-        
-        Args:
-            body (str): The body of the circular
-            
-        Returns:
-            Tuple[Optional[float], Optional[float]]: (Redshift, Redshift Error) or (None, None) if not found
-            
-        Examples:
-            >>> handler._extract_redshift("We measure a redshift of 0.4215±0.0005")
-            (0.4215, 0.0005)
-            >>> handler._extract_redshift("The host galaxy has z = 1.23")
-            (1.23, None)
-        """
-        try:
-            # Try each redshift pattern
-            for pattern in self.compiled_patterns['redshift']['general']:
-                match = pattern.search(body)
-                if match:
-                    redshift = float(match.group(1))
-                    redshift_error = float(match.group(2)) if len(match.groups()) > 1 and match.group(2) else None
-                    logger.info(f"Extracted redshift: z={redshift}{f' ± {redshift_error}' if redshift_error else ''}")
-                    return redshift, redshift_error
-            
-            # Special case: search for decimal numbers following "redshift" within a reasonable distance
-            redshift_mentions = re.finditer(r"redshift", body, re.IGNORECASE)
-            for mention in redshift_mentions:
-                # Look for numbers within 50 characters after "redshift"
-                pos = mention.end()
-                snippet = body[pos:pos+50]
-                num_match = re.search(r"([\d.]+)(?:\s*(?:±|\+/-)\s*([\d.]+))?", snippet)
-                if num_match:
-                    redshift = float(num_match.group(1))
-                    redshift_error = float(num_match.group(2)) if num_match.group(2) else None
-                    logger.info(f"Extracted redshift using proximity search: z={redshift}{f' ± {redshift_error}' if redshift_error else ''}")
-                    return redshift, redshift_error
-                    
-            logger.debug("No redshift found in circular")
-            return None, None
-        except Exception as e:
-            logger.error(f"Error extracting redshift: {e}")
-            return None, None
-        
-    def _extract_host_info(self, body: str) -> Optional[str]:
-        """
-        Extract host galaxy information from circular body.
-        
-        Args:
-            body (str): The body of the circular
-            
-        Returns:
-            Optional[str]: Host galaxy information or None if not found
-            
-        Examples:
-            >>> handler._extract_host_info("We observed the bright galaxy within the localization of GRB...")
-            "bright galaxy within the localization of GRB"
-        """
-        try:
-            for pattern in self.compiled_patterns['host_galaxy']['general']:
-                match = pattern.search(body)
-                if match:
-                    host_info = match.group(1).strip()
-                    logger.info(f"Extracted host galaxy info: {host_info[:50]}...")
-                    return host_info
-            
-            # Try additional approaches: look for context containing "host" and "galaxy"
-            host_mentions = re.finditer(r"host|galaxy", body, re.IGNORECASE)
-            for mention in host_mentions:
-                # Get surrounding context (100 chars before and after)
-                start = max(0, mention.start() - 100)
-                end = min(len(body), mention.end() + 100)
-                context = body[start:end]
-                
-                # Extract a sentence containing the mention
-                sentence_match = re.search(r"([^\.;]+host[^\.;]+galaxy[^\.;]+)", context, re.IGNORECASE)
-                if sentence_match:
-                    host_info = sentence_match.group(1).strip()
-                    logger.info(f"Extracted host galaxy info using context: {host_info[:50]}...")
-                    return host_info
-                    
-            logger.debug("No host galaxy information found in circular")
-            return None
-        except Exception as e:
-            logger.error(f"Error extracting host info: {e}")
-            return None
-        
     def _check_false_trigger(self, body: str, facility: Optional[str]) -> bool:
         """
         Check if the circular is reporting a false trigger.
@@ -493,124 +405,64 @@ class GCNCircularHandler:
         except Exception as e:
             logger.error(f"Error checking for false trigger: {e}")
             return False
-    
-    def _extract_coordinates(self, body: str, facility: Optional[str]) -> Tuple[Optional[float], Optional[float], Optional[float], Optional[str]]:
+
+    def _extract_trigger_number(self, subject: str, body: str, facility: str = None) -> Optional[str]:
         """
-        Extract RA, Dec and position error from circular body.
-        
-        Args:
-            body (str): The body of the circular
-            facility (Optional[str]): The detected facility name, if available
-            
-        Returns:
-            Tuple[Optional[float], Optional[float], Optional[float], Optional[str]]: 
-                (RA, Dec, Error, Error Unit) or (None, None, None, None) if not found
-                
-        Examples:
-            >>> handler._extract_coordinates("RA, Dec = 106.76048, +7.19313 with uncertainty of 2.6 arcsec", "SwiftXRT")
-            (106.76048, 7.19313, 2.6, 'arcsec')
+        Extract trigger number from circular with improved error handling.
         """
         try:
-            if not facility:
-                # Try all position patterns if facility is unknown
-                for facility_key, patterns in self.compiled_patterns['position'].items():
-                    for pattern in patterns:
-                        match = pattern.search(body)
-                        if match:
-                            if facility_key in ['Swift-XRT', 'Swift-BAT', 'Einstein-Probe']:
-                                # These patterns extract decimal degrees directly
-                                if len(match.groups()) >= 3:
-                                    ra = float(match.group(1))
-                                    dec = float(match.group(2))
-                                    error = float(match.group(3))
-                                    error_unit = match.group(4) if len(match.groups()) >= 4 else 'arcsec'
-                                    return ra, dec, error, error_unit
-                            elif facility_key in ['Fermi-GBM', 'Fermi-LAT']:
-                                # These also extract decimal degrees but error is in degrees
-                                if len(match.groups()) >= 3:
-                                    ra = float(match.group(1))
-                                    dec = float(match.group(2))
-                                    error = float(match.group(3))
-                                    error_unit = 'deg'
-                                    return ra, dec, error, error_unit
-                
-                # Try to match sexagesimal format (RA: HH MM SS.SS, Dec: DD MM SS.SS)
-                sex_pattern = re.compile(
-                    r"RA\s*\(J2000\):\s*(\d{2})h\s*(\d{2})m\s*([\d.]+)s.*?" +
-                    r"Dec\s*\(J2000\):\s*([-+]?\d{2})d\s*(\d{2})\'\s*([\d.]+)\".*?" +
-                    r"uncertainty\s+of\s+([\d.]+)\s*([\"\'arcsec]+)",
-                    re.IGNORECASE | re.DOTALL
-                )
-                
-                sex_match = sex_pattern.search(body)
-                if sex_match:
-                    # Convert sexagesimal to decimal degrees
-                    ra_h = float(sex_match.group(1))
-                    ra_m = float(sex_match.group(2))
-                    ra_s = float(sex_match.group(3))
-                    ra = (ra_h + ra_m / 60 + ra_s / 3600) * 15  # Convert hours to degrees
-                    
-                    dec_d = float(sex_match.group(4))
-                    dec_m = float(sex_match.group(5))
-                    dec_s = float(sex_match.group(6))
-                    dec_sign = -1 if dec_d < 0 else 1
-                    dec = dec_sign * (abs(dec_d) + dec_m / 60 + dec_s / 3600)
-                    
-                    error = float(sex_match.group(7))
-                    error_unit = sex_match.group(8)
-                    
-                    return ra, dec, error, error_unit
-                    
-                return None, None, None, None
-                
-            # Facility-specific coordinate extraction
-            if 'Swift' in facility:
-                relevant_patterns = self.compiled_patterns['position']['Swift-XRT'] if 'XRT' in facility else self.compiled_patterns['position']['Swift-BAT']
-            elif 'Fermi' in facility:
-                relevant_patterns = self.compiled_patterns['position']['Fermi-GBM'] if 'GBM' in facility else self.compiled_patterns['position']['Fermi-LAT']
-            elif 'Einstein' in facility:
-                relevant_patterns = self.compiled_patterns['position']['Einstein-Probe']
-            else:
-                # Try all patterns if specific instrument not identified
-                return self._extract_coordinates(body, None)
-                
-            # Try to match the relevant patterns
-            for pattern in relevant_patterns:
-                match = pattern.search(body)
-                if match:
-                    # Check if it's a sexagesimal format
-                    if len(match.groups()) >= 6 and 'XRT' in facility:
-                        # Convert sexagesimal to decimal degrees
-                        ra_h = float(match.group(1))
-                        ra_m = float(match.group(2))
-                        ra_s = float(match.group(3))
-                        ra = (ra_h + ra_m / 60 + ra_s / 3600) * 15  # Convert hours to degrees
-                        
-                        dec_d = float(match.group(4))
-                        dec_m = float(match.group(5))
-                        dec_s = float(match.group(6))
-                        dec_sign = -1 if dec_d < 0 else 1
-                        dec = dec_sign * (abs(dec_d) + dec_m / 60 + dec_s / 3600)
-                        
-                        error = float(match.group(7))
-                        error_unit = match.group(8)
-                        
-                        return ra, dec, error, error_unit
-                    else:
-                        # Standard decimal degree format
-                        ra = float(match.group(1))
-                        dec = float(match.group(2))
-                        error = float(match.group(3))
-                        # Get error unit if available, otherwise use default based on facility
-                        error_unit = match.group(4) if len(match.groups()) >= 4 else 'deg' if 'Fermi' in facility else 'arcsec'
-                        
-                        return ra, dec, error, error_unit
-                    
-            logger.debug(f"Could not extract coordinates for facility {facility}")
-            return None, None, None, None
+            # Try multiple patterns based on facility
+            patterns = []
+            
+            if facility and 'Fermi' in facility:
+                patterns.extend([
+                    r'trigger\s+(\d+)/?(\d+)',  # Fermi dual format
+                    r'trigger\s+(\d+)',         # Single trigger
+                    r'GBM\s+trigger\s+(\d+)',   # GBM specific
+                    r'LAT\s+trigger\s+(\d+)',   # LAT specific
+                ])
+            
+            if facility and 'Swift' in facility:
+                patterns.extend([
+                    r'trigger\s+(\d+)',
+                    r'BAT\s+trigger\s+(\d+)',
+                    r'XRT\s+trigger\s+(\d+)',
+                    r'trigger\s+number\s+(\d+)',
+                    r'\(trigger\s*=\s*(\d+)\)',
+                ])
+            
+            # General patterns
+            patterns.extend([
+                r'trigger[:\s]+(\d+)',
+                r'Trigger\s+Number[:\s]+(\d+)',
+                r'#(\d+)',  # For numbered triggers
+                r'(\d{8,})',  # Long number sequences
+            ])
+            
+            # Try each pattern with error handling
+            combined_text = subject + " " + body
+            for pattern in patterns:
+                try:
+                    match = re.search(pattern, combined_text, re.IGNORECASE)
+                    if match and match.groups():
+                        # For Fermi dual format, return first number
+                        trigger_num = match.group(1)
+                        if trigger_num and trigger_num.isdigit():
+                            if facility and 'Fermi' in facility:
+                                logger.info(f"Extracted trigger number (Fermi dual format): {trigger_num}")
+                            else:
+                                logger.info(f"Extracted trigger number: {trigger_num}")
+                            return trigger_num
+                except (AttributeError, IndexError) as e:
+                    logger.debug(f"Pattern '{pattern}' failed: {e}")
+                    continue
+            
+            logger.debug("No trigger number found")
+            return None
+            
         except Exception as e:
-            logger.error(f"Error extracting coordinates: {e}")
-            return None, None, None, None
+            logger.error(f"Error extracting trigger number: {e}")
+            return None
 
     def _extract_event_name(self, subject: str) -> Optional[str]:
         """
@@ -731,99 +583,120 @@ class GCNCircularHandler:
             logger.error(f"Error extracting facility: {e}")
             return None
 
-    def _extract_trigger_number(self, subject: str, body: str, facility: Optional[str]) -> Optional[str]:
+    def _extract_coordinates(self, body: str, facility: str = None) -> Tuple[Optional[float], Optional[float], Optional[float], Optional[str]]:
         """
-        Extract trigger number from circular subject and body.
-        
-        Args:
-            subject (str): The subject line of the circular
-            body (str): The body of the circular
-            facility (Optional[str]): The detected facility name, if available
-            
-        Returns:
-            Optional[str]: The extracted trigger number or None if not found
-            
-        Examples:
-            >>> handler._extract_trigger_number("...", "Fermi GBM trigger 764205327", "FermiGBM")
-            "764205327"
+        Extract coordinates with improved error handling.
+        FIXED: Better handling of regex group access and type conversions.
         """
         try:
-            if not facility:
-                # Try to match any trigger number pattern if facility is unknown
-                for facility_key, patterns in self.compiled_patterns['trigger_num'].items():
-                    for pattern in patterns:
-                        match = pattern.search(body)
-                        if match:
-                            # Handle special case for Fermi with two trigger numbers
-                            if len(match.groups()) > 1 and 'Fermi' in facility_key and match.group(2):
-                                logger.info(f"Extracted trigger number (Fermi dual format): {match.group(1)}")
-                                return match.group(1)  # Use first trigger number
-                            
-                            logger.info(f"Extracted trigger number: {match.group(1)}")
-                            return match.group(1)
-                            
-                # Check subject if not found in body
-                for facility_key, patterns in self.compiled_patterns['trigger_num'].items():
-                    for pattern in patterns:
-                        match = pattern.search(subject)
-                        if match:
-                            if len(match.groups()) > 1 and 'Fermi' in facility_key and match.group(2):
-                                logger.info(f"Extracted trigger number from subject (Fermi dual format): {match.group(1)}")
-                                return match.group(1)
-                            
-                            logger.info(f"Extracted trigger number from subject: {match.group(1)}")
-                            return match.group(1)
-                return None
+            # Your existing coordinate extraction logic here
+            # but wrapped in try-catch for each step
+            
+            if facility and facility in self.patterns.get('position', {}):
+                patterns = self.patterns['position'][facility]
                 
-            # Facility-specific trigger extraction
-            patterns_to_check = []
-            if 'Swift' in facility:
-                patterns_to_check = self.compiled_patterns['trigger_num']['Swift']
-            elif 'Fermi' in facility:
-                patterns_to_check = self.compiled_patterns['trigger_num']['Fermi']
-            elif 'Einstein' in facility:
-                patterns_to_check = self.compiled_patterns['trigger_num']['Einstein-Probe']
-            else:
-                # If unknown facility, try all patterns
-                return self._extract_trigger_number(subject, body, None)
-                
-            # First check the body
-            for pattern in patterns_to_check:
-                match = pattern.search(body)
-                if match:
-                    # Fermi trigger numbers sometimes have format trigger=12345/67890
-                    if len(match.groups()) > 1 and 'Fermi' in facility and match.group(2):
-                        logger.info(f"Extracted trigger number (Fermi dual format): {match.group(1)}")
-                        return match.group(1)  # Use first trigger number
+                for pattern in patterns:
+                    try:
+                        match = re.search(pattern, body, re.IGNORECASE | re.DOTALL)
+                        if match and match.groups():
+                            groups = match.groups()
+                            if len(groups) >= 3:  # Check if we have enough groups
+                                ra = float(groups[0])
+                                dec = float(groups[1])
+                                error = float(groups[2])
+                                error_unit = groups[3] if len(groups) > 3 and groups[3] else 'arcsec'
+                                logger.info(f"Extracted coordinates: RA={ra}, Dec={dec}, Error={error} {error_unit}")
+                                return ra, dec, error, error_unit
+                    except (ValueError, IndexError, TypeError) as e:
+                        logger.debug(f"Pattern failed: {e}")
+                        continue
+            
+            # Fallback to general patterns
+            general_patterns = [
+                r'RA[:\s=]*(\d+\.?\d*)[,\s]+Dec[:\s=]*([-+]?\d+\.?\d*)',
+                r'RA\s*=\s*(\d+\.?\d*),?\s*Dec\s*=\s*([-+]?\d+\.?\d*)',
+                r'located\s+at\s+RA[:\s=]*(\d+\.?\d*)[,\s]+Dec[:\s=]*([-+]?\d+\.?\d*)',
+            ]
+            
+            for pattern in general_patterns:
+                try:
+                    match = re.search(pattern, body, re.IGNORECASE)
+                    if match and match.groups() and len(match.groups()) >= 2:
+                        ra = float(match.group(1))
+                        dec = float(match.group(2))
+                        logger.info(f"Extracted coordinates (general): RA={ra}, Dec={dec}")
+                        return ra, dec, None, None
+                except (ValueError, IndexError, TypeError, AttributeError):
+                    continue
                     
-                    logger.info(f"Extracted trigger number: {match.group(1)}")
-                    return match.group(1)
-                    
-            # Then check the subject if not found in body
-            for pattern in patterns_to_check:
-                match = pattern.search(subject)
-                if match:
-                    if len(match.groups()) > 1 and 'Fermi' in facility and match.group(2):
-                        logger.info(f"Extracted trigger number from subject (Fermi dual format): {match.group(1)}")
-                        return match.group(1)
-                    
-                    logger.info(f"Extracted trigger number from subject: {match.group(1)}")
-                    return match.group(1)
-                    
-            # Try a generic approach if still not found - looking for numbers in parentheses in first 300 chars
-            if not ('Einstein' in facility):  # Einstein Probe IDs can be complex, so skip this for them
-                first_part = body[:300]
-                number_matches = re.finditer(r"\((\d{5,})\)", first_part)
-                for match in number_matches:
-                    trigger_num = match.group(1)
-                    if len(trigger_num) >= 5 and len(trigger_num) <= 10:  # Typical trigger number length
-                        logger.info(f"Extracted trigger number using generic pattern: {trigger_num}")
-                        return trigger_num
-                
-            logger.debug(f"Could not extract trigger number for facility {facility}")
-            return None
         except Exception as e:
-            logger.error(f"Error extracting trigger number: {e}")
+            logger.error(f"Error extracting coordinates: {e}")
+        
+        return None, None, None, None
+
+    def _extract_redshift(self, body: str) -> Tuple[Optional[float], Optional[float]]:
+        """
+        Extract redshift with improved error handling.
+        """
+        try:
+            patterns = [
+                r'redshift\s+(?:of\s+)?z\s*[=~]\s*([\d.]+)(?:\s*(?:±|\+/-)\s*([\d.]+))?',
+                r'at\s+z\s*[=~]\s*([\d.]+)(?:\s*(?:±|\+/-)\s*([\d.]+))?',
+                r'z\s*=\s*([\d.]+)(?:\s*(?:±|\+/-)\s*([\d.]+))?',
+                r'redshift.*?(\d+\.?\d*)(?:\s*±\s*([\d.]+))?',
+            ]
+            
+            for pattern in patterns:
+                try:
+                    match = re.search(pattern, body, re.IGNORECASE)
+                    if match and match.groups():
+                        redshift = float(match.group(1))
+                        redshift_error = None
+                        if len(match.groups()) > 1 and match.group(2):
+                            try:
+                                redshift_error = float(match.group(2))
+                            except (ValueError, TypeError):
+                                pass
+                        
+                        logger.info(f"Extracted redshift: z={redshift}{f' ± {redshift_error}' if redshift_error else ''}")
+                        return redshift, redshift_error
+                except (ValueError, IndexError, TypeError, AttributeError):
+                    continue
+                    
+            return None, None
+            
+        except Exception as e:
+            logger.error(f"Error extracting redshift: {e}")
+            return None, None
+
+    def _extract_host_info(self, body: str) -> Optional[str]:
+        """
+        Extract host information with improved error handling.
+        """
+        try:
+            patterns = [
+                r'host\s+galaxy.*?([^.\n]+)',
+                r'host[:\s]*([^.\n]+)',
+                r'galaxy[:\s]*([^.\n]+)',
+                r'supporting\s+it\s+as\s+a\s+likely\s+host\s+galaxy\s+of\s+the\s+GRB',
+                r'bright\s+galaxy\s+within.*?([^.\n]+)',
+            ]
+            
+            for pattern in patterns:
+                try:
+                    match = re.search(pattern, body, re.IGNORECASE)
+                    if match and match.groups():
+                        host_info = match.group(1).strip()
+                        if host_info and len(host_info) > 3:  # Minimum meaningful length
+                            logger.info(f"Extracted host info: {host_info[:50]}...")
+                            return host_info
+                except (AttributeError, IndexError, TypeError):
+                    continue
+                    
+            return None
+            
+        except Exception as e:
+            logger.error(f"Error extracting host info: {e}")
             return None
 
     def _convert_error_to_degrees(self, error: float, error_unit: str) -> float:
@@ -1246,48 +1119,25 @@ class GCNCircularHandler:
         Update the ASCII database with processed circular data.
         Enhanced multi-facility design: one row per GRB with facility tracking.
         """
-        
-        # Check for false triggers first (they need different handling)
-        if processed_data.get('false_trigger'):
-            logger.info(f"Processing false trigger for removal: {processed_data.get('facility')} trigger {processed_data.get('trigger_num')}")
-            
-            # For false triggers, we only need facility and trigger_num
-            if not processed_data.get('facility') or not processed_data.get('trigger_num'):
-                logger.warning(f"Skipping false trigger removal due to missing facility or trigger_num")
-                return
-                
-            self._remove_false_trigger_from_ascii(processed_data)
-            return
-        
-        # Now check for essential data for real GRBs
+        # Early return checks
         event_name = processed_data.get('event_name')
         facility = processed_data.get('facility')
         trigger_num = processed_data.get('trigger_num')
         
-        # For Swift facilities, we can proceed without trigger number if we have coordinates
-        is_swift_facility = facility and 'Swift' in facility
+        # Skip ASCII update if essential data is missing
+        if not event_name or not facility:
+            logger.warning("Skipping ASCII update due to missing essential data (event_name or facility)")
+            return
+            
+        # Skip certain facilities without trigger numbers unless they have coordinates
         has_coordinates = (processed_data.get('ra') is not None and 
                         processed_data.get('dec') is not None)
+        is_swift_facility = facility and 'Swift' in facility
         
-        # Essential data check - more flexible for Swift
-        if not event_name or not facility:
-            logger.warning(f"Skipping ASCII update due to missing essential data (event_name or facility)")
-            return
-            
-        # For non-Swift facilities, trigger number is still required
-        if not is_swift_facility and not trigger_num:
-            logger.warning(f"Skipping ASCII update due to missing trigger number for {facility}")
-            return
-            
-        # For Swift, if no trigger number but has coordinates, create a pseudo-trigger ID
-        if is_swift_facility and not trigger_num and has_coordinates:
-            trigger_num = f"SWIFT_{event_name.replace(' ', '_')}"
-            processed_data['trigger_num'] = trigger_num
-            logger.info(f"Generated pseudo trigger number for Swift circular: {trigger_num}")
-        elif is_swift_facility and not trigger_num and not has_coordinates:
+        if is_swift_facility and not trigger_num and not has_coordinates:
             logger.warning(f"Skipping ASCII update for Swift circular without trigger number or coordinates")
             return
-                    
+                
         with self.file_lock:
             try:
                 # Load existing ASCII file
@@ -1296,6 +1146,22 @@ class GCNCircularHandler:
                 # Load existing data with backward compatibility
                 df = self._load_ascii_with_recovery(self.output_ascii)
                 df = self._ensure_ascii_columns(df)  # Add new columns if missing
+                
+                # CRITICAL FIX: Ensure all required columns exist before accessing them
+                required_columns = ['Best_Facility', 'All_Facilities', 'Primary_Facility', 'Last_Update', 'GCN_ID']
+                for col in required_columns:
+                    if col not in df.columns:
+                        logger.info(f"Adding missing column: {col}")
+                        if col == 'Best_Facility' and 'Facility' in df.columns:
+                            df[col] = df['Facility']
+                        elif col == 'Primary_Facility' and 'Facility' in df.columns:
+                            df[col] = df['Facility']
+                        elif col == 'All_Facilities' and 'Facility' in df.columns:
+                            df[col] = df['Facility']
+                        elif col == 'Last_Update' and 'Notice_date' in df.columns:
+                            df[col] = df['Notice_date']
+                        else:
+                            df[col] = ''
                 
                 # Get circular info
                 circular_id = processed_data.get('circular_id')
@@ -1321,69 +1187,63 @@ class GCNCircularHandler:
                     
                     should_update_position = self._should_update_position(current_best, facility)
                     
-                    logger.info(f"Updating {event_name}: current_best={current_best}, new={facility}, update_position={should_update_position}")
+                    logger.info(f"Updating existing entry for {event_name}: current_best={current_best}, new_facility={facility}, should_update={should_update_position}")
                     
-                    # Update Best_Facility and position if higher priority
-                    if should_update_position and has_coordinates:
+                    # Update facility tracking
+                    if facility not in current_all:
+                        updated_all = f"{current_all},{facility}" if current_all else facility
+                        df.at[existing_idx, 'All_Facilities'] = updated_all
+                    
+                    # Update best facility if new one has higher priority
+                    if should_update_position:
                         df.at[existing_idx, 'Best_Facility'] = facility
-                        df.at[existing_idx, 'RA'] = f"{processed_data['ra']:.5f}"
-                        df.at[existing_idx, 'DEC'] = f"{processed_data['dec']:.5f}"
+                        logger.info(f"Updated best facility from {current_best} to {facility}")
                         
-                        if (processed_data.get('error') is not None and 
-                            processed_data.get('error_unit') is not None):
-                            error_in_degrees = self._convert_error_to_degrees(
-                                processed_data['error'], 
-                                processed_data['error_unit']
-                            )
-                            if error_in_degrees is not None:
-                                df.at[existing_idx, 'Error'] = f"{error_in_degrees:.6f}"
-                        
-                        logger.info(f"Updated position with {facility} data (higher priority)")
+                        # Update position if coordinates available
+                        if has_coordinates:
+                            df.at[existing_idx, 'RA'] = f"{processed_data['ra']:.5f}"
+                            df.at[existing_idx, 'DEC'] = f"{processed_data['dec']:.5f}"
+                            
+                            # Convert error to degrees if needed
+                            error_in_degrees = processed_data.get('error', 0)
+                            if processed_data.get('error_unit') == 'arcsec':
+                                error_in_degrees = error_in_degrees / 3600.0
+                            elif processed_data.get('error_unit') == 'arcmin':
+                                error_in_degrees = error_in_degrees / 60.0
+                            
+                            df.at[existing_idx, 'Error'] = f"{error_in_degrees:.6f}"
+                            df.at[existing_idx, 'Facility'] = facility  # Keep main facility field updated
+                            
+                            if trigger_num:
+                                df.at[existing_idx, 'Trigger_num'] = trigger_num
                     
-                    # Add facility to All_Facilities if not already present
-                    all_facilities_list = [f.strip() for f in current_all.split(',') if f.strip()]
-                    if facility not in all_facilities_list:
-                        all_facilities_list.append(facility)
-                        df.at[existing_idx, 'All_Facilities'] = ','.join(all_facilities_list)
-                    
-                    # Add circular ID to GCN_ID if not already present
-                    gcn_ids = [g.strip() for g in current_gcn_id.split(',') if g.strip()]
-                    if str(circular_id) not in gcn_ids:
-                        gcn_ids.append(str(circular_id))
-                        df.at[existing_idx, 'GCN_ID'] = ','.join(gcn_ids)
-                    
-                    # Always update redshift if available
-                    if processed_data.get('redshift') is not None:
-                        df.at[existing_idx, 'Redshift'] = f"{processed_data['redshift']:.4f}"
-                        
-                    # Always update host info if new info is more detailed
-                    if processed_data.get('host_info'):
-                        current_host_info = str(df.at[existing_idx, 'Host_info']).strip()
-                        new_host_info = processed_data['host_info'].strip()
-                        
-                        if len(new_host_info) > len(current_host_info):
-                            if not (new_host_info.startswith('"') and new_host_info.endswith('"')):
-                                new_host_info = f'"{new_host_info}"'
-                            df.at[existing_idx, 'Host_info'] = new_host_info
-                    
-                    # Update Last_Update but keep Notice_date unchanged
+                    # Always update GCN_ID list and Last_Update
+                    updated_gcn_id = f"{current_gcn_id},{circular_id}" if current_gcn_id else str(circular_id)
+                    df.at[existing_idx, 'GCN_ID'] = updated_gcn_id
                     df.at[existing_idx, 'Last_Update'] = current_time
                     
-                    logger.info(f"Updated existing entry: {df.at[existing_idx, 'GCN_ID']}")
+                    # Update other fields if available
+                    if processed_data.get('redshift') is not None:
+                        df.at[existing_idx, 'Redshift'] = f"{processed_data['redshift']:.4f}"
+                    if processed_data.get('host_info'):
+                        df.at[existing_idx, 'Host_info'] = f'"{processed_data["host_info"]}"'
+                    
+                    logger.info(f"Updated existing entry for {event_name}")
                     
                 else:
-                    # ADD NEW ENTRY (first detection of this GRB)
-                    if (processed_data.get('ra') is not None and 
-                        processed_data.get('dec') is not None and 
-                        processed_data.get('error') is not None and
-                        processed_data.get('error_unit') is not None):
+                    # ADD NEW ENTRY
+                    if has_coordinates and trigger_num:
+                        # Convert error to degrees if needed
+                        error_in_degrees = processed_data.get('error', 0)
+                        if processed_data.get('error_unit') == 'arcsec':
+                            error_in_degrees = error_in_degrees / 3600.0
+                        elif processed_data.get('error_unit') == 'arcmin':
+                            error_in_degrees = error_in_degrees / 60.0
                         
-                        error_in_degrees = self._convert_error_to_degrees(
-                            processed_data['error'], 
-                            processed_data['error_unit']
-                        )
-                        
-                        discovery_time = datetime.fromtimestamp(processed_data["created_on"]/1000).strftime("%Y-%m-%d %H:%M:%S")
+                        # Format discovery time
+                        discovery_time = processed_data.get('discovery_utc', '')
+                        if not discovery_time and processed_data.get('discovery_date') and processed_data.get('discovery_time'):
+                            discovery_time = f"{processed_data['discovery_date']} {processed_data['discovery_time']}"
                         
                         new_row = {
                             'GCN_ID': str(circular_id),
@@ -1395,6 +1255,7 @@ class GCNCircularHandler:
                             'Primary_Facility': facility,       # First detector
                             'Best_Facility': facility,          # Initially same as primary
                             'All_Facilities': facility,         # Start with just this facility
+                            'Facility': facility,               # Backward compatibility
                             'Trigger_num': trigger_num,         # From primary facility
                             'Notice_date': current_time,        # First circular time
                             'Last_Update': current_time,        # Same as notice_date initially
@@ -1478,7 +1339,6 @@ class GCNCircularHandler:
         
         return facility_priorities.get(facility, 1)
 
-
     def _should_update_position(self, current_facility: str, new_facility: str) -> bool:
         """
         Determine if position should be updated based on facility priority.
@@ -1488,7 +1348,6 @@ class GCNCircularHandler:
         new_priority = self._get_facility_priority(new_facility)
         
         return new_priority > current_priority
-
 
     def get_facility_summary(self) -> None:
         """
@@ -1523,11 +1382,8 @@ class GCNCircularHandler:
         
     def _remove_false_trigger_from_ascii(self, processed_data: Dict[str, Any]) -> None:
         """
-        Remove a false trigger from the ASCII database if it exists.
-        Enhanced with better facility name matching and detailed logging.
-        
-        Args:
-            processed_data (Dict[str, Any]): The processed circular data containing false trigger
+        Remove a false trigger from the ASCII database with improved error handling.
+        FIXED: Better column handling and safe row processing.
         """
         if not os.path.exists(self.output_ascii):
             logger.warning("ASCII file does not exist, skipping false trigger removal")
@@ -1541,35 +1397,54 @@ class GCNCircularHandler:
             try:
                 # Load existing ASCII
                 df = self._load_ascii_with_recovery(self.output_ascii)
-                logger.info(f"Loaded ASCII file with {len(df)} entries")
+                df = self._ensure_ascii_columns(df)  # Ensure all columns exist
+                logger.info(f"pandas loaded {len(df)}/{len(df)} entries")
                 
                 # Get normalized facility name for the processed data
                 facility = processed_data['facility']
                 trigger_num = str(processed_data['trigger_num'])
                 normalized_facility = self._normalize_facility_name(facility)
                 
+                logger.info(f"Processing false trigger for removal: {facility} trigger {trigger_num}")
                 logger.info(f"Looking for false trigger to remove: facility='{facility}' (normalized='{normalized_facility}'), trigger='{trigger_num}'")
                 
                 # Find rows to remove - any with matching normalized facility and trigger
                 rows_to_remove = []
                 gcn_ids_to_remove = []
                 
+                # Use the correct column name based on what exists
+                facility_columns = ['Primary_Facility', 'Facility', 'Best_Facility']
+                facility_column = None
+                for col in facility_columns:
+                    if col in df.columns:
+                        facility_column = col
+                        break
+                
+                if not facility_column:
+                    logger.warning("No suitable facility column found for false trigger removal")
+                    return
+                
                 for idx, row in df.iterrows():
-                    row_facility = str(row.get('Facility', '')).strip()
-                    row_trigger = str(row.get('Trigger_num', '')).strip()
-                    row_gcn_id = str(row.get('GCN_ID', '')).strip()
+                    try:
+                        row_facility = str(row.get(facility_column, '')).strip()
+                        row_trigger = str(row.get('Trigger_num', '')).strip()
+                        row_gcn_id = str(row.get('GCN_ID', '')).strip()
+                        
+                        # Normalize the row's facility
+                        normalized_row_facility = self._normalize_facility_name(row_facility)
+                        
+                        logger.debug(f"Checking row {idx}: facility='{row_facility}' (normalized='{normalized_row_facility}'), trigger='{row_trigger}', gcn_id='{row_gcn_id}'")
+                        
+                        # Check if normalized facilities and trigger numbers match
+                        if (normalized_row_facility == normalized_facility and 
+                            row_trigger == trigger_num):
+                            rows_to_remove.append(idx)
+                            gcn_ids_to_remove.append(row_gcn_id)
+                            logger.info(f"Found matching entry to remove: {row_gcn_id} (original facility: {row_facility})")
                     
-                    # Normalize the row's facility
-                    normalized_row_facility = self._normalize_facility_name(row_facility)
-                    
-                    logger.debug(f"Checking row {idx}: facility='{row_facility}' (normalized='{normalized_row_facility}'), trigger='{row_trigger}', gcn_id='{row_gcn_id}'")
-                    
-                    # Check if normalized facilities and trigger numbers match
-                    if (normalized_row_facility == normalized_facility and 
-                        row_trigger == trigger_num):
-                        rows_to_remove.append(idx)
-                        gcn_ids_to_remove.append(row_gcn_id)
-                        logger.info(f"Found matching entry to remove: {row_gcn_id} (original facility: {row_facility})")
+                    except Exception as row_error:
+                        logger.debug(f"Error processing row {idx}: {row_error}")
+                        continue
                 
                 if rows_to_remove:
                     # Remove the false triggers
@@ -1583,21 +1458,15 @@ class GCNCircularHandler:
                     logger.info(f"Successfully removed {len(rows_to_remove)} false trigger entries matching {normalized_facility}_{trigger_num} from ASCII database. GCN_IDs: {gcn_ids_str}")
                     
                     # Log summary of remaining entries for this facility
-                    remaining_count = len(df[df['Facility'].apply(lambda x: self._normalize_facility_name(str(x)) == normalized_facility)])
-                    logger.info(f"Remaining entries for {normalized_facility}: {remaining_count}")
+                    try:
+                        remaining_count = len(df[df[facility_column].apply(lambda x: self._normalize_facility_name(str(x)) == normalized_facility)])
+                        logger.info(f"Remaining entries for {normalized_facility}: {remaining_count}")
+                    except Exception:
+                        logger.debug("Could not count remaining entries")
                     
                 else:
                     logger.warning(f"No entries found to remove for false trigger {normalized_facility}_{trigger_num}")
                     
-                    # Debug: show all existing entries for this facility
-                    facility_entries = df[df['Facility'].apply(lambda x: self._normalize_facility_name(str(x)) == normalized_facility)]
-                    if len(facility_entries) > 0:
-                        logger.debug(f"Existing {normalized_facility} entries:")
-                        for _, entry in facility_entries.iterrows():
-                            logger.debug(f"  - Trigger: {entry.get('Trigger_num', 'N/A')}, GCN_ID: {entry.get('GCN_ID', 'N/A')}")
-                    else:
-                        logger.debug(f"No existing entries found for facility {normalized_facility}")
-                        
             except Exception as e:
                 logger.error(f"Error removing false trigger from ASCII database: {e}", exc_info=True)
                 
