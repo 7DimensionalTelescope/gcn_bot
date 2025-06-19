@@ -396,7 +396,9 @@ def _filter_notice_text(text, topic):
         r"AMPLIFIER",
         r"COMMENTS:",
         r"TRIGGER_INDEX",
-        r"TITLE"
+        r"TITLE",
+        r"SRC_ERROR50",
+        r"REVISION"
     ]
     
     # Store sections for structured output
