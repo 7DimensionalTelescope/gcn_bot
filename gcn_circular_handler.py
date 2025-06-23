@@ -1208,7 +1208,7 @@ class GCNCircularHandler:
                             elif processed_data.get('error_unit') == 'arcmin':
                                 error_in_degrees = error_in_degrees / 60.0
                             
-                            df.at[existing_idx, 'Error'] = f"{error_in_degrees:.6f}"
+                            df.at[existing_idx, 'Error'] = f"{error_in_degrees:.6f}" if error_in_degrees is not None else "N/A"
                             df.at[existing_idx, 'Facility'] = facility  # Keep main facility field updated
                             
                             if trigger_num:
