@@ -192,3 +192,6 @@ grb_targets.ascii.backup.*
 
 # test
 *test*.py
+*test*.ascii*
+*test*.csv
+*test*
