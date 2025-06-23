@@ -1524,6 +1524,78 @@ class GCNNoticeHandler:
             issues_found.append(f"Verification error: {str(e)}")
             return False, issues_found, repairs_made
 
+    def _create_backup_with_limit(self, filepath: str, max_backups: int = 5) -> str:
+        """
+        Create a backup of the file and manage backup count to keep only the most recent ones.
+        
+        Args:
+            filepath (str): Path to the file to backup
+            max_backups (int): Maximum number of backup files to keep (default: 5)
+        
+        Returns:
+            str: Path of the created backup file, or empty string if backup failed
+        """
+        if not os.path.exists(filepath):
+            logger.debug(f"File {filepath} does not exist, skipping backup")
+            return ""
+        
+        try:
+            # Create new backup with timestamp
+            backup_path = f"{filepath}.backup.{int(time.time())}"
+            import shutil
+            shutil.copy2(filepath, backup_path)
+            logger.debug(f"Created backup: {backup_path}")
+            
+            # Clean up old backups - keep only the most recent ones
+            self._cleanup_old_backups(filepath, max_backups)
+            
+            return backup_path
+            
+        except Exception as e:
+            logger.error(f"Failed to create backup for {filepath}: {e}")
+            return ""
+
+    def _cleanup_old_backups(self, filepath: str, max_backups: int = 5) -> None:
+        """
+        Remove old backup files, keeping only the most recent ones.
+        
+        Args:
+            filepath (str): Original file path (backups will be filepath.backup.*)
+            max_backups (int): Maximum number of backup files to keep
+        """
+        try:
+            import glob
+            
+            # Find all backup files for this filepath
+            backup_pattern = f"{filepath}.backup.*"
+            backup_files = glob.glob(backup_pattern)
+            
+            if len(backup_files) <= max_backups:
+                logger.debug(f"Only {len(backup_files)} backup files, no cleanup needed")
+                return
+            
+            # Sort by modification time (newest first)
+            backup_files.sort(key=lambda x: os.path.getmtime(x), reverse=True)
+            
+            # Keep only the most recent max_backups files
+            files_to_keep = backup_files[:max_backups]
+            files_to_remove = backup_files[max_backups:]
+            
+            # Remove old backup files
+            removed_count = 0
+            for old_backup in files_to_remove:
+                try:
+                    os.remove(old_backup)
+                    removed_count += 1
+                    logger.debug(f"Removed old backup: {old_backup}")
+                except Exception as e:
+                    logger.warning(f"Failed to remove backup file {old_backup}: {e}")
+            
+            logger.info(f"Cleaned up {removed_count} old backup files, keeping {len(files_to_keep)} most recent")
+                
+        except Exception as e:
+            logger.error(f"Error during backup cleanup: {e}")
+
 #---------------------------------------Main Function----------------------------------------
     def parse_notice(self, formatted_text: Union[str, bytes], topic: str) -> Optional[Dict[str, Any]]:
         """
@@ -1858,10 +1930,8 @@ class GCNNoticeHandler:
 
                 # PRESERVED: Save with backup
                 if os.path.exists(self.output_ascii):
-                    backup_path = f"{self.output_ascii}.backup.{int(time.time())}"
-                    import shutil
-                    shutil.copy2(self.output_ascii, backup_path)
-                    logger.debug(f"Created backup: {backup_path}")
+                    backup_path = self._create_backup_with_limit(self.output_ascii, max_backups=5)
+                    logger.info(f"Created backup: {backup_path}")
                 
                 # PRESERVED: Save with proper formatting
                 with open(self.output_ascii, 'w') as f:
