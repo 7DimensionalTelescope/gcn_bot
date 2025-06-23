@@ -198,6 +198,9 @@ except ImportError as e:
 # Import notice handler
 from gcn_notice_handler import GCNNoticeHandler
 
+# Import ToO emailer
+from gcn_too_emailer import GCNToOEmailer
+
 # Import ToO integration
 from slack_bolt import App
 from slack_bolt.adapter.socket_mode import SocketModeHandler
@@ -400,45 +403,79 @@ class SlackToOIntegration:
     
     def add_too_button_to_message(self, blocks: List[Dict[str, Any]], notice_data: Dict[str, Any]) -> List[Dict[str, Any]]:
         """Add ToO request button to existing GRB alert message."""
-        # Create ToO button block
-        too_button_block = {
-            "type": "actions",
-            "elements": [
-                {
-                    "type": "button",
-                    "text": {
-                        "type": "plain_text",
-                        "text": "📧 Submit ToO Request",
-                        "emoji": True
-                    },
-                    "style": "primary",
-                    "action_id": "submit_too_request",
-                    "value": json.dumps({
-                        "target": notice_data.get('Name', ''),
-                        "ra": notice_data.get('RA', ''),
-                        "dec": notice_data.get('DEC', ''),
-                        "facility": notice_data.get('Facility', ''),
-                        "trigger_num": notice_data.get('Trigger_Num', '')
-                    })
+        
+        try:
+            # Create simple button data with essential fields
+            button_data = {
+                "Name": str(notice_data.get('Name', '')),
+                "RA": str(notice_data.get('RA', '')),
+                "DEC": str(notice_data.get('DEC', '')),
+                "Facility": str(notice_data.get('Facility', '')),
+                "Trigger_num": str(notice_data.get('Trigger_num', ''))
+            }
+            
+            # Remove empty values
+            button_data = {k: v for k, v in button_data.items() if v and v != 'nan'}
+            
+            # Test JSON serialization
+            json_string = json.dumps(button_data, ensure_ascii=True)
+            
+            # Check Slack button value length limit
+            if len(json_string) > 2000:
+                logger.warning(f"Button data too long ({len(json_string)} chars), using minimal version")
+                minimal_data = {
+                    "Name": str(notice_data.get('Name', '')),
+                    "RA": str(notice_data.get('RA', '')),
+                    "DEC": str(notice_data.get('DEC', ''))
                 }
-            ]
-        }
-        
-        # Add divider and button
-        enhanced_blocks = blocks.copy()
-        enhanced_blocks.append({"type": "divider"})
-        enhanced_blocks.append(too_button_block)
-        
-        return enhanced_blocks
+                json_string = json.dumps(minimal_data, ensure_ascii=True)
+            
+            # Create ToO button block
+            too_button_block = {
+                "type": "actions",
+                "elements": [
+                    {
+                        "type": "button",
+                        "text": {
+                            "type": "plain_text",
+                            "text": "📧 Submit ToO Request",
+                            "emoji": True
+                        },
+                        "style": "primary",
+                        "action_id": "submit_too_request",
+                        "value": json_string
+                    }
+                ]
+            }
+            
+            # Add divider and button
+            enhanced_blocks = blocks.copy()
+            enhanced_blocks.append({"type": "divider"})
+            enhanced_blocks.append(too_button_block)
+            
+            logger.info("ToO button added successfully")
+            return enhanced_blocks
+            
+        except Exception as e:
+            logger.error(f"Failed to add ToO button: {e}")
+            # Return original blocks without button if there's any error
+            return blocks
     
     def create_too_modal(self, trigger_id: str, user_email: str, notice_data: Dict[str, Any]) -> bool:
-        """Create and open ToO request modal form."""
-        # Pre-populate form data from GRB notice
-        target_name = notice_data.get('Name', '')
+        """Create and open ToO request modal form with pre-populated data."""
+        
+        # DEBUG: Log what we received
+        logger.debug(f"🔍 DEBUG - Modal received notice_data: {notice_data}")
+        
+        # Extract values (notice_data should now be clean strings/numbers)
+        target_name = str(notice_data.get('Name', ''))
         ra_value = str(notice_data.get('RA', ''))
         dec_value = str(notice_data.get('DEC', ''))
         
-        # Create modal view
+        # Debug logging to check what data we're using
+        logger.debug(f"🔍 DEBUG - Extracted values: Target='{target_name}', RA='{ra_value}', DEC='{dec_value}'")
+        
+        # Create modal view with pre-populated fields
         modal_view = {
             "type": "modal",
             "callback_id": "too_request_modal",
@@ -460,7 +497,7 @@ class SlackToOIntegration:
                     "type": "section",
                     "text": {
                         "type": "mrkdwn",
-                        "text": f"*Target of Opportunity Request*\n*Target:* {target_name}"
+                        "text": f"*Target of Opportunity Request*\n*Target:* {target_name or 'Not specified'}"
                     }
                 },
                 {"type": "divider"},
@@ -484,14 +521,14 @@ class SlackToOIntegration:
                     }
                 },
                 
-                # Target name
+                # Target name - NOW WITH INITIAL VALUE
                 {
                     "type": "input",
                     "block_id": "target_block",
                     "element": {
                         "type": "plain_text_input",
                         "action_id": "target_input",
-                        "initial_value": target_name,
+                        "initial_value": target_name,  # ✅ Pre-populated from notice
                         "placeholder": {
                             "type": "plain_text",
                             "text": "GRB240101A"
@@ -503,26 +540,17 @@ class SlackToOIntegration:
                     }
                 },
                 
-                # Coordinates section
-                {
-                    "type": "section",
-                    "text": {
-                        "type": "mrkdwn",
-                        "text": "*Coordinates*"
-                    }
-                },
-                
-                # RA
+                # Right Ascension (RA) - NOW WITH INITIAL VALUE
                 {
                     "type": "input",
                     "block_id": "ra_block",
                     "element": {
                         "type": "plain_text_input",
                         "action_id": "ra_input",
-                        "initial_value": ra_value,
+                        "initial_value": ra_value,  # ✅ Pre-populated from notice
                         "placeholder": {
                             "type": "plain_text",
-                            "text": "hh:mm:ss or degrees"
+                            "text": "150.1234 (degrees)"
                         }
                     },
                     "label": {
@@ -531,35 +559,26 @@ class SlackToOIntegration:
                     }
                 },
                 
-                # Dec
+                # Declination (DEC) - NOW WITH INITIAL VALUE
                 {
                     "type": "input",
                     "block_id": "dec_block",
                     "element": {
                         "type": "plain_text_input",
                         "action_id": "dec_input",
-                        "initial_value": dec_value,
+                        "initial_value": dec_value,  # ✅ Pre-populated from notice
                         "placeholder": {
                             "type": "plain_text",
-                            "text": "dd:mm:ss or degrees"
+                            "text": "-25.5678 (degrees)"
                         }
                     },
                     "label": {
                         "type": "plain_text",
-                        "text": "Declination (Dec) *"
+                        "text": "Declination (DEC) *"
                     }
                 },
                 
                 {"type": "divider"},
-                
-                # Observation settings section
-                {
-                    "type": "section",
-                    "text": {
-                        "type": "mrkdwn",
-                        "text": "*Observation Settings*"
-                    }
-                },
                 
                 # Exposure time
                 {
@@ -604,21 +623,15 @@ class SlackToOIntegration:
                     "type": "input",
                     "block_id": "obsmode_block",
                     "element": {
-                        "type": "radio_buttons",
+                        "type": "static_select",
                         "action_id": "obsmode_input",
                         "initial_option": {
                             "text": {"type": "plain_text", "text": "Deep"},
                             "value": "Deep"
                         },
                         "options": [
-                            {
-                                "text": {"type": "plain_text", "text": "Spec"},
-                                "value": "Spec"
-                            },
-                            {
-                                "text": {"type": "plain_text", "text": "Deep"},
-                                "value": "Deep"
-                            }
+                            {"text": {"type": "plain_text", "text": "Deep"}, "value": "Deep"},
+                            {"text": {"type": "plain_text", "text": "Spec"}, "value": "Spec"}
                         ]
                     },
                     "label": {
@@ -627,18 +640,19 @@ class SlackToOIntegration:
                     }
                 },
                 
-                # Filters (for Deep mode)
+                # Filters selection
                 {
                     "type": "input",
                     "block_id": "filters_block",
                     "element": {
-                        "type": "checkboxes",
+                        "type": "multi_static_select",
                         "action_id": "filters_input",
                         "initial_options": [
                             {"text": {"type": "plain_text", "text": "r"}, "value": "r"},
                             {"text": {"type": "plain_text", "text": "i"}, "value": "i"}
                         ],
                         "options": [
+                            {"text": {"type": "plain_text", "text": "u"}, "value": "u"},
                             {"text": {"type": "plain_text", "text": "g"}, "value": "g"},
                             {"text": {"type": "plain_text", "text": "r"}, "value": "r"},
                             {"text": {"type": "plain_text", "text": "i"}, "value": "i"},
@@ -647,20 +661,11 @@ class SlackToOIntegration:
                     },
                     "label": {
                         "type": "plain_text",
-                        "text": "Filters"
+                        "text": "Filters *"
                     }
                 },
                 
                 {"type": "divider"},
-                
-                # Advanced settings section
-                {
-                    "type": "section",
-                    "text": {
-                        "type": "mrkdwn",
-                        "text": "*Advanced Settings*"
-                    }
-                },
                 
                 # Priority
                 {
@@ -674,15 +679,15 @@ class SlackToOIntegration:
                             "value": "High"
                         },
                         "options": [
-                            {"text": {"type": "plain_text", "text": "URGENT"}, "value": "URGENT"},
+                            {"text": {"type": "plain_text", "text": "Low"}, "value": "Low"},
+                            {"text": {"type": "plain_text", "text": "Medium"}, "value": "Medium"},
                             {"text": {"type": "plain_text", "text": "High"}, "value": "High"},
-                            {"text": {"type": "plain_text", "text": "NORMAL"}, "value": "NORMAL"},
-                            {"text": {"type": "plain_text", "text": "Low"}, "value": "Low"}
+                            {"text": {"type": "plain_text", "text": "Urgent"}, "value": "Urgent"}
                         ]
                     },
                     "label": {
                         "type": "plain_text",
-                        "text": "Priority"
+                        "text": "Priority *"
                     }
                 },
                 
@@ -699,12 +704,14 @@ class SlackToOIntegration:
                         },
                         "options": [
                             {"text": {"type": "plain_text", "text": "1"}, "value": "1"},
-                            {"text": {"type": "plain_text", "text": "2"}, "value": "2"}
+                            {"text": {"type": "plain_text", "text": "2"}, "value": "2"},
+                            {"text": {"type": "plain_text", "text": "3"}, "value": "3"},
+                            {"text": {"type": "plain_text", "text": "4"}, "value": "4"}
                         ]
                     },
                     "label": {
                         "type": "plain_text",
-                        "text": "Binning"
+                        "text": "Binning *"
                     }
                 },
                 
@@ -720,17 +727,18 @@ class SlackToOIntegration:
                             "value": "High"
                         },
                         "options": [
-                            {"text": {"type": "plain_text", "text": "High"}, "value": "High"},
-                            {"text": {"type": "plain_text", "text": "Low"}, "value": "Low"}
+                            {"text": {"type": "plain_text", "text": "Low"}, "value": "Low"},
+                            {"text": {"type": "plain_text", "text": "Medium"}, "value": "Medium"},
+                            {"text": {"type": "plain_text", "text": "High"}, "value": "High"}
                         ]
                     },
                     "label": {
                         "type": "plain_text",
-                        "text": "Gain"
+                        "text": "Gain *"
                     }
                 },
                 
-                # Abort setting
+                # Abort current observation
                 {
                     "type": "input",
                     "block_id": "abort_block",
@@ -754,7 +762,7 @@ class SlackToOIntegration:
                 
                 {"type": "divider"},
                 
-                # Comments
+                # Comments - PRE-POPULATED WITH TARGET NAME
                 {
                     "type": "input",
                     "block_id": "comments_block",
@@ -762,7 +770,7 @@ class SlackToOIntegration:
                         "type": "plain_text_input",
                         "action_id": "comments_input",
                         "multiline": True,
-                        "initial_value": f"Submitted via Slack for {target_name}",
+                        "initial_value": f"Submitted via Slack for {target_name}" if target_name else "Submitted via Slack",
                         "placeholder": {
                             "type": "plain_text",
                             "text": "Additional comments or special instructions..."
@@ -783,7 +791,7 @@ class SlackToOIntegration:
                 trigger_id=trigger_id,
                 view=modal_view
             )
-            logger.info(f"ToO modal opened successfully")
+            logger.info(f"ToO modal opened successfully with pre-populated data")
             return True
             
         except SlackApiError as e:
@@ -845,6 +853,78 @@ class SlackToOIntegration:
         except Exception as e:
             logger.error(f"Error extracting form data: {e}")
             return {}
+    
+    def convert_slack_form_to_email_data(self, form_data: Dict[str, Any], 
+                                       user_name: str, user_email: str,
+                                       notice_data: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Convert Slack modal form data to GCNToOEmailer format.
+        
+        Args:
+            form_data: Data extracted from Slack modal submission
+            user_name: Display name of user who submitted form
+            user_email: Email address of user who submitted form
+            notice_data: Original GCN notice data
+            
+        Returns:
+            Dictionary formatted for GCNToOEmailer.send_too_email()
+        """
+        try:
+            # Get current timestamp for submission
+            submission_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S UTC')
+            
+            # Create email data structure expected by GCNToOEmailer
+            email_data = {
+                # User and submission info
+                'requester': user_email,
+                'submitter_name': user_name,
+                'submission_time': submission_time,
+                'submitted_via': 'Slack Bot',
+                
+                # Target information
+                'target': form_data['target'],
+                'ra': form_data['ra'],
+                'dec': form_data['dec'],
+                
+                # Observation parameters
+                'exposure': int(form_data['exposure']) * int(form_data['imageCount']),  # Total exposure
+                'singleExposure': int(form_data['exposure']),  # Single exposure time
+                'imageCount': int(form_data['imageCount']),
+                'obsmode': form_data['obsmode'],
+                'selectedFilters': form_data['selectedFilters'],
+                'priority': form_data['priority'],
+                'binning': form_data['binning'],
+                'gain': form_data['gain'],
+                'abortObservation': form_data['abortObservation'],
+                'comments': form_data['comments'],
+                
+                # Additional fields for tcspy compatibility
+                'selectedTelNumber': 1,  # Default to 1 telescope
+                'radius': '0',  # Default radius
+                'obsStartTime': 'ASAP',  # Immediate start
+                'is_ToO': True,  # Always true for ToO requests
+                
+                # Include original notice info if available
+                'original_facility': notice_data.get('Facility', 'Unknown'),
+                'original_trigger': notice_data.get('Trigger_num', 'Unknown'),
+                'gcn_notice_type': notice_data.get('Notice_type', 'Unknown')
+            }
+            
+            # Add Slack-specific comments
+            base_comments = form_data.get('comments', '')
+            slack_info = f"Submitted via Slack Bot by {user_name} ({user_email}) at {submission_time}"
+            
+            if base_comments:
+                email_data['comments'] = f"{base_comments}\n\n--- Submission Info ---\n{slack_info}"
+            else:
+                email_data['comments'] = slack_info
+                
+            logger.info(f"Converted Slack form data to email format for target: {email_data['target']}")
+            return email_data
+            
+        except Exception as e:
+            logger.error(f"Error converting Slack form data to email format: {e}")
+            return {}
 
 ############################## Initialize Clients ############################
 # Initialize Slack client
@@ -883,7 +963,6 @@ notice_handler = GCNNoticeHandler(
 ############################## Initialize argument parser ############################
 # Add argument parser
 parser = argparse.ArgumentParser(description='GCN Alert Monitor')
-parser.add_argument('--test', action='store_true', help='Run a test with a GCN test message')
 parser.add_argument('--send', action='store_true', help='Actually send test messages to Slack')
 args = parser.parse_args()
 
@@ -2356,9 +2435,7 @@ def _send_too_email_if_criteria_met(notice_data: Dict[str, Any], visibility_info
         logger.debug(f"ToO not sent: {reason}")
         return
         
-    try:
-        from gcn_too_emailer import GCNToOEmailer
-        
+    try:        
         # Initialize emailer
         emailer = GCNToOEmailer(
             email_from=EMAIL_FROM,
@@ -2462,7 +2539,9 @@ def setup_slack_handlers():
 
     @app.view("too_request_modal")
     def handle_too_modal(ack, body, client):
-        """Handle modal submissions"""
+        """
+        Handle modal submissions - Phase 2: Send actual emails
+        """
         ack()
         
         try:
@@ -2481,34 +2560,148 @@ def setup_slack_handlers():
             except (json.JSONDecodeError, KeyError):
                 notice_data = {}
             
-            # Get user display name
+            # Get user information
             user_name = too_integration.get_user_display_name(user_id)
+            user_email = too_integration.get_user_email(user_id)
             
-            # Log the submission (Phase 3 will send actual email)
-            logger.info(f"ToO request submitted by {user_name} ({user_id}): {form_data}")
+            if not user_email:
+                raise ValueError("Could not retrieve user email address")
             
-            # Send confirmation message
-            client.chat_postMessage(
-                channel=SLACK_CHANNEL,
-                text=(
-                    f"✅ *ToO Request Submitted Successfully*\n\n"
-                    f"**Submitted by:** {user_name}\n"
-                    f"**Target:** {form_data['target']}\n"
-                    f"**Priority:** {form_data['priority']}\n"
-                    f"**Total Exposure:** {form_data['totalExposureTime']}s\n\n"
-                    f"Your Target of Opportunity request has been processed and sent to the observation team."
-                )
+            # Convert Slack form data to email format
+            email_data = too_integration.convert_slack_form_to_email_data(
+                form_data, user_name, user_email, notice_data
             )
             
-        except Exception as e:
-            logger.error(f"Error handling modal submission: {e}")
+            if not email_data:
+                raise ValueError("Failed to convert form data to email format")
             
-            # Send error message to user
+            # Initialize GCN ToO Emailer
+            emailer = GCNToOEmailer(
+                email_from=EMAIL_FROM,
+                email_to=["7dt.observation.alert@gmail.com"],  # Use your actual ToO email
+                email_password=EMAIL_PASSWORD,
+                min_altitude=MIN_ALTITUDE,
+                min_moon_sep=MIN_MOON_SEP
+            )
+            
+            # Prepare too_config for the emailer
+            too_config = {
+                'singleExposure': int(form_data['exposure']),
+                'imageCount': int(form_data['imageCount']),
+                'obsmode': form_data['obsmode'],
+                'selectedFilters': form_data['selectedFilters'],
+                'selectedTelNumber': 1,
+                'abortObservation': form_data['abortObservation'],
+                'priority': form_data['priority'],
+                'gain': form_data['gain'],
+                'radius': '0',
+                'binning': form_data['binning'],
+                'additional_comments': f"Submitted via Slack by {user_name}"
+            }
+            
+            # Try to get visibility information for this target
+            visibility_info = None
+            try:
+                # Check if we have visibility info from the original notice processing
+                # This would come from the notice_data if visibility was analyzed
+                if 'visibility_info' in notice_data:
+                    visibility_info = notice_data['visibility_info']
+                    logger.info("Using visibility info from original notice")
+                else:
+                    logger.info("No visibility info available from original notice")
+            except Exception as e:
+                logger.warning(f"Could not retrieve visibility info: {e}")
+            
+            # Send the ToO email
+            logger.info(f"Attempting to send ToO email for {form_data['target']} via {user_name}")
+            
+            email_sent = emailer.send_too_email(
+                notice_data=email_data,  # Use converted email_data as notice_data
+                visibility_info=visibility_info,
+                too_config=too_config
+            )
+            
+            # Handle email sending result
+            if email_sent:
+                # Success - send confirmation message
+                logger.info(f"ToO email sent successfully for {form_data['target']} by {user_name}")
+                
+                success_message = (
+                    f"✅ *ToO Request Sent Successfully*\n\n"
+                    f"**Submitted by:** {user_name}\n"
+                    f"**Target:** {form_data['target']}\n"
+                    f"**Coordinates:** RA {form_data['ra']}, Dec {form_data['dec']}\n"
+                    f"**Priority:** {form_data['priority']}\n"
+                    f"**Total Exposure:** {form_data['totalExposureTime']}s "
+                    f"({form_data['imageCount']} × {form_data['exposure']}s)\n"
+                    f"**Filters:** {', '.join(form_data['selectedFilters'])}\n"
+                    f"**Obsmode:** {form_data['obsmode']}\n\n"
+                    f"📧 *Email sent to observation team*\n"
+                    f"Your Target of Opportunity request has been delivered to the 7DT observation team."
+                )
+                
+                if visibility_info:
+                    status = visibility_info.get('status', 'unknown')
+                    if status == 'observable_now':
+                        success_message += f"\n\n🟢 **Target is currently observable!**"
+                    elif status == 'observable_later':
+                        hours_until = visibility_info.get('hours_until_observable', 'unknown')
+                        success_message += f"\n\n🟠 **Target observable in {hours_until} hours**"
+                    else:
+                        success_message += f"\n\n🔴 **Target visibility: {status}**"
+                
+                client.chat_postMessage(
+                    channel=SLACK_CHANNEL,
+                    text=success_message
+                )
+                
+            else:
+                # Email failed - send error message
+                logger.error(f"ToO email failed to send for {form_data['target']} by {user_name}")
+                
+                error_message = (
+                    f"❌ *ToO Request Failed*\n\n"
+                    f"**Submitted by:** {user_name}\n"
+                    f"**Target:** {form_data['target']}\n"
+                    f"**Error:** Failed to send email to observation team\n\n"
+                    f"Please try again or contact the system administrator.\n"
+                    f"Your request data has been logged for manual processing."
+                )
+                
+                client.chat_postMessage(
+                    channel=SLACK_CHANNEL,
+                    text=error_message
+                )
+                
+                # Also send ephemeral message to user
+                client.chat_postEphemeral(
+                    channel=SLACK_CHANNEL,
+                    user=user_id,
+                    text="❌ Email delivery failed. Please try again or contact the administrator."
+                )
+            
+        except ValueError as e:
+            logger.error(f"Validation error in modal submission: {e}")
+            
+            # Send user-friendly error message
             try:
                 client.chat_postEphemeral(
                     channel=SLACK_CHANNEL,
                     user=user_id,
-                    text="❌ There was an error processing your ToO request. Please try again or contact the administrator."
+                    text=f"❌ Form validation error: {str(e)}. Please check your inputs and try again."
+                )
+            except:
+                pass
+                
+        except Exception as e:
+            logger.error(f"Unexpected error handling modal submission: {e}")
+            
+            # Send generic error message to user
+            try:
+                client.chat_postEphemeral(
+                    channel=SLACK_CHANNEL,
+                    user=user_id,
+                    text="❌ There was an unexpected error processing your ToO request. Please try again or contact the administrator."
                 )
             except:
                 pass
@@ -2853,11 +3046,6 @@ def main():
     except Exception as e:
         logger.error(f"Error connecting to Slack: {e}")
         logger.warning("Continuing without Slack notifications")
-    
-    # Run test if requested
-    if args.test:
-        test_message()
-        sys.exit(0)
     
     consecutive_errors = 0
     max_consecutive_errors = 5
