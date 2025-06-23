@@ -884,27 +884,24 @@ class GCNCircularHandler:
         """
         Safely concatenate two DataFrames, handling empty DataFrames and avoiding FutureWarnings.
         """
-        # If first DataFrame is empty, return the second one
         if df1.empty:
             return df2.copy() if not df2.empty else df2
-        
-        # If second DataFrame is empty, return the first one
+
         if df2.empty:
             return df1.copy()
-        
-        # Both DataFrames have data - ensure column compatibility
+
+        # Add missing columns to each DataFrame and match dtypes
         for col in df1.columns:
             if col not in df2.columns:
-                df2[col] = None
-                
+                df2[col] = pd.Series([pd.NA] * len(df2), dtype=df1[col].dtype)
+
         for col in df2.columns:
             if col not in df1.columns:
-                df1[col] = None
-        
-        # Reorder columns to match
+                df1[col] = pd.Series([pd.NA] * len(df1), dtype=df2[col].dtype)
+
+        # Reorder df2 columns to match df1
         df2 = df2[df1.columns]
-        
-        # Now safe to concatenate
+
         return pd.concat([df1, df2], ignore_index=ignore_index)
     
     def _normalize_facility_name(self, facility: str) -> str:
