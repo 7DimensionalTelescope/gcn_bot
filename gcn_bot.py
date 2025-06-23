@@ -198,6 +198,11 @@ except ImportError as e:
 # Import notice handler
 from gcn_notice_handler import GCNNoticeHandler
 
+# Import ToO integration
+from slack_bolt import App
+from slack_bolt.adapter.socket_mode import SocketModeHandler
+import threading
+
 ############################## Configuration ############################
 # Configuration class
 class Config:
@@ -243,6 +248,8 @@ class Config:
         'gcn.classic.text.SWIFT_XRT_POSITION',
         'gcn.notices.einstein_probe.wxt.alert'
     ]
+    TOO_USER_GROUP = "too-operators"  # Slack user group for authorized users
+    SLACK_APP_TOKEN = "xapp-your-app-token"  # Socket mode app token
     
     def __init__(self):
         """Initialize config and try to load from config.py file."""
@@ -288,6 +295,8 @@ OUTPUT_CSV = config.OUTPUT_CSV
 OUTPUT_ASCII = config.OUTPUT_ASCII
 ASCII_MAX_EVENTS = config.ASCII_MAX_EVENTS
 DISPLAY_TOPICS = config.DISPLAY_TOPICS
+TOO_USER_GROUP = config.TOO_USER_GROUP
+SLACK_APP_TOKEN = config.SLACK_APP_TOKEN
 
 ############################## Global Flags and Variables ############################
 # Global flags and variables
@@ -295,14 +304,568 @@ running = True
 last_heartbeat = datetime.now()
 heartbeat_lock = Lock()
 last_connection_status = True  # True = connected, False = disconnected
+socket_handler = None
 os.environ["NUMEXPR_MAX_THREADS"] = "4"
 reconnect_attempts = 0
 max_reconnect_attempts = 5
 consumer_lock = Lock()  # For thread-safe consumer replacement
 
+############################## Slack ToO Integration ############################
+
+class SlackToOIntegration:
+    """
+    Handles ToO (Target of Opportunity) integration with Slack.
+    
+    This class manages:
+    - User authorization checking
+    - ToO button addition to messages
+    - Modal form creation and handling
+    - Form submission processing
+    """
+    
+    def __init__(self, slack_client: WebClient, user_group: str):
+        """
+        Initialize ToO integration.
+        
+        Args:
+            slack_client: Slack WebClient instance
+            user_group: Name of authorized user group (e.g., 'too-operators')
+        """
+        self.slack_client = slack_client
+        self.user_group = user_group
+        logger.info(f"ToO Integration initialized with user group: {user_group}")
+    
+    def is_user_authorized(self, user_id: str) -> bool:
+        """Check if user is authorized to submit ToO requests."""
+        try:
+            response = self.slack_client.usergroups_list()
+            
+            # Find the ToO user group
+            too_group = None
+            for group in response['usergroups']:
+                if group['handle'] == self.user_group:
+                    too_group = group
+                    break
+            
+            if not too_group:
+                logger.warning(f"ToO user group '{self.user_group}' not found")
+                return False
+            
+            # Get members of the ToO group
+            members_response = self.slack_client.usergroups_users_list(
+                usergroup=too_group['id']
+            )
+            
+            authorized_users = members_response['users']
+            is_authorized = user_id in authorized_users
+            
+            logger.info(f"User {user_id} authorization check: {is_authorized}")
+            return is_authorized
+            
+        except SlackApiError as e:
+            logger.error(f"Error checking user authorization: {e}")
+            return False
+    
+    def get_user_email(self, user_id: str) -> Optional[str]:
+        """Get user's email address from Slack profile."""
+        try:
+            user_info = self.slack_client.users_info(user=user_id)
+            email = user_info['user']['profile'].get('email')
+            
+            if email:
+                logger.info(f"Retrieved email for user {user_id}")
+                return email
+            else:
+                logger.warning(f"No email found for user {user_id}")
+                return None
+                
+        except SlackApiError as e:
+            logger.error(f"Error getting user email: {e}")
+            return None
+    
+    def get_user_display_name(self, user_id: str) -> str:
+        """Get user's display name from Slack profile."""
+        try:
+            user_info = self.slack_client.users_info(user=user_id)
+            display_name = (
+                user_info['user']['profile'].get('display_name') or 
+                user_info['user']['profile'].get('real_name') or 
+                user_info['user']['name']
+            )
+            return display_name
+            
+        except SlackApiError as e:
+            logger.error(f"Error getting user display name: {e}")
+            return "Unknown User"
+    
+    def add_too_button_to_message(self, blocks: List[Dict[str, Any]], notice_data: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """Add ToO request button to existing GRB alert message."""
+        # Create ToO button block
+        too_button_block = {
+            "type": "actions",
+            "elements": [
+                {
+                    "type": "button",
+                    "text": {
+                        "type": "plain_text",
+                        "text": "📧 Submit ToO Request",
+                        "emoji": True
+                    },
+                    "style": "primary",
+                    "action_id": "submit_too_request",
+                    "value": json.dumps({
+                        "target": notice_data.get('Name', ''),
+                        "ra": notice_data.get('RA', ''),
+                        "dec": notice_data.get('DEC', ''),
+                        "facility": notice_data.get('Facility', ''),
+                        "trigger_num": notice_data.get('Trigger_Num', '')
+                    })
+                }
+            ]
+        }
+        
+        # Add divider and button
+        enhanced_blocks = blocks.copy()
+        enhanced_blocks.append({"type": "divider"})
+        enhanced_blocks.append(too_button_block)
+        
+        return enhanced_blocks
+    
+    def create_too_modal(self, trigger_id: str, user_email: str, notice_data: Dict[str, Any]) -> bool:
+        """Create and open ToO request modal form."""
+        # Pre-populate form data from GRB notice
+        target_name = notice_data.get('Name', '')
+        ra_value = str(notice_data.get('RA', ''))
+        dec_value = str(notice_data.get('DEC', ''))
+        
+        # Create modal view
+        modal_view = {
+            "type": "modal",
+            "callback_id": "too_request_modal",
+            "title": {
+                "type": "plain_text",
+                "text": "ToO Request Form"
+            },
+            "submit": {
+                "type": "plain_text",
+                "text": "Submit Request"
+            },
+            "close": {
+                "type": "plain_text",
+                "text": "Cancel"
+            },
+            "blocks": [
+                # Header
+                {
+                    "type": "section",
+                    "text": {
+                        "type": "mrkdwn",
+                        "text": f"*Target of Opportunity Request*\n*Target:* {target_name}"
+                    }
+                },
+                {"type": "divider"},
+                
+                # Requester email
+                {
+                    "type": "input",
+                    "block_id": "requester_block",
+                    "element": {
+                        "type": "plain_text_input",
+                        "action_id": "requester_input",
+                        "initial_value": user_email,
+                        "placeholder": {
+                            "type": "plain_text",
+                            "text": "your.email@example.com"
+                        }
+                    },
+                    "label": {
+                        "type": "plain_text",
+                        "text": "Requester Email *"
+                    }
+                },
+                
+                # Target name
+                {
+                    "type": "input",
+                    "block_id": "target_block",
+                    "element": {
+                        "type": "plain_text_input",
+                        "action_id": "target_input",
+                        "initial_value": target_name,
+                        "placeholder": {
+                            "type": "plain_text",
+                            "text": "GRB240101A"
+                        }
+                    },
+                    "label": {
+                        "type": "plain_text",
+                        "text": "Target Name *"
+                    }
+                },
+                
+                # Coordinates section
+                {
+                    "type": "section",
+                    "text": {
+                        "type": "mrkdwn",
+                        "text": "*Coordinates*"
+                    }
+                },
+                
+                # RA
+                {
+                    "type": "input",
+                    "block_id": "ra_block",
+                    "element": {
+                        "type": "plain_text_input",
+                        "action_id": "ra_input",
+                        "initial_value": ra_value,
+                        "placeholder": {
+                            "type": "plain_text",
+                            "text": "hh:mm:ss or degrees"
+                        }
+                    },
+                    "label": {
+                        "type": "plain_text",
+                        "text": "Right Ascension (RA) *"
+                    }
+                },
+                
+                # Dec
+                {
+                    "type": "input",
+                    "block_id": "dec_block",
+                    "element": {
+                        "type": "plain_text_input",
+                        "action_id": "dec_input",
+                        "initial_value": dec_value,
+                        "placeholder": {
+                            "type": "plain_text",
+                            "text": "dd:mm:ss or degrees"
+                        }
+                    },
+                    "label": {
+                        "type": "plain_text",
+                        "text": "Declination (Dec) *"
+                    }
+                },
+                
+                {"type": "divider"},
+                
+                # Observation settings section
+                {
+                    "type": "section",
+                    "text": {
+                        "type": "mrkdwn",
+                        "text": "*Observation Settings*"
+                    }
+                },
+                
+                # Exposure time
+                {
+                    "type": "input",
+                    "block_id": "exposure_block",
+                    "element": {
+                        "type": "plain_text_input",
+                        "action_id": "exposure_input",
+                        "initial_value": "100",
+                        "placeholder": {
+                            "type": "plain_text",
+                            "text": "100"
+                        }
+                    },
+                    "label": {
+                        "type": "plain_text",
+                        "text": "Single Exposure Time (seconds) *"
+                    }
+                },
+                
+                # Image count
+                {
+                    "type": "input",
+                    "block_id": "count_block",
+                    "element": {
+                        "type": "plain_text_input",
+                        "action_id": "count_input",
+                        "initial_value": "3",
+                        "placeholder": {
+                            "type": "plain_text",
+                            "text": "3"
+                        }
+                    },
+                    "label": {
+                        "type": "plain_text",
+                        "text": "Number of Images *"
+                    }
+                },
+                
+                # Observation mode
+                {
+                    "type": "input",
+                    "block_id": "obsmode_block",
+                    "element": {
+                        "type": "radio_buttons",
+                        "action_id": "obsmode_input",
+                        "initial_option": {
+                            "text": {"type": "plain_text", "text": "Deep"},
+                            "value": "Deep"
+                        },
+                        "options": [
+                            {
+                                "text": {"type": "plain_text", "text": "Spec"},
+                                "value": "Spec"
+                            },
+                            {
+                                "text": {"type": "plain_text", "text": "Deep"},
+                                "value": "Deep"
+                            }
+                        ]
+                    },
+                    "label": {
+                        "type": "plain_text",
+                        "text": "Observation Mode *"
+                    }
+                },
+                
+                # Filters (for Deep mode)
+                {
+                    "type": "input",
+                    "block_id": "filters_block",
+                    "element": {
+                        "type": "checkboxes",
+                        "action_id": "filters_input",
+                        "initial_options": [
+                            {"text": {"type": "plain_text", "text": "r"}, "value": "r"},
+                            {"text": {"type": "plain_text", "text": "i"}, "value": "i"}
+                        ],
+                        "options": [
+                            {"text": {"type": "plain_text", "text": "g"}, "value": "g"},
+                            {"text": {"type": "plain_text", "text": "r"}, "value": "r"},
+                            {"text": {"type": "plain_text", "text": "i"}, "value": "i"},
+                            {"text": {"type": "plain_text", "text": "z"}, "value": "z"}
+                        ]
+                    },
+                    "label": {
+                        "type": "plain_text",
+                        "text": "Filters"
+                    }
+                },
+                
+                {"type": "divider"},
+                
+                # Advanced settings section
+                {
+                    "type": "section",
+                    "text": {
+                        "type": "mrkdwn",
+                        "text": "*Advanced Settings*"
+                    }
+                },
+                
+                # Priority
+                {
+                    "type": "input",
+                    "block_id": "priority_block",
+                    "element": {
+                        "type": "static_select",
+                        "action_id": "priority_input",
+                        "initial_option": {
+                            "text": {"type": "plain_text", "text": "High"},
+                            "value": "High"
+                        },
+                        "options": [
+                            {"text": {"type": "plain_text", "text": "URGENT"}, "value": "URGENT"},
+                            {"text": {"type": "plain_text", "text": "High"}, "value": "High"},
+                            {"text": {"type": "plain_text", "text": "NORMAL"}, "value": "NORMAL"},
+                            {"text": {"type": "plain_text", "text": "Low"}, "value": "Low"}
+                        ]
+                    },
+                    "label": {
+                        "type": "plain_text",
+                        "text": "Priority"
+                    }
+                },
+                
+                # Binning
+                {
+                    "type": "input",
+                    "block_id": "binning_block",
+                    "element": {
+                        "type": "static_select",
+                        "action_id": "binning_input",
+                        "initial_option": {
+                            "text": {"type": "plain_text", "text": "1"},
+                            "value": "1"
+                        },
+                        "options": [
+                            {"text": {"type": "plain_text", "text": "1"}, "value": "1"},
+                            {"text": {"type": "plain_text", "text": "2"}, "value": "2"}
+                        ]
+                    },
+                    "label": {
+                        "type": "plain_text",
+                        "text": "Binning"
+                    }
+                },
+                
+                # Gain
+                {
+                    "type": "input",
+                    "block_id": "gain_block",
+                    "element": {
+                        "type": "static_select",
+                        "action_id": "gain_input",
+                        "initial_option": {
+                            "text": {"type": "plain_text", "text": "High"},
+                            "value": "High"
+                        },
+                        "options": [
+                            {"text": {"type": "plain_text", "text": "High"}, "value": "High"},
+                            {"text": {"type": "plain_text", "text": "Low"}, "value": "Low"}
+                        ]
+                    },
+                    "label": {
+                        "type": "plain_text",
+                        "text": "Gain"
+                    }
+                },
+                
+                # Abort setting
+                {
+                    "type": "input",
+                    "block_id": "abort_block",
+                    "element": {
+                        "type": "radio_buttons",
+                        "action_id": "abort_input",
+                        "initial_option": {
+                            "text": {"type": "plain_text", "text": "Yes"},
+                            "value": "Yes"
+                        },
+                        "options": [
+                            {"text": {"type": "plain_text", "text": "Yes"}, "value": "Yes"},
+                            {"text": {"type": "plain_text", "text": "No"}, "value": "No"}
+                        ]
+                    },
+                    "label": {
+                        "type": "plain_text",
+                        "text": "Abort Current Observation *"
+                    }
+                },
+                
+                {"type": "divider"},
+                
+                # Comments
+                {
+                    "type": "input",
+                    "block_id": "comments_block",
+                    "element": {
+                        "type": "plain_text_input",
+                        "action_id": "comments_input",
+                        "multiline": True,
+                        "initial_value": f"Submitted via Slack for {target_name}",
+                        "placeholder": {
+                            "type": "plain_text",
+                            "text": "Additional comments or special instructions..."
+                        }
+                    },
+                    "label": {
+                        "type": "plain_text",
+                        "text": "Comments"
+                    },
+                    "optional": True
+                }
+            ],
+            "private_metadata": json.dumps(notice_data)
+        }
+        
+        try:
+            response = self.slack_client.views_open(
+                trigger_id=trigger_id,
+                view=modal_view
+            )
+            logger.info(f"ToO modal opened successfully")
+            return True
+            
+        except SlackApiError as e:
+            logger.error(f"Error opening ToO modal: {e}")
+            return False
+    
+    def handle_unauthorized_access(self, channel_id: str, user_id: str, thread_ts: Optional[str] = None) -> bool:
+        """Handle unauthorized user attempting to submit ToO request."""
+        try:
+            error_message = (
+                "❌ *Access Denied*\n\n"
+                f"You must be a member of @{self.user_group} to submit ToO requests.\n"
+                "Please contact the system administrator to request access."
+            )
+            
+            self.slack_client.chat_postEphemeral(
+                channel=channel_id,
+                user=user_id,
+                text=error_message,
+                thread_ts=thread_ts
+            )
+            
+            logger.warning(f"Unauthorized ToO request attempt by user {user_id}")
+            return True
+            
+        except SlackApiError as e:
+            logger.error(f"Error sending unauthorized access message: {e}")
+            return False
+    
+    def extract_form_data(self, form_values: Dict[str, Any]) -> Dict[str, Any]:
+        """Extract and format form data from Slack modal submission."""
+        try:
+            # Extract all form fields
+            form_data = {
+                'requester': form_values['requester_block']['requester_input']['value'],
+                'target': form_values['target_block']['target_input']['value'],
+                'ra': form_values['ra_block']['ra_input']['value'],
+                'dec': form_values['dec_block']['dec_input']['value'],
+                'exposure': form_values['exposure_block']['exposure_input']['value'],
+                'imageCount': form_values['count_block']['count_input']['value'],
+                'obsmode': form_values['obsmode_block']['obsmode_input']['selected_option']['value'],
+                'priority': form_values['priority_block']['priority_input']['selected_option']['value'],
+                'binning': form_values['binning_block']['binning_input']['selected_option']['value'],
+                'gain': form_values['gain_block']['gain_input']['selected_option']['value'],
+                'abortObservation': form_values['abort_block']['abort_input']['selected_option']['value'],
+                'comments': form_values['comments_block']['comments_input']['value']
+            }
+            
+            # Extract filters if selected
+            filters_options = form_values.get('filters_block', {}).get('filters_input', {}).get('selected_options', [])
+            form_data['selectedFilters'] = [opt['value'] for opt in filters_options]
+            
+            # Add computed fields
+            form_data['totalExposureTime'] = int(form_data['exposure']) * int(form_data['imageCount'])
+            form_data['is_ToO'] = form_data['abortObservation'] == 'Yes'
+            
+            return form_data
+            
+        except Exception as e:
+            logger.error(f"Error extracting form data: {e}")
+            return {}
+
 ############################## Initialize Clients ############################
 # Initialize Slack client
 slack_client = WebClient(token=SLACK_TOKEN)
+
+# Initialize Slack Bolt app and ToO integration
+app = None
+too_integration = None
+socket_handler = None
+
+if SLACK_APP_TOKEN:
+    try:
+        app = App(token=SLACK_TOKEN)
+        too_integration = SlackToOIntegration(slack_client, TOO_USER_GROUP)
+        logger.info("Slack Bolt app and ToO integration initialized")
+    except Exception as e:
+        logger.error(f"Failed to initialize Slack Bolt app: {e}")
+        app = None
+        too_integration = None
+else:
+    logger.warning("SLACK_APP_TOKEN not configured - ToO integration disabled")
 
 # Initialize GCN consumer
 consumer = Consumer(
@@ -1843,6 +2406,113 @@ def _send_too_email_if_criteria_met(notice_data: Dict[str, Any], visibility_info
     except Exception as e:
         logger.error(f"Error sending ToO email: {e}")
 
+def setup_slack_handlers():
+    """Setup Slack event handlers for ToO integration"""
+    if not app or not too_integration:
+        return
+    
+    @app.action("submit_too_request")
+    def handle_too_button(ack, body, client):
+        """Handle ToO request button clicks"""
+        ack()
+        
+        try:
+            action = body['actions'][0]
+            user_id = body['user']['id']
+            channel_id = body['channel']['id']
+            trigger_id = body['trigger_id']
+            
+            # Check authorization using the class method
+            if not too_integration.is_user_authorized(user_id):
+                too_integration.handle_unauthorized_access(
+                    channel_id=channel_id,
+                    user_id=user_id,
+                    thread_ts=body.get('message', {}).get('ts')
+                )
+                return
+            
+            # Get user email using the class method
+            user_email = too_integration.get_user_email(user_id)
+            if not user_email:
+                client.chat_postEphemeral(
+                    channel=channel_id,
+                    user=user_id,
+                    text="❌ Could not retrieve your email address. Please ensure it's set in your Slack profile."
+                )
+                return
+            
+            # Parse notice data
+            try:
+                notice_data = json.loads(action['value'])
+            except json.JSONDecodeError:
+                logger.error("Failed to parse notice data from button")
+                notice_data = {}
+            
+            # Open modal using the class method
+            modal_opened = too_integration.create_too_modal(trigger_id, user_email, notice_data)
+            if not modal_opened:
+                client.chat_postEphemeral(
+                    channel=channel_id,
+                    user=user_id,
+                    text="❌ Failed to open ToO request form. Please try again."
+                )
+        
+        except Exception as e:
+            logger.error(f"Error handling button: {e}")
+
+    @app.view("too_request_modal")
+    def handle_too_modal(ack, body, client):
+        """Handle modal submissions"""
+        ack()
+        
+        try:
+            view = body['view']
+            user_id = body['user']['id']
+            
+            # Extract form data using the class method
+            form_data = too_integration.extract_form_data(view['state']['values'])
+            
+            if not form_data:
+                raise ValueError("Failed to extract form data")
+            
+            # Parse original notice data
+            try:
+                notice_data = json.loads(view['private_metadata'])
+            except (json.JSONDecodeError, KeyError):
+                notice_data = {}
+            
+            # Get user display name
+            user_name = too_integration.get_user_display_name(user_id)
+            
+            # Log the submission (Phase 3 will send actual email)
+            logger.info(f"ToO request submitted by {user_name} ({user_id}): {form_data}")
+            
+            # Send confirmation message
+            client.chat_postMessage(
+                channel=SLACK_CHANNEL,
+                text=(
+                    f"✅ *ToO Request Submitted Successfully*\n\n"
+                    f"**Submitted by:** {user_name}\n"
+                    f"**Target:** {form_data['target']}\n"
+                    f"**Priority:** {form_data['priority']}\n"
+                    f"**Total Exposure:** {form_data['totalExposureTime']}s\n\n"
+                    f"Your Target of Opportunity request has been processed and sent to the observation team."
+                )
+            )
+            
+        except Exception as e:
+            logger.error(f"Error handling modal submission: {e}")
+            
+            # Send error message to user
+            try:
+                client.chat_postEphemeral(
+                    channel=SLACK_CHANNEL,
+                    user=user_id,
+                    text="❌ There was an error processing your ToO request. Please try again or contact the administrator."
+                )
+            except:
+                pass
+
 def process_notice_and_send_message(topic, value, slack_client, slack_channel, is_test=False):
     """
     Process a GCN notice and send to Slack with visibility plot.
@@ -2034,7 +2704,18 @@ def process_notice_and_send_message(topic, value, slack_client, slack_channel, i
                 
                 # Combine all blocks
                 message_blocks = slack_message.get('blocks', []) + visibility_blocks
-                
+
+                # Add ToO button if GRB keywords are present
+                grb_keywords = ['GRB', 'Fermi', 'Swift', 'IceCube', 'HAWC', 'AMON']
+                if any(keyword.lower() in topic.lower() for keyword in grb_keywords):
+                    if too_integration:
+                        try:
+                            enhanced_blocks = too_integration.add_too_button_to_message(message_blocks, notice_data)
+                            message_blocks = enhanced_blocks
+                            logger.info(f"Added ToO button to {notice_data.get('Name', 'target')} alert")
+                        except Exception as e:
+                            logger.warning(f"Failed to add ToO button: {e}")
+
                 # Send the main message
                 if not is_test or (is_test and TEST_SEND_TO_SLACK):
                     try:
@@ -2132,8 +2813,8 @@ def process_notice_and_send_message(topic, value, slack_client, slack_channel, i
 
 ############################## Main Loop ##############################
 def main():
-    """Main function with improved error handling and reconnection triggering."""
-    global running, TEST_SEND_TO_SLACK, consumer
+    """Enhanced main function with ToO integration support."""
+    global running, TEST_SEND_TO_SLACK, consumer, socket_handler  # ADD socket_handler to global
     
     # Update TEST_SEND_TO_SLACK based on args
     TEST_SEND_TO_SLACK = args.send
@@ -2142,7 +2823,26 @@ def main():
     monitor_thread = Thread(target=check_connection, daemon=True)
     monitor_thread.start()
     
-    logger.info("Starting GCN Slack Bot... (Press Ctrl+C to stop)")
+    logger.info("Starting Enhanced GCN Slack Bot with ToO Integration... (Press Ctrl+C to stop)")
+    
+    # Setup Slack handlers for ToO integration
+    setup_slack_handlers()
+    
+    # Start Socket Mode handler for interactive features
+    if app and SLACK_APP_TOKEN:
+        try:
+            socket_handler = SocketModeHandler(app, SLACK_APP_TOKEN)
+            socket_thread = threading.Thread(
+                target=socket_handler.start,
+                daemon=True,
+                name="SlackSocketMode"
+            )
+            socket_thread.start()
+            logger.info("Socket Mode handler started for ToO interactive features")
+        except Exception as e:
+            logger.error(f"Failed to start Socket Mode: {e}")
+    else:
+        logger.warning("Socket Mode not available - ToO buttons will not be interactive")
     
     # Try to authenticate with Slack
     try:
@@ -2281,8 +2981,16 @@ def main():
     except Exception as e:
         logger.error(f"Critical error in main process: {e}", exc_info=True)
     finally:
-        logger.info("Shutting down...")
+        logger.info("Shutting down Enhanced GCN Alert Monitor...")
         running = False
+        
+        # Close Socket Mode handler
+        if socket_handler:
+            try:
+                socket_handler.close()
+                logger.info("Socket Mode handler closed")
+            except Exception as e:
+                logger.warning(f"Error closing Socket Mode handler: {e}")
         
         # Close consumer safely
         with consumer_lock:

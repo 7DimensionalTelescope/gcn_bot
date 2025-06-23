@@ -70,3 +70,7 @@ DISPLAY_TOPICS = [
     # JSON format topics
     'gcn.notices.einstein_probe.wxt.alert'         # Einstein Probe WXT alerts                          | 2 alerts per week      | ~1 min
 ]
+
+# Slack ToO
+TOO_USER_GROUP = "too-operators"  # Slack user group for authorized users
+SLACK_APP_TOKEN = "xapp-your-app-token"  # Socket mode app token
