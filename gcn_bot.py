@@ -626,8 +626,8 @@ class SlackToOIntegration:
                         "type": "static_select",
                         "action_id": "obsmode_input",
                         "initial_option": {
-                            "text": {"type": "plain_text", "text": "Deep"},
-                            "value": "Deep"
+                            "text": {"type": "plain_text", "text": "Spec"},
+                            "value": "Spec"
                         },
                         "options": [
                             {"text": {"type": "plain_text", "text": "Deep"}, "value": "Deep"},
@@ -648,6 +648,7 @@ class SlackToOIntegration:
                         "type": "multi_static_select",
                         "action_id": "filters_input",
                         "initial_options": [
+                            {"text": {"type": "plain_text", "text": "g"}, "value": "g"},    
                             {"text": {"type": "plain_text", "text": "r"}, "value": "r"},
                             {"text": {"type": "plain_text", "text": "i"}, "value": "i"}
                         ],
@@ -746,8 +747,8 @@ class SlackToOIntegration:
                         "type": "radio_buttons",
                         "action_id": "abort_input",
                         "initial_option": {
-                            "text": {"type": "plain_text", "text": "Yes"},
-                            "value": "Yes"
+                            "text": {"type": "plain_text", "text": "No"},
+                            "value": "No"
                         },
                         "options": [
                             {"text": {"type": "plain_text", "text": "Yes"}, "value": "Yes"},
