@@ -50,6 +50,7 @@ logger = logging.getLogger(__name__)
 class GCNCircularHandler:
     def __init__(self, output_csv: str = 'gcn_circulars.csv', 
                  output_ascii: str = 'grb_targets.ascii',
+                 ascii_max_events: int = 10,
                  client_id: str = '',
                  client_secret: str = '') -> None:
         """
@@ -58,11 +59,13 @@ class GCNCircularHandler:
         Args:
             output_csv (str): Path to the CSV database file
             output_ascii (str): Path to the ASCII database file
+            ascii_max_events (int, optional): Maximum number of events to keep in the ASCII file
             client_id (str, optional): Kafka client ID for monitoring circulars
             client_secret (str, optional): Kafka client secret for monitoring circulars
         """
         self.output_csv = output_csv
         self.output_ascii = output_ascii
+        self.ascii_max_events = ascii_max_events
         self.file_lock = threading.Lock()
         self.consumer = None  # Initialize consumer as None
         
@@ -1077,8 +1080,18 @@ class GCNCircularHandler:
 
     def _save_ascii_with_backup(self, df: pd.DataFrame, filepath: str) -> None:
         """
-        Save ASCII file with backup and validation. Drop-in replacement for df.to_csv().
+        Save ASCII file with backup and validation. Applies max events limit.
         """
+        # ADDED: Apply max events limit before saving (from config)
+        if len(df) > self.ascii_max_events:
+            # Sort by Last_Update or Notice_date (newest first) and keep only max_events
+            date_col = 'Last_Update' if 'Last_Update' in df.columns else 'Notice_date'
+            if date_col in df.columns:
+                df['sort_key'] = df[date_col].str.strip('"')
+                df = df.sort_values('sort_key', ascending=False).head(self.ascii_max_events)
+                df = df.drop('sort_key', axis=1)
+                logger.info(f"Applied ASCII limit from config: kept {self.ascii_max_events} most recent events")
+        
         # Create backup with automatic cleanup (keep only 5 most recent)
         backup_path = self._create_backup_with_limit(filepath, max_backups=5)
         logger.info(f"Created backup: {backup_path}")
@@ -1102,7 +1115,7 @@ class GCNCircularHandler:
                     
                     f.write(" ".join(row_values) + "\n")
             
-            logger.info(f"ASCII file saved with {len(df)} entries")
+            logger.info(f"ASCII file saved with {len(df)} entries (max: {self.ascii_max_events})")
             
         except Exception as e:
             logger.error(f"Error saving ASCII file: {e}", exc_info=True)
@@ -1672,11 +1685,12 @@ def main():
     
     # Try to import configuration, default to empty values if not available
     try:
-        from config import OUTPUT_CIRCULAR_CSV, OUTPUT_ASCII, GCN_ID, GCN_SECRET
+        from config import OUTPUT_CIRCULAR_CSV, OUTPUT_ASCII, ASCII_MAX_EVENTS, GCN_ID, GCN_SECRET
     except ImportError:
         logger.warning("Config file not found, using default values")
         OUTPUT_CIRCULAR_CSV = 'gcn_circulars.csv'
         OUTPUT_ASCII = 'grb_targets.ascii'
+        ASCII_MAX_EVENTS = 10
         GCN_ID = ''
         GCN_SECRET = ''
     
@@ -1684,6 +1698,7 @@ def main():
     handler = GCNCircularHandler(
         output_csv=OUTPUT_CIRCULAR_CSV,
         output_ascii=OUTPUT_ASCII,
+        ascii_max_events=ASCII_MAX_EVENTS,
         client_id=GCN_ID,
         client_secret=GCN_SECRET
     )

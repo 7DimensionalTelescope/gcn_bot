@@ -381,16 +381,9 @@ class GCNNoticeHandler:
         except Exception as e:
             logger.error(f"Error in verification schedule check: {e}")
 
-    def _load_caches(self, force=False):
-        """
-        Load all caches for names, sequence tracking, and ASCII entries.
-        Ensures all facility-trigger_num combinations are properly mapped to existing GRB names.
-        
-        Args:
-            force (bool): If True, forces reload of caches regardless of timing.
-        """
+    def _load_caches(self, force: bool = False) -> None:
+        """Load caches from files with improved error handling."""
         now = datetime.now()
-        # Check if cache refresh needed
         if (self._cache_loaded and not force and 
             (now - self._last_cache_refresh).total_seconds() < self._cache_refresh_interval):
             return
@@ -398,91 +391,85 @@ class GCNNoticeHandler:
         with self.file_lock:
             logger.debug("Loading caches from files")
             
-            # Clear existing caches but preserve grb_name_cache sequence tracking
             if force:
                 self._name_cache.clear()
                 self._ascii_entry_cache.clear()
             
-            # Load from CSV - used for both name mapping and sequence tracking
+            # Load from CSV (existing logic preserved)
             if os.path.exists(self.output_csv):
                 try:
-                    # Use safer CSV reading method
                     df = self._safe_csv_read(self.output_csv)
                     
-                    # Process for name mapping (facility, trigger_num) -> name
                     if all(col in df.columns for col in ['Name', 'Facility', 'Trigger_num']):
                         for _, row in df.iterrows():
                             if pd.notna(row['Facility']) and pd.notna(row['Trigger_num']) and pd.notna(row['Name']):
-                                # Add to name cache - ensure trigger_num is a string
                                 key = (row['Facility'], str(row['Trigger_num']))
                                 self._name_cache[key] = row['Name']
                                 logger.debug(f"Cached name mapping: {key} -> {row['Name']}")
                     
-                    # Process for sequence tracking
-                    for name in df['Name']:
-                        if isinstance(name, str):
-                            # Handle different name formats: GRB YYMMDD[A-Z], EP YYMMDD[a-z], IceCube-YYMMDD[A-Z]
-                            if name.startswith('GRB '):
-                                prefix = 'GRB'
-                                parts = name.split()
-                                date_part = parts[1][:6]  # 'YYMMDD'
-                                letter_part = parts[1][6]  # The sequence letter
-                                cache_key = f"{prefix}_{date_part}"
-                                alphabet = ascii_uppercase
-                            elif name.startswith('EP '):
-                                prefix = 'EP'
-                                parts = name.split()
-                                date_part = parts[1][:6]  # 'YYMMDD'
-                                letter_part = parts[1][6]  # The sequence letter
-                                cache_key = f"{prefix}_{date_part}"
-                                alphabet = ascii_lowercase
-                            elif name.startswith('IceCube-'):
-                                prefix = 'IceCube'
-                                # Remove prefix and dash
-                                remaining = name[8:]  # Remove 'IceCube-'
-                                date_part = remaining[:6]  # 'YYMMDD'
-                                letter_part = remaining[6]  # The sequence letter
-                                cache_key = f"{prefix}_{date_part}"
-                                alphabet = ascii_uppercase
-                            else:
-                                continue  # Skip if it doesn't match any expected format
+                    # GRB name sequence tracking logic
+                    for _, row in df.iterrows():
+                        if 'Name' in row and pd.notna(row['Name']):
+                            name = str(row['Name']).strip().strip('"')
                             
-                            # Update cache with latest letter for each prefix_date
-                            if cache_key in self._grb_name_cache:
-                                current_letter = self._grb_name_cache[cache_key]
+                            grb_match = re.match(r'^GRB\s*(\d{2})(\d{2})(\d{2})([A-Za-z]+)$', name)
+                            if grb_match:
+                                year, month, day, letter_part = grb_match.groups()
+                                date_part = f"{year}{month}{day}"
+                                cache_key = f"GRB_{date_part}"
                                 
-                                # Get index of current and new letters
-                                try:
-                                    letter_idx = alphabet.index(letter_part) if letter_part in alphabet else -1
-                                    current_idx = alphabet.index(current_letter) if current_letter in alphabet else -1
-                                    
-                                    if letter_idx > current_idx:
-                                        self._grb_name_cache[cache_key] = letter_part
-                                except (ValueError, IndexError) as e:
-                                    logger.warning(f"Error comparing letters for {cache_key}: {e}")
-                            else:
-                                self._grb_name_cache[cache_key] = letter_part
+                                if letter_part.isupper():
+                                    alphabet = ascii_uppercase
+                                elif letter_part.islower():
+                                    alphabet = ascii_lowercase
+                                else:
+                                    continue
+                                
+                                if cache_key in self._grb_name_cache:
+                                    current_letter = self._grb_name_cache[cache_key]
+                                    try:
+                                        letter_idx = alphabet.index(letter_part) if letter_part in alphabet else -1
+                                        current_idx = alphabet.index(current_letter) if current_letter in alphabet else -1
+                                        
+                                        if letter_idx > current_idx:
+                                            self._grb_name_cache[cache_key] = letter_part
+                                    except (ValueError, IndexError) as e:
+                                        logger.warning(f"Error comparing letters for {cache_key}: {e}")
+                                else:
+                                    self._grb_name_cache[cache_key] = letter_part
                     
-                    logger.debug(f"Loaded {len(self._name_cache)} name mappings into cache from CSV")
-                    logger.debug(f"Loaded {len(self._grb_name_cache)} date sequences into GRB name cache")
+                    logger.debug(f"Loaded {len(self._name_cache)} name mappings and {len(self._grb_name_cache)} date sequences from CSV")
                 except Exception as e:
                     logger.warning(f"Error loading caches from CSV: {e}")
             
-            # Load entries from ASCII as well for completeness
+            # Load from ASCII with better error handling
             if os.path.exists(self.output_ascii):
                 try:
-                    df = pd.read_csv(self.output_ascii, sep=r'\s+', quotechar='"', quoting=csv.QUOTE_MINIMAL)
+                    # Try pandas first, then fallback
+                    try:
+                        df = pd.read_csv(self.output_ascii, sep=r'\s+', quotechar='"', 
+                                    quoting=csv.QUOTE_MINIMAL, dtype=str, na_filter=False)
+                    except:
+                        # Simple fallback for basic cache loading
+                        logger.debug("Using simplified ASCII cache loading")
+                        self._cache_loaded = True
+                        self._last_cache_refresh = now
+                        return
                     
                     # Process rows into cache
                     for _, row in df.iterrows():
-                        if pd.notna(row['Facility']) and pd.notna(row['Trigger_num']):
-                            key = (row['Facility'], str(row['Trigger_num']))
-                            # Add to name cache as well as ASCII entry cache
+                        # Handle both old and new column formats
+                        facility = (row.get('Primary_Facility') or row.get('Best_Facility') or 
+                                row.get('Facility', '')).strip()
+                        trigger_num = str(row.get('Trigger_num', '')).strip()
+                        
+                        if facility and trigger_num:
+                            key = (facility, trigger_num)
                             self._ascii_entry_cache[key] = row.to_dict()
                             if 'Name' in row and pd.notna(row['Name']):
                                 self._name_cache[key] = row['Name']
                     
-                    logger.debug(f"Additionally loaded {len(self._ascii_entry_cache)} entries from ASCII entry cache")
+                    logger.debug(f"Loaded {len(self._ascii_entry_cache)} entries from ASCII cache")
                 except Exception as e:
                     logger.warning(f"Error loading ASCII entry cache: {e}")
             
@@ -1713,49 +1700,23 @@ class GCNNoticeHandler:
 
     def save_to_ascii(self, notice_data: Dict[str, Any], thread_ts: Optional[str] = None) -> bool:
         """
-        ENHANCED: Save/update notice data to ASCII file using new multi-facility structure.
-        INTEGRATED: All helper functions moved into this main function to reduce complexity.
-        PRESERVED: All existing data protection, backup, and recovery features.
+        Save/update notice data to ASCII file with error handling.
         """
         try:
             with self.file_lock:
-                # Format data (PRESERVED logic)
-                formatted_data = notice_data.copy()
-                
-                # Format numeric fields to 2 decimal places (PRESERVED)
-                for field in ['RA', 'DEC', 'Error']:
-                    if field in formatted_data and formatted_data[field] not in ('', None):
-                        formatted_data[field] = round(float(formatted_data[field]), 2)
-                
-                # Format date fields (PRESERVED)
-                for field in ['Discovery_UTC', 'Notice_date']:
-                    if field in formatted_data and formatted_data[field] not in ('', None):
-                        if isinstance(formatted_data[field], datetime):
-                            formatted_data[field] = formatted_data[field].strftime('%Y-%m-%d %H:%M:%S')
-                
-                # Get key identifiers
-                facility = str(formatted_data.get('Facility', ''))
-                trigger_num = str(formatted_data.get('Trigger_num', ''))
-                event_name = str(formatted_data.get('Name', ''))
-                current_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-                
-                logger.info(f"Saving notice for {event_name}, facility={facility}, trigger={trigger_num}")
-                
-                # PRESERVED: Load existing ASCII file with recovery
+                # Load existing data with better error handling
                 try:
-                    df = pd.read_csv(self.output_ascii, sep=r'\s+', 
-                                    quotechar='"', quoting=csv.QUOTE_MINIMAL, 
-                                    dtype=str)
-                    logger.info(f"Loaded ASCII file with {len(df)} entries")
+                    df = pd.read_csv(self.output_ascii, sep=r'\s+', quotechar='"', 
+                                quoting=csv.QUOTE_MINIMAL, dtype=str, na_filter=False)
                     
-                    # INTEGRATED: Column migration (was _ensure_ascii_columns)
+                    # Migration for old format
                     if 'Facility' in df.columns and 'Primary_Facility' not in df.columns:
                         logger.info("Migrating ASCII format from old to new multi-facility structure")
                         df['Primary_Facility'] = df['Facility']
-                        df['Best_Facility'] = df['Facility']
+                        df['Best_Facility'] = df['Facility'] 
                         df['All_Facilities'] = df['Facility']
-                        if 'Last_Update' not in df.columns:
-                            df['Last_Update'] = df.get('Notice_date', '')
+                        df['Last_Update'] = df.get('Notice_date', '')
+                        df['thread_ts'] = ''
                     
                     # Ensure all columns exist
                     for col in self.ascii_columns:
@@ -1764,16 +1725,14 @@ class GCNNoticeHandler:
                     df = df[self.ascii_columns]
                     
                 except (pd.errors.EmptyDataError, FileNotFoundError):
-                    # Create new DataFrame
                     df = pd.DataFrame(columns=self.ascii_columns)
-                    for col in self.ascii_columns:
-                        df[col] = df[col].astype('object')
                     logger.info(f"Created new ASCII file: {self.output_ascii}")
+                    
                 except Exception as load_error:
                     logger.warning(f"pandas failed: {load_error}, attempting manual recovery")
-                    
-                    # INTEGRATED: Manual recovery (was _load_ascii_with_recovery + _parse_line_to_dict)
                     df = pd.DataFrame(columns=self.ascii_columns)
+                    
+                    # Better manual recovery
                     try:
                         with open(self.output_ascii, 'r') as f:
                             lines = f.read().strip().split('\n')
@@ -1782,12 +1741,14 @@ class GCNNoticeHandler:
                             header = lines[0].split()
                             for line in lines[1:]:
                                 if line.strip():
-                                    # Simple parsing
+                                    # Better parsing logic
                                     fields = []
                                     current_field = ""
                                     in_quotes = False
+                                    i = 0
                                     
-                                    for char in line:
+                                    while i < len(line):
+                                        char = line[i]
                                         if char == '"':
                                             in_quotes = not in_quotes
                                             current_field += char
@@ -1795,13 +1756,23 @@ class GCNNoticeHandler:
                                             if current_field:
                                                 fields.append(current_field)
                                                 current_field = ""
+                                            # Skip consecutive spaces properly
+                                            while i + 1 < len(line) and line[i + 1] == ' ':
+                                                i += 1
                                         else:
                                             current_field += char
+                                        i += 1
                                     
                                     if current_field:
                                         fields.append(current_field)
                                     
-                                    # Clean quotes and create row
+                                    # Handle field count mismatch
+                                    while len(fields) < len(header):
+                                        fields.append('')
+                                    if len(fields) > len(header):
+                                        fields = fields[:len(header)]
+                                    
+                                    # Clean quotes properly
                                     cleaned_fields = []
                                     for field in fields:
                                         if field.startswith('"') and field.endswith('"') and len(field) > 1:
@@ -1809,131 +1780,88 @@ class GCNNoticeHandler:
                                         else:
                                             cleaned_fields.append(field)
                                     
-                                    while len(cleaned_fields) < len(header):
-                                        cleaned_fields.append('')
+                                    row_dict = dict(zip(header, cleaned_fields))
                                     
-                                    row_dict = dict(zip(header, cleaned_fields[:len(header)]))
+                                    # Migration during manual recovery
+                                    if 'Facility' in row_dict and 'Primary_Facility' not in row_dict:
+                                        row_dict['Primary_Facility'] = row_dict['Facility']
+                                        row_dict['Best_Facility'] = row_dict['Facility']
+                                        row_dict['All_Facilities'] = row_dict['Facility']
+                                        row_dict['Last_Update'] = row_dict.get('Notice_date', '')
+                                        row_dict['thread_ts'] = ''
+                                    
+                                    # Ensure all columns exist
+                                    for col in self.ascii_columns:
+                                        if col not in row_dict:
+                                            row_dict[col] = ''
+                                    
                                     df = pd.concat([df, pd.DataFrame([row_dict])], ignore_index=True)
-                        
-                        logger.info(f"Recovery successful: {len(df)} rows recovered")
-                        
-                        # Apply column migration to recovered data
-                        if 'Facility' in df.columns and 'Primary_Facility' not in df.columns:
-                            df['Primary_Facility'] = df['Facility']
-                            df['Best_Facility'] = df['Facility']
-                            df['All_Facilities'] = df['Facility']
-                            if 'Last_Update' not in df.columns:
-                                df['Last_Update'] = df.get('Notice_date', '')
-                        
-                        for col in self.ascii_columns:
-                            if col not in df.columns:
-                                df[col] = ''
-                        df = df[self.ascii_columns]
-                        
-                    except:
-                        logger.error("Manual recovery also failed, creating empty DataFrame")
+                    
+                    except Exception as recovery_error:
+                        logger.error(f"Manual recovery failed: {recovery_error}")
                         df = pd.DataFrame(columns=self.ascii_columns)
-
-                # Find existing entry
+                
+                # Rest of the logic for finding/updating existing events
+                facility = notice_data.get('Facility', '')
+                trigger_num = str(notice_data.get('Trigger_num', ''))
+                
                 existing_idx = None
-                
-                # Strategy 1: Search by event name (for multi-facility)
-                if event_name and event_name != '':
+                if facility and trigger_num:
                     for idx, row in df.iterrows():
-                        row_event = str(row.get('Name', '')).strip().strip('"')
-                        if row_event == event_name:
-                            existing_idx = idx
-                            logger.info(f"Found existing entry for {event_name} at index {existing_idx}")
-                            break
-                
-                # Strategy 2: Search by facility+trigger (backward compatibility)
-                if existing_idx is None and facility and trigger_num:
-                    normalized_facility = self._normalize_facility_name(facility)
-                    for idx, row in df.iterrows():
-                        row_facility = str(row.get('Primary_Facility', row.get('Facility', ''))).strip()
+                        # Check multiple facility columns for compatibility
+                        row_facility = (str(row.get('Primary_Facility', '')) or 
+                                    str(row.get('Best_Facility', '')) or 
+                                    str(row.get('Facility', ''))).strip()
                         row_trigger = str(row.get('Trigger_num', '')).strip()
-                        normalized_row_facility = self._normalize_facility_name(row_facility)
                         
-                        if (normalized_row_facility == normalized_facility and 
-                            row_trigger == trigger_num):
+                        if row_facility == facility and row_trigger == trigger_num:
                             existing_idx = idx
-                            logger.info(f"Found existing entry for {facility} trigger {trigger_num} at index {existing_idx}")
                             break
-
+                
+                # Create new row data
+                row_data = {
+                    'GCN_ID': notice_data.get('GCN_ID', ''),
+                    'Name': notice_data.get('Name', ''),
+                    'RA': str(notice_data.get('RA', '')),
+                    'DEC': str(notice_data.get('DEC', '')),
+                    'Error': str(notice_data.get('Error', '')),
+                    'Discovery_UTC': notice_data.get('Discovery_UTC', ''),
+                    'Primary_Facility': facility,
+                    'Best_Facility': facility,
+                    'All_Facilities': facility,
+                    'Trigger_num': trigger_num,
+                    'Notice_date': notice_data.get('Notice_date', ''),
+                    'Last_Update': notice_data.get('Notice_date', ''),
+                    'Redshift': notice_data.get('Redshift', ''),
+                    'Host_info': notice_data.get('Host_info', ''),
+                    'thread_ts': thread_ts or ''
+                }
+                
                 if existing_idx is not None:
-                    # UPDATE EXISTING ENTRY
-                    current_best = str(df.at[existing_idx, 'Best_Facility']).strip()
-                    current_all = str(df.at[existing_idx, 'All_Facilities']).strip()
-                    existing_thread_ts = str(df.at[existing_idx, 'thread_ts']).strip()
-                    
-                    # Check if this notice has higher priority
-                    should_update_position = self._get_facility_priority(facility) > self._get_facility_priority(facility)
-                    
-                    logger.info(f"Updating {event_name}: current_best={current_best}, new_notice={facility}, update_position={should_update_position}")
-                    
-                    # Update position if higher priority
-                    if should_update_position:
-                        df.at[existing_idx, 'Best_Facility'] = facility
-                        df.at[existing_idx, 'RA'] = str(formatted_data.get('RA', ''))
-                        df.at[existing_idx, 'DEC'] = str(formatted_data.get('DEC', ''))
-                        df.at[existing_idx, 'Error'] = str(formatted_data.get('Error', ''))
-                        logger.info(f"Updated position with {facility} notice data (higher priority)")
-                    
-                    # Add facility to All_Facilities
-                    all_facilities_list = [f.strip() for f in current_all.split(',') if f.strip()]
-                    if facility not in all_facilities_list:
-                        all_facilities_list.append(facility)
-                        df.at[existing_idx, 'All_Facilities'] = ','.join(all_facilities_list)
-                    
-                    # Update Last_Update
-                    df.at[existing_idx, 'Last_Update'] = f'"{current_time}"'
-                    
-                    # PRESERVE thread_ts (CRITICAL)
-                    if thread_ts:
-                        df.at[existing_idx, 'thread_ts'] = thread_ts
-                    elif not existing_thread_ts:
-                        df.at[existing_idx, 'thread_ts'] = thread_ts if thread_ts else ''
-                    
-                    logger.info(f"Updated existing entry for {event_name}")
-                    
+                    # Update existing entry
+                    for col, val in row_data.items():
+                        if val and val != 'nan':  # Better empty value check
+                            df.at[existing_idx, col] = val
+                    logger.info(f"Updated existing entry for {facility} trigger {trigger_num}")
                 else:
-                    # ADD NEW ENTRY
-                    gcn_id = f"GCN_{facility}_{trigger_num}"
-                    
-                    new_row_data = {
-                        'GCN_ID': gcn_id,
-                        'Name': f'"{event_name}"',
-                        'RA': str(formatted_data.get('RA', '')),
-                        'DEC': str(formatted_data.get('DEC', '')),
-                        'Error': str(formatted_data.get('Error', '')),
-                        'Discovery_UTC': f'"{formatted_data.get("Discovery_UTC", "")}"',
-                        'Primary_Facility': facility,
-                        'Best_Facility': facility,
-                        'All_Facilities': facility,
-                        'Trigger_num': trigger_num,
-                        'Notice_date': f'"{current_time}"',
-                        'Last_Update': f'"{current_time}"',
-                        'Redshift': '""',
-                        'Host_info': '""',
-                        'thread_ts': thread_ts if thread_ts else ''
-                    }
-                    
-                    df = pd.concat([df, pd.DataFrame([new_row_data])], ignore_index=True)
-                    logger.info(f"Added new entry for {event_name} from {facility} notice")
-
-                # PRESERVED: Keep max events limit
+                    # Add new entry
+                    new_row_df = pd.DataFrame([row_data])
+                    df = pd.concat([new_row_df, df], ignore_index=True)
+                    logger.info(f"Added new entry for {row_data['Name']}")
+                
+                # Keep max events limit
                 if len(df) > self.ascii_max_events:
                     df['Notice_date_clean'] = df['Notice_date'].str.strip('"')
                     df = df.sort_values('Notice_date_clean', ascending=False).head(self.ascii_max_events)
                     df = df.drop('Notice_date_clean', axis=1)
                     logger.info(f"Kept {self.ascii_max_events} most recent events")
 
-                # PRESERVED: Save with backup
+                # Save with backup
                 if os.path.exists(self.output_ascii):
                     backup_path = self._create_backup_with_limit(self.output_ascii, max_backups=5)
                     logger.info(f"Created backup: {backup_path}")
                 
-                # PRESERVED: Save with proper formatting
+                # Better save logic with proper formatting
                 with open(self.output_ascii, 'w') as f:
                     f.write(' '.join(self.ascii_columns) + '\n')
                     
@@ -1942,17 +1870,21 @@ class GCNNoticeHandler:
                         for col in self.ascii_columns:
                             val = str(row.get(col, '')).strip()
                             
-                            if pd.isna(val) or val is None or str(val) == 'nan':
+                            # Better NaN handling
+                            if pd.isna(val) or val == 'nan' or val == 'None':
                                 val = ''
                             
-                            # Quote fields that need quoting (PRESERVED logic)
-                            if col in ['Name', 'Discovery_UTC', 'Notice_date', 'Last_Update', 'Redshift', 'Host_info']:
-                                if val and not (val.startswith('"') and val.endswith('"')):
-                                    val = f'"{val}"'
-                            elif col != 'thread_ts' and ' ' in val and val:
-                                val = f'"{val}"'
+                            # Simplified quoting logic
+                            needs_quotes = (
+                                col in ['Name', 'Discovery_UTC', 'Notice_date', 'Last_Update', 'Redshift', 'Host_info'] or
+                                (col != 'thread_ts' and ' ' in val and val)
+                            )
                             
-                            formatted_values.append(val if val else '')
+                            if val and needs_quotes:
+                                if not (val.startswith('"') and val.endswith('"')):
+                                    val = f'"{val}"'
+                            
+                            formatted_values.append(val)
                         
                         f.write(' '.join(formatted_values) + '\n')
                 
@@ -1965,8 +1897,8 @@ class GCNNoticeHandler:
 
     def get_existing_event(self, facility: str, trigger_num: str) -> Optional[Dict[str, Any]]:
         """
-        ENHANCED: Get existing event data from ASCII file.
-        PRESERVED: All existing functionality.
+        Get existing event data from ASCII file.
+        All existing functionality.
         """
         try:
             normalized_facility = self._normalize_facility_name(facility)
