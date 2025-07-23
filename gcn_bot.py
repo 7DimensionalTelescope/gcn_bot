@@ -2700,6 +2700,84 @@ def setup_slack_handlers():
             except Exception as slack_error:
                 logger.error(f"Failed to send error message to Slack: {slack_error}")
 
+    @app.action("submit_too_request")
+    def handle_submit_too_request(ack, body, client, logger):
+        """
+        Handle ToO request button clicks - opens the ToO request modal.
+        
+        This function is triggered when someone clicks the "Submit ToO Request" button
+        on a GRB alert message. It validates user authorization and opens the ToO form modal.
+        """
+        # Acknowledge the button click immediately (must be within 3 seconds)
+        ack()
+        
+        try:
+            user_id = body['user']['id']
+            trigger_id = body['trigger_id']
+            
+            # Log the button click
+            logger.info(f"ToO request button clicked by user {user_id}")
+            
+            # Check if user is authorized to submit ToO requests
+            if not too_integration.is_user_authorized(user_id):
+                channel_id = body['channel']['id']
+                thread_ts = body.get('message', {}).get('ts')
+                too_integration.handle_unauthorized_access(channel_id, user_id, thread_ts)
+                logger.warning(f"Unauthorized ToO request attempt by user {user_id}")
+                return
+            
+            # Get user email
+            user_email = too_integration.get_user_email(user_id)
+            if not user_email:
+                # Send ephemeral error message
+                client.chat_postEphemeral(
+                    channel=body['channel']['id'],
+                    user=user_id,
+                    text="❌ *Error: Could not retrieve your email address*\n\nPlease ensure your Slack profile has an email address configured.",
+                    thread_ts=body.get('message', {}).get('ts')
+                )
+                logger.error(f"Could not retrieve email for authorized user {user_id}")
+                return
+            
+            # Parse notice data from button value
+            notice_data = {}
+            try:
+                action_value = body['actions'][0].get('value', '{}')
+                notice_data = json.loads(action_value)
+                logger.debug(f"Parsed notice data from button: {notice_data}")
+            except (json.JSONDecodeError, KeyError, IndexError) as e:
+                logger.warning(f"Could not parse notice data from button value: {e}")
+                # Continue with empty notice_data - modal will still work
+            
+            # Create and open the ToO request modal
+            modal_opened = too_integration.create_too_modal(trigger_id, user_email, notice_data)
+            
+            if modal_opened:
+                logger.info(f"ToO modal opened successfully for user {user_id}")
+            else:
+                # Send ephemeral error message
+                client.chat_postEphemeral(
+                    channel=body['channel']['id'],
+                    user=user_id,
+                    text="❌ *Error: Could not open ToO request form*\n\nPlease try again or contact the system administrator.",
+                    thread_ts=body.get('message', {}).get('ts')
+                )
+                logger.error(f"Failed to open ToO modal for user {user_id}")
+                
+        except Exception as e:
+            logger.error(f"Error handling ToO request button click: {e}")
+            
+            # Send ephemeral error message to user
+            try:
+                client.chat_postEphemeral(
+                    channel=body['channel']['id'],
+                    user=body['user']['id'],
+                    text="❌ *Unexpected Error*\n\nSomething went wrong while processing your ToO request. Please try again or contact the system administrator.",
+                    thread_ts=body.get('message', {}).get('ts')
+                )
+            except Exception as notification_error:
+                logger.error(f"Failed to send error notification to user: {notification_error}")
+
 def process_notice_and_send_message(topic, value, slack_client, slack_channel, is_test=False):
     """
     Process a GCN notice and send to Slack with visibility plot.
