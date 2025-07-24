@@ -1709,20 +1709,17 @@ class GCNNoticeHandler:
                     df = pd.read_csv(self.output_ascii, sep=r'\s+', quotechar='"', 
                                 quoting=csv.QUOTE_MINIMAL, dtype=str, na_filter=False)
                     
-                    # Migration for old format
-                    if 'Facility' in df.columns and 'Primary_Facility' not in df.columns:
-                        logger.info("Migrating ASCII format from old to new multi-facility structure")
-                        df['Primary_Facility'] = df['Facility']
-                        df['Best_Facility'] = df['Facility'] 
-                        df['All_Facilities'] = df['Facility']
-                        df['Last_Update'] = df.get('Notice_date', '')
-                        df['thread_ts'] = ''
-                    
-                    # Ensure all columns exist
+                    # Ensure all required columns exist
                     for col in self.ascii_columns:
                         if col not in df.columns:
                             df[col] = ''
+
+                    # Reorder columns to match expected format  
                     df = df[self.ascii_columns]
+
+                    # Fill NaN values with empty strings (preserve existing data)
+                    for col in self.ascii_columns:
+                        df[col] = df[col].fillna('')
                     
                 except (pd.errors.EmptyDataError, FileNotFoundError):
                     df = pd.DataFrame(columns=self.ascii_columns)

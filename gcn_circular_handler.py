@@ -1154,7 +1154,7 @@ class GCNCircularHandler:
                 df = self._load_ascii_with_recovery(self.output_ascii)
                 df = self._ensure_ascii_columns(df)  # Add new columns if missing
                 
-                # CRITICAL FIX: Ensure all required columns exist before accessing them
+                # Ensure all required columns exist before accessing them
                 required_columns = ['Best_Facility', 'All_Facilities', 'Primary_Facility', 'Last_Update', 'GCN_ID']
                 for col in required_columns:
                     if col not in df.columns:
@@ -1193,6 +1193,31 @@ class GCNCircularHandler:
                     current_gcn_id = str(df.at[existing_idx, 'GCN_ID']).strip()
                     
                     should_update_position = self._should_update_position(current_best, facility)
+                    
+                    # Update GCN_ID: replace temporary ID with circular ID
+                    circular_id = str(processed_data['circular_id'])
+                    temporary_id = f"GCN_{facility}_{trigger_num}"
+                    
+                    # Replace temporary ID or append new circular ID
+                    if current_gcn_id == temporary_id:
+                        updated_gcn_id = circular_id
+                        logger.info(f"Replaced temporary GCN_ID {temporary_id} with circular ID {circular_id}")
+                    elif temporary_id in current_gcn_id:
+                        updated_gcn_id = current_gcn_id.replace(temporary_id, circular_id)
+                        logger.info(f"Replaced temporary GCN_ID in list: {current_gcn_id} -> {updated_gcn_id}")
+                    else:
+                        # Append if not already present
+                        existing_ids = [id.strip() for id in current_gcn_id.split(',') if id.strip()]
+                        if circular_id not in existing_ids:
+                            existing_ids.append(circular_id)
+                            updated_gcn_id = ','.join(existing_ids)
+                            logger.info(f"Appended circular ID: {current_gcn_id} -> {updated_gcn_id}")
+                        else:
+                            updated_gcn_id = current_gcn_id
+                            logger.info(f"Circular ID {circular_id} already exists in GCN_ID list")
+                    
+                    # Update the GCN_ID in dataframe
+                    df.at[existing_idx, 'GCN_ID'] = updated_gcn_id
                     
                     logger.info(f"Updating existing entry for {event_name}: current_best={current_best}, new_facility={facility}, should_update={should_update_position}")
                     
@@ -1252,12 +1277,19 @@ class GCNCircularHandler:
                         if not discovery_time and processed_data.get('discovery_date') and processed_data.get('discovery_time'):
                             discovery_time = f"{processed_data['discovery_date']} {processed_data['discovery_time']}"
                         
+                        # Check if entry already exists
+                        existing_entry = {}
+                        if len(df) > 0:
+                            existing_mask = df['Name'].str.strip('"') == event_name
+                            if existing_mask.any():
+                                existing_entry = df[existing_mask].iloc[0].to_dict()
+                        
                         new_row = {
                             'GCN_ID': str(circular_id),
                             'Name': f'"{event_name}"',
                             'RA': f"{processed_data['ra']:.5f}",
                             'DEC': f"{processed_data['dec']:.5f}",
-                            'Error': f"{error_in_degrees:.6f}",
+                            'Error': f"{error_in_degrees:.6f}" if error_in_degrees is not None else existing_entry.get('Error', ''),
                             'Discovery_UTC': discovery_time,
                             'Primary_Facility': facility,       # First detector
                             'Best_Facility': facility,          # Initially same as primary
@@ -1286,39 +1318,23 @@ class GCNCircularHandler:
 
     def _ensure_ascii_columns(self, df: pd.DataFrame) -> pd.DataFrame:
         """
-        Ensure ASCII DataFrame has all required columns for backward compatibility.
-        Gradually migrate old format to new multi-facility format.
+        Ensure ASCII DataFrame has all 15 required columns.
+        Only fills missing/empty columns, preserves existing data.
         """
-        try:
-            # Check if this is old format (has 'Facility' instead of 'Primary_Facility')
-            if 'Facility' in df.columns and 'Primary_Facility' not in df.columns:
-                logger.info("Migrating ASCII format from old to new multi-facility structure")
-                
-                # Rename and add columns for gradual migration
-                if 'Facility' in df.columns:
-                    df['Primary_Facility'] = df['Facility']
-                    df['Best_Facility'] = df['Facility']
-                    df['All_Facilities'] = df['Facility']
-                    # Keep old 'Facility' column temporarily for compatibility
-                
-                # Add new columns if missing
-                if 'Last_Update' not in df.columns:
-                    df['Last_Update'] = df.get('Notice_date', '')
-            
-            # Ensure all required columns exist
-            for col in self.ascii_columns:
-                if col not in df.columns:
-                    df[col] = ''
-                    logger.debug(f"Added missing column: {col}")
-            
-            # Reorder columns to match expected format
-            df = df[self.ascii_columns]
-            
-            return df
-            
-        except Exception as e:
-            logger.error(f"Error ensuring ASCII columns: {e}")
-            return df
+        # Ensure all required columns exist
+        for col in self.ascii_columns:
+            if col not in df.columns:
+                df[col] = ''
+                logger.debug(f"Added missing column: {col}")
+        
+        # Reorder columns to match expected format
+        df = df[self.ascii_columns]
+        
+        # Fill NaN values with empty strings (but don't overwrite existing data)
+        for col in self.ascii_columns:
+            df[col] = df[col].fillna('')
+        
+        return df
 
     def _get_facility_priority(self, facility: str) -> int:
         """
