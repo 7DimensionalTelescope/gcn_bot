@@ -1,10 +1,6 @@
 #!/usr/bin/env python3
 """
-Fixed Visibility Plot Generator for GRB observations
-
-Uses direct import of VisibilityPlotter class.
-The key fix: VisibilityPlotter.create_visibility_plot() returns the plot file path,
-we don't need to save it ourselves.
+Visibility Plot Generator for GRB observations
 """
 
 import shutil
@@ -33,7 +29,7 @@ def save_visibility_plot(ra, dec, object_name, output_dir="plots"):
         # Create plotter and generate plot
         plotter = VisibilityPlotter()
         
-        # FIXED: create_visibility_plot() returns (plot_path, visibility_info)
+        # create_visibility_plot() returns (plot_path, visibility_info)
         result = plotter.create_visibility_plot(
             ra=ra, 
             dec=dec, 

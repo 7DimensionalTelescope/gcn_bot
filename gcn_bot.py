@@ -2363,28 +2363,7 @@ def _evaluate_too_criteria(notice_data: Dict[str, Any], visibility_info: Optiona
     facility = notice_data.get('Facility', '')
     target_name = notice_data.get('Name', 'Unknown Target')
     
-    # Criteria 1: IceCube neutrino events (always high priority)
-    icecube_facilities = ['AMON', 'IceCubeCASCADE', 'HAWC', 'IceCubeBRONZE', 'IceCubeGOLD']
-    is_neutrino_event = any(ice_fac in facility for ice_fac in icecube_facilities)
-    
-    if is_neutrino_event:
-        logger.info(f"ToO Criteria Met - Neutrino Event: {facility}")
-        
-        # Return specific facility name as reason
-        if 'AMON' in facility:
-            return True, "AMON Neutrino-EM Coincidence"
-        elif 'CASCADE' in facility:
-            return True, "IceCube CASCADE Event"
-        elif 'HAWC' in facility:
-            return True, "HAWC Burst Monitor"
-        elif 'GOLD' in facility:
-            return True, "IceCube GOLD Track"
-        elif 'BRONZE' in facility:
-            return True, "IceCube BRONZE Track"
-        else:
-            return True, facility  # Fallback to full facility name
-    
-    # Criteria 2: Currently observable targets with good conditions
+    # Criteria 1: Currently observable targets with good conditions
     if visibility_info:
         status = visibility_info.get('status')
         
@@ -2393,7 +2372,7 @@ def _evaluate_too_criteria(notice_data: Dict[str, Any], visibility_info: Optiona
             current_altitude = visibility_info.get('current_altitude', 0)
             
             # Only send ToO if we have sufficient time and good altitude
-            if remaining_hours >= 1.0 and current_altitude >= 35:
+            if remaining_hours >= 1.0 and current_altitude >= 30:
                 logger.info(f"ToO Criteria Met - Currently Observable: {target_name}")
                 return True, "Currently Observable with Good Conditions"
             else:
@@ -2461,21 +2440,11 @@ def _send_too_email_if_criteria_met(notice_data: Dict[str, Any], visibility_info
         custom_too_config = TOO_CONFIG.copy()
         custom_too_config['additional_comments'] = f"ToO Reason: {reason}"
         
-        # Set priority and urgency based on reason and visibility status
-        neutrino_reasons = ['AMON', 'IceCube CASCADE', 'HAWC', 'IceCube GOLD', 'IceCube BRONZE']
-        is_neutrino = any(neut_type in reason for neut_type in neutrino_reasons)
-        
-        if is_neutrino:
-            # High priority for all neutrino events
-            custom_too_config.update({
-                'priority': 'URGENT',
-                'abortObservation': 'Yes'
-            })
-        elif visibility_info and visibility_info.get('status') == 'observable_now':
+        if visibility_info and visibility_info.get('status') == 'observable_now':
             # High priority for currently observable targets
             custom_too_config.update({
                 'priority': 'URGENT',
-                'abortObservation': 'Yes'
+                'abortObservation': 'No'
             })
         else:
             # Normal priority for other cases
@@ -2912,9 +2881,6 @@ def process_notice_and_send_message(topic, value, slack_client, slack_channel, i
                                 logger.info(f"Uploaded updated visibility plot to thread")
                             except Exception as plot_error:
                                 logger.error(f"Error uploading plot to thread: {plot_error}")
-                        
-                        # Send ToO email if criteria are met
-                        _send_too_email_if_criteria_met(notice_data, visibility_info)
                                 
                     except Exception as e:
                         logger.error(f"Error sending thread update: {e}")
