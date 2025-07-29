@@ -1919,8 +1919,10 @@ class GCNNoticeHandler:
                 
                 if (normalized_row_facility == normalized_facility and 
                     row_trigger == trigger_num):
+                    logger.info(f"Found existing event for {facility} trigger {trigger_num}, thread_ts: {row.get('thread_ts', '')}")
                     return row.to_dict()
             
+            logger.info(f"No existing event found for {facility} trigger {trigger_num}")
             return None
             
         except Exception as e:

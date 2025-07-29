@@ -15,7 +15,7 @@ License:        MIT
 
 import pandas as pd
 import re
-from datetime import datetime
+from datetime import datetime, timezone
 import json
 import os
 import logging
@@ -100,6 +100,7 @@ class GCNCircularHandler:
             'GECAM': 2, 'CALET': 2,                    # Detection confirmation
         }
 
+    ### Process circular ###
     def process_circular(self, circular_data: Dict[str, Any]) -> Dict[str, Any]:
         """
         Process a GCN circular and extract all relevant information.
@@ -110,15 +111,15 @@ class GCNCircularHandler:
             body = circular_data.get('body', '')
             circular_id = circular_data.get('circularId')
             created_on = circular_data.get('createdOn')
-            
+            created_on = datetime.fromtimestamp(int(created_on) / 1000, tz = timezone.utc)  # Convert ms to seconds
             logger.info(f"Processing circular {circular_id}: {subject}")
             
             # Initialize result dictionary
             result = {
                 'circular_id': circular_id,
                 'subject': subject,
-                'created_on': created_on,
-                'processed_on': datetime.now().timestamp() * 1000,
+                'created_on': created_on.strftime("%Y-%m-%d_%H:%M:%S"),
+                'processed_on': datetime.now(tz=timezone.utc).strftime("%Y-%m-%d_%H:%M:%S"),
                 'event_name': None,
                 'facility': None,
                 'trigger_num': None,
@@ -133,13 +134,17 @@ class GCNCircularHandler:
             }
             
             # Extract event name (GRB/EP)
-            event_match = re.search(r'(?:GRB|grb)\s*(\d{6}[A-Za-z])', subject, re.IGNORECASE)
-            if event_match:
-                result['event_name'] = f"GRB {event_match.group(1)}"
+            GRB_event_match = re.search(r'(?:GRB|grb)\s*(\d{6}[A-Za-z])', subject, re.IGNORECASE)
+            EP_event_match = re.search(r'(?:EP)\s*(\d{6}[A-Za-z])', subject, re.IGNORECASE)
+            IceCube_event_match = re.search(r'(?:IceCube)\s*(\d{6}[A-Za-z])', subject, re.IGNORECASE)
+            if GRB_event_match:
+                result['event_name'] = f"GRB {GRB_event_match.group(1)}"
+            elif EP_event_match:
+                result['event_name'] = f"EP {EP_event_match.group(1)}"
+            elif IceCube_event_match:
+                result['event_name'] = f"IceCube {IceCube_event_match.group(1)}"
             else:
-                event_match = re.search(r'(?:EP)\s*(\d{6}[A-Za-z])', subject, re.IGNORECASE)
-                if event_match:
-                    result['event_name'] = f"EP {event_match.group(1)}"
+                result['event_name'] = None
             
             # Extract facility
             combined_text = subject + " " + body[:500]  # Check subject and first part of body
@@ -155,6 +160,12 @@ class GCNCircularHandler:
                 (r'GECAM', 'GECAM'),
                 (r'SVOM|ECLAIRs', 'SVOM'),
                 (r'CALET', 'CALET'),
+                (r'HAWC', 'HAWC'),
+                (r'ICECUBE', 'IceCube'),
+                (r'AMON', 'AMON'),
+                (r'ICECUBE_Astrotrack_BRONZE', 'IceCubeBronze'),
+                (r'ICECUBE_Astrotrack_GOLD', 'IceCubeGold'),
+                (r'IceCube-Cascade', 'IceCubeCASCADE'),
             ]
             
             for pattern, facility_name in facility_patterns:
@@ -286,7 +297,8 @@ class GCNCircularHandler:
             if re.search(pattern, body, re.IGNORECASE):
                 return True
         return False
-
+    
+    ### Database Update ###
     def _update_databases(self, processed_data: Dict[str, Any]) -> None:
         """
         Update both CSV and ASCII databases with processed circular data.
@@ -323,19 +335,11 @@ class GCNCircularHandler:
             else:
                 df = pd.DataFrame(columns=self.csv_columns)
             
-            # Update or add entry
-            if 'circular_id' in df.columns and data['circular_id'] in df['circular_id'].values:
-                # Update existing
-                idx = df[df['circular_id'] == data['circular_id']].index[0]
-                for key, value in data.items():
-                    if key in df.columns and value is not None:
-                        df.at[idx, key] = str(value) if key == 'trigger_num' else value
-            else:
-                # Add new
-                new_row = {col: data.get(col) for col in self.csv_columns}
-                if new_row.get('trigger_num') is not None:
-                    new_row['trigger_num'] = str(new_row['trigger_num'])
-                df = pd.concat([df, pd.DataFrame([new_row])], ignore_index=True)
+            # Add entry
+            new_row = {col: data.get(col) for col in self.csv_columns}
+            if new_row.get('trigger_num') is not None:
+                new_row['trigger_num'] = str(new_row['trigger_num'])
+            df = pd.concat([df, pd.DataFrame([new_row])], ignore_index=True)
             
             df.to_csv(self.output_csv, index=False)
             logger.info(f"CSV database updated with circular ID {data['circular_id']}")
@@ -487,8 +491,7 @@ class GCNCircularHandler:
             trigger = str(data['trigger_num'])
             
             # Find rows to remove
-            mask = (df['Trigger_num'] == trigger) & (df['Facility'].str.contains(facility.split('Swift')[-1] if 'Swift' in facility else facility))
-            
+            mask = (df['Trigger_num'] == trigger) & (df['Facility'] == facility)            
             if mask.any():
                 df = df[~mask]
                 
@@ -503,12 +506,6 @@ class GCNCircularHandler:
                 
         except Exception as e:
             logger.error(f"Error removing false trigger: {e}", exc_info=True)
-
-    def _get_facility_priority(self, facility: str) -> int:
-        """
-        Get facility priority for position accuracy.
-        """
-        return self.facility_priorities.get(facility, 1) if facility else 0
     
     def _compare_facilities(self, current_facility: str, current_error: Optional[float], 
                         new_facility: str, new_error: Optional[float]) -> bool:
@@ -516,8 +513,8 @@ class GCNCircularHandler:
         Compare facilities to determine if new facility should become Best_Facility.
         Returns True if new facility should be used.
         """
-        current_priority = self._get_facility_priority(current_facility)
-        new_priority = self._get_facility_priority(new_facility)
+        current_priority = self.facility_priorities.get(current_facility, 1) if current_facility else 0
+        new_priority = self.facility_priorities.get(new_facility, 1) if new_facility else 0
         
         # Higher priority wins
         if new_priority > current_priority:
@@ -533,6 +530,7 @@ class GCNCircularHandler:
         
         return False
     
+    ### Process circular from JSON string ###
     def process_circular_from_json(self, json_str: str) -> None:
         """
         Process a GCN circular from JSON string and update databases.
@@ -581,7 +579,7 @@ class GCNCircularHandler:
                 self.consumer.close()
             logger.info("Monitoring stopped")
 
-
+    ### Main function ###
 def main():
     """Main function to run the GCN Circular Handler."""
     import argparse
