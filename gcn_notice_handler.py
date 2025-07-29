@@ -230,7 +230,6 @@ class GCNNoticeHandler:
         - output_ascii (str): The path to the output ASCII file. (default: 'grb_targets.ascii')
         - ascii_max_events (int): The maximum number of events to store in the ASCII file. (default: 10)
         - strict_parsing (bool): Enable strict parsing mode. (default: False)
-        - verify_interval (int): How often to verify CSV integrity (in days). (default: 1)
 
     Attributes:
     ----------
@@ -243,7 +242,7 @@ class GCNNoticeHandler:
     """
     
     def __init__(self, output_csv='gcn_notices.csv', output_ascii='grb_targets.ascii',
-                ascii_max_events=10, strict_parsing=False, verify_interval=1):
+                ascii_max_events=10, strict_parsing=False):
         """
         Initialize the GCN Notice Handler.
         
@@ -252,11 +251,9 @@ class GCNNoticeHandler:
             output_ascii (str): The path to the output ASCII file. (default: 'grb_targets.ascii')
             ascii_max_events (int): The maximum number of events to store in the ASCII file. (default: 10)
             strict_parsing (bool): Enable strict parsing mode. (default: False)
-            verify_interval (int): How often to verify CSV integrity (in days). (default: 1)
         """
         self.file_lock = Lock()
         self.strict_parsing = strict_parsing
-        self.verify_interval = verify_interval
         
         # Unified caching system
         # GRB name sequence tracking (date -> letter)
@@ -330,151 +327,6 @@ class GCNNoticeHandler:
             'Host_info',             # Usually empty from notices
             'thread_ts'              # Slack thread timestamp
         ]
-        
-        # Check if it's time to verify CSV integrity
-        self._check_verify_schedule()
-
-    def _check_verify_schedule(self):
-        """Check if it's time to verify CSV integrity based on schedule."""
-        try:
-            # Check if verification is due
-            current_time = time.time()
-            
-            # Initialize verification time if needed
-            if self._last_verification is None:
-                # Check for existing verification record
-                verify_file = f"{self.output_csv}.verify"
-                if os.path.exists(verify_file):
-                    try:
-                        with open(verify_file, 'r') as f:
-                            self._last_verification = float(f.read().strip())
-                    except (ValueError, IOError) as e:
-                        logger.warning(f"Error reading verification record: {e}")
-                        self._last_verification = current_time
-                else:
-                    self._last_verification = current_time
-            
-            # Check if it's time to verify
-            if current_time - self._last_verification > (self.verify_interval * 86400):  # days to seconds
-                if os.path.exists(self.output_csv):
-                    logger.info("Performing scheduled CSV integrity verification")
-                    is_valid, issues, repairs = self._verify_csv_integrity(repair=True)
-                    
-                    if not is_valid:
-                        logger.warning(f"CSV integrity issues found: {', '.join(issues)}")
-                        if repairs:
-                            logger.info(f"Repairs made: {', '.join(repairs)}")
-                    else:
-                        logger.info("CSV integrity verification passed")
-                
-                # Update verification time
-                self._last_verification = current_time
-                
-                # Save verification timestamp
-                try:
-                    verify_file = f"{self.output_csv}.verify"
-                    with open(verify_file, 'w') as f:
-                        f.write(str(current_time))
-                except IOError as e:
-                    logger.error(f"Error saving verification timestamp: {e}")
-        
-        except Exception as e:
-            logger.error(f"Error in verification schedule check: {e}")
-
-    def _load_caches(self, force: bool = False) -> None:
-        """Load caches from files with improved error handling."""
-        now = datetime.now()
-        if (self._cache_loaded and not force and 
-            (now - self._last_cache_refresh).total_seconds() < self._cache_refresh_interval):
-            return
-
-        with self.file_lock:
-            logger.debug("Loading caches from files")
-            
-            if force:
-                self._name_cache.clear()
-                self._ascii_entry_cache.clear()
-            
-            # Load from CSV (existing logic preserved)
-            if os.path.exists(self.output_csv):
-                try:
-                    df = self._safe_csv_read(self.output_csv)
-                    
-                    if all(col in df.columns for col in ['Name', 'Facility', 'Trigger_num']):
-                        for _, row in df.iterrows():
-                            if pd.notna(row['Facility']) and pd.notna(row['Trigger_num']) and pd.notna(row['Name']):
-                                key = (row['Facility'], str(row['Trigger_num']))
-                                self._name_cache[key] = row['Name']
-                                logger.debug(f"Cached name mapping: {key} -> {row['Name']}")
-                    
-                    # GRB name sequence tracking logic
-                    for _, row in df.iterrows():
-                        if 'Name' in row and pd.notna(row['Name']):
-                            name = str(row['Name']).strip().strip('"')
-                            
-                            grb_match = re.match(r'^GRB\s*(\d{2})(\d{2})(\d{2})([A-Za-z]+)$', name)
-                            if grb_match:
-                                year, month, day, letter_part = grb_match.groups()
-                                date_part = f"{year}{month}{day}"
-                                cache_key = f"GRB_{date_part}"
-                                
-                                if letter_part.isupper():
-                                    alphabet = ascii_uppercase
-                                elif letter_part.islower():
-                                    alphabet = ascii_lowercase
-                                else:
-                                    continue
-                                
-                                if cache_key in self._grb_name_cache:
-                                    current_letter = self._grb_name_cache[cache_key]
-                                    try:
-                                        letter_idx = alphabet.index(letter_part) if letter_part in alphabet else -1
-                                        current_idx = alphabet.index(current_letter) if current_letter in alphabet else -1
-                                        
-                                        if letter_idx > current_idx:
-                                            self._grb_name_cache[cache_key] = letter_part
-                                    except (ValueError, IndexError) as e:
-                                        logger.warning(f"Error comparing letters for {cache_key}: {e}")
-                                else:
-                                    self._grb_name_cache[cache_key] = letter_part
-                    
-                    logger.debug(f"Loaded {len(self._name_cache)} name mappings and {len(self._grb_name_cache)} date sequences from CSV")
-                except Exception as e:
-                    logger.warning(f"Error loading caches from CSV: {e}")
-            
-            # Load from ASCII with better error handling
-            if os.path.exists(self.output_ascii):
-                try:
-                    # Try pandas first, then fallback
-                    try:
-                        df = pd.read_csv(self.output_ascii, sep=r'\s+', quotechar='"', 
-                                    quoting=csv.QUOTE_MINIMAL, dtype=str, na_filter=False)
-                    except:
-                        # Simple fallback for basic cache loading
-                        logger.debug("Using simplified ASCII cache loading")
-                        self._cache_loaded = True
-                        self._last_cache_refresh = now
-                        return
-                    
-                    # Process rows into cache
-                    for _, row in df.iterrows():
-                        # Handle both old and new column formats
-                        facility = (row.get('Primary_Facility') or row.get('Best_Facility') or 
-                                row.get('Facility', '')).strip()
-                        trigger_num = str(row.get('Trigger_num', '')).strip()
-                        
-                        if facility and trigger_num:
-                            key = (facility, trigger_num)
-                            self._ascii_entry_cache[key] = row.to_dict()
-                            if 'Name' in row and pd.notna(row['Name']):
-                                self._name_cache[key] = row['Name']
-                    
-                    logger.debug(f"Loaded {len(self._ascii_entry_cache)} entries from ASCII cache")
-                except Exception as e:
-                    logger.warning(f"Error loading ASCII entry cache: {e}")
-            
-            self._cache_loaded = True
-            self._last_cache_refresh = now
 
     def _normalize_facility_name(self, facility: str) -> str:
         """
@@ -523,93 +375,67 @@ class GCNNoticeHandler:
         # For other facilities, return as-is
         return facility
 
-    def _get_facility_priority(self, facility: str) -> int:
+    def _find_existing_event(self, facility: str, trigger_num: str, return_full_data: bool = False) -> Optional[Union[str, Dict[str, Any]]]:
         """
-        Get facility priority for position accuracy.
-        Higher number = higher priority/accuracy.
-        
-        Args:
-            facility (str): The facility name
-            
-        Returns:
-            int: Priority score (higher = more accurate)
-        """
-        if not facility:
-            return 0
-            
-        facility_priorities = {
-            'SwiftXRT': 10,      # Highest - arcsec precision
-            'Swift-XRT': 10,
-            'SwiftBAT': 7,       # Good - arcmin precision  
-            'Swift-BAT': 7,
-            'Swift': 6,          # General Swift
-            'FermiLAT': 5,       # Degree precision but good
-            'Fermi-LAT': 5,
-            'SVOM': 4,           # Arcmin precision
-            'FermiGBM': 3,       # Detection mainly
-            'Fermi-GBM': 3,
-            'Fermi': 3,
-            'GECAM': 2,          # Detection confirmation
-            'CALET': 2,          # Detection confirmation
-        }
-        
-        return facility_priorities.get(facility, 1)
-
-    def _event_exists(self, facility: str, trigger_num: str) -> Optional[str]:
-        """
-        Check if an event with the given facility and trigger number already exists.
-        Facilities from the same mission (e.g., SwiftBAT, SwiftXRT) are considered the same.
+        Unified method to find existing event from ASCII file.
         
         Args:
             facility (str): The facility name
             trigger_num (str): The trigger number
+            return_full_data (bool): If True, return full event data; if False, return only GRB name
             
         Returns:
-            Optional[str]: The existing GRB name if found, None otherwise
+            Optional[Union[str, Dict[str, Any]]]: 
+                - If return_full_data=False: GRB name (str) or None
+                - If return_full_data=True: Full event data (dict) or None
         """
-        # Always force reload to ensure we have the latest data
-        self._load_caches(force=True)
-        
         if not facility or not trigger_num:
             return None
-        
-        # Normalize the facility name for comparison
-        normalized_facility = self._normalize_facility_name(facility)
-        
-        # Check for any matches with normalized facility names
-        for (existing_facility, existing_trigger), existing_name in self._name_cache.items():
-            # Normalize the existing facility name
-            normalized_existing = self._normalize_facility_name(existing_facility)
             
-            # If normalized names and trigger numbers match, return the existing name
-            if normalized_existing == normalized_facility and str(existing_trigger) == str(trigger_num):
-                logger.info(f"Found existing event: {existing_name} for {facility} trigger {trigger_num} (matched with {existing_facility})")
-                return existing_name
-        
-        # If not in name cache, try csv directly (safety check)
         try:
-            if os.path.exists(self.output_csv):
-                df = self._safe_csv_read(self.output_csv)
-                if all(col in df.columns for col in ['Name', 'Facility', 'Trigger_num']):
-                    # Get all matching rows with normalized facility names
-                    matches = []
-                    for idx, row in df.iterrows():
-                        normalized_row_facility = self._normalize_facility_name(row['Facility'])
-                        if (normalized_row_facility == normalized_facility and 
-                            str(row['Trigger_num']) == str(trigger_num)):
-                            matches.append(row['Name'])
+            # Load ASCII file directly without caching
+            if not os.path.exists(self.output_ascii):
+                logger.info(f"ASCII file does not exist: {self.output_ascii}")
+                return None
+                
+            df = pd.read_csv(self.output_ascii, sep=r'\s+', 
+                            quotechar='"', quoting=csv.QUOTE_MINIMAL, 
+                            dtype=str, na_filter=False)
+            
+            if df.empty:
+                logger.info("ASCII file is empty")
+                return None
+            
+            # Normalize the search facility name
+            normalized_facility = self._normalize_facility_name(facility)
+            
+            # Search for matching event
+            for _, row in df.iterrows():
+                # Handle both old and new column formats for backward compatibility
+                row_facility = str(row.get('Primary_Facility', row.get('Facility', ''))).strip()
+                row_trigger = str(row.get('Trigger_num', '')).strip()
+                
+                # Normalize the row facility name for comparison
+                normalized_row_facility = self._normalize_facility_name(row_facility)
+                
+                # Check if facility and trigger number match
+                if (normalized_row_facility == normalized_facility and 
+                    row_trigger == str(trigger_num)):
                     
-                    if matches:
-                        existing_name = matches[0]  # Take the first match
-                        # Update the cache
-                        self._name_cache[(facility, str(trigger_num))] = existing_name
-                        logger.info(f"Found existing event in CSV (not in cache): {existing_name}")
-                        return existing_name
+                    if return_full_data:
+                        logger.info(f"Found existing event for {facility} trigger {trigger_num}, thread_ts: {row.get('thread_ts', '')}")
+                        return row.to_dict()
+                    else:
+                        grb_name = row.get('Name', '')
+                        logger.info(f"Found existing event: {grb_name} for {facility} trigger {trigger_num} (matched with {row_facility})")
+                        return grb_name
+            
+            logger.info(f"No existing event found for {facility} trigger {trigger_num}")
+            return None
+            
         except Exception as e:
-            logger.warning(f"Error checking CSV directly for existing event: {e}")
-        
-        logger.info(f"No existing event found for {facility} trigger {trigger_num}")
-        return None
+            logger.error(f"Error finding existing event: {e}")
+            return None
 
     def _get_facility(self, topic: str) -> Optional[str]:
         """
@@ -635,14 +461,10 @@ class GCNNoticeHandler:
         """
         # First check if this is an existing event
         if facility and trigger_num:
-            existing_name = self._event_exists(facility, str(trigger_num))
+            existing_name = self._find_existing_event(facility, str(trigger_num), return_full_data=False)
             if existing_name:
                 logger.info(f"Using existing name {existing_name} for {facility} trigger {trigger_num}")
                 return existing_name
-        
-        # Load caches if needed
-        if not self._cache_loaded:
-            self._load_caches()
         
         # Determine the prefix based on facility
         is_einstein_probe = facility == "EinsteinProbe"
@@ -1372,145 +1194,6 @@ class GCNNoticeHandler:
             logger.error(f"Unexpected error reading CSV file {filepath}: {e}")
             return pd.DataFrame(columns=self.csv_columns)
 
-    def _verify_csv_integrity(self, repair=False):
-        """
-        Verify the integrity of the CSV file and optionally repair issues.
-        
-        Args:
-            repair (bool): If True, attempt to repair issues found
-            
-        Returns:
-            tuple: (is_valid, issues_found, repairs_made)
-        """
-        issues_found = []
-        repairs_made = []
-        
-        try:
-            if not os.path.exists(self.output_csv):
-                issues_found.append("CSV file does not exist")
-                
-                if repair:
-                    # Create new file with header
-                    with open(self.output_csv, 'w', newline='') as f:
-                        writer = csv.DictWriter(f, fieldnames=self.csv_columns)
-                        writer.writeheader()
-                    repairs_made.append("Created new CSV file with header")
-                    
-                return False, issues_found, repairs_made
-                
-            # Check file is not empty
-            if os.path.getsize(self.output_csv) == 0:
-                issues_found.append("CSV file is empty")
-                if repair:
-                    with open(self.output_csv, 'w', newline='') as f:
-                        writer = csv.DictWriter(f, fieldnames=self.csv_columns)
-                        writer.writeheader()
-                    repairs_made.append("Created empty CSV with header")
-                return False, issues_found, repairs_made
-                
-            # Check header row
-            with open(self.output_csv, 'r') as f:
-                header = f.readline().strip().split(',')
-                
-            # Verify all expected columns are present
-            missing_columns = [col for col in self.csv_columns if col not in header]
-            if missing_columns:
-                issues_found.append(f"Missing columns: {', '.join(missing_columns)}")
-                
-                if repair and len(missing_columns) < len(self.csv_columns) / 2:
-                    # Only attempt repair if most columns are present
-                    temp_file = f"{self.output_csv}.temp"
-                    
-                    # Read existing file
-                    try:
-                        df = self._safe_csv_read(self.output_csv)
-                        
-                        # Add missing columns
-                        for col in missing_columns:
-                            df[col] = ''
-                            
-                        # Save with correct columns
-                        df.to_csv(temp_file, index=False, columns=self.csv_columns)
-                        
-                        # Replace original file
-                        shutil.move(temp_file, self.output_csv)
-                        repairs_made.append(f"Added missing columns: {', '.join(missing_columns)}")
-                    except Exception as e:
-                        logger.error(f"Failed to repair missing columns: {e}")
-                        if os.path.exists(temp_file):
-                            os.remove(temp_file)
-                
-            # Check data consistency
-            df = self._safe_csv_read(self.output_csv)
-            
-            # Check for missing values in critical columns
-            for col in ['Name', 'RA', 'DEC', 'Discovery_UTC']:
-                if col in df.columns and pd.isna(df[col]).any():
-                    count = pd.isna(df[col]).sum()
-                    issues_found.append(f"Missing values in {col} column: {count} rows")
-                    
-            # Check for duplicate GRB names
-            if 'Name' in df.columns:
-                duplicates = df['Name'].duplicated()
-                duplicate_count = duplicates.sum()
-                if duplicate_count > 0:
-                    duplicate_names = df.loc[duplicates, 'Name'].tolist()
-                    issues_found.append(f"Found {duplicate_count} duplicate GRB names: {', '.join(duplicate_names[:5])}")
-                    
-                    if repair:
-                        # Remove duplicates by keeping first occurrence
-                        df = df.drop_duplicates(subset=['Name'], keep='first')
-                        df.to_csv(self.output_csv, index=False)
-                        repairs_made.append(f"Removed {duplicate_count} duplicate GRB name entries")
-                    
-            # Check date format consistency
-            if 'Discovery_UTC' in df.columns:
-                date_format_issues = 0
-                for i, date_str in enumerate(df['Discovery_UTC']):
-                    if isinstance(date_str, str):
-                        try:
-                            # Try to parse with various formats
-                            formats = ['%Y-%m-%d %H:%M:%S.%f', '%Y-%m-%d %H:%M:%S', '%Y-%m-%d %H:%M:%S.%f    ', '%Y-%m-%d %H:%M:%S       ']
-                            for fmt in formats:
-                                try:
-                                    datetime.strptime(date_str.strip(), fmt)
-                                    break
-                                except ValueError:
-                                    continue
-                            else:
-                                date_format_issues += 1
-                        except (ValueError, AttributeError):
-                            date_format_issues += 1
-                            
-                if date_format_issues > 0:
-                    issues_found.append(f"Found {date_format_issues} date format issues in Discovery_UTC")
-                    
-                    if repair:
-                        # Try to fix date formats
-                        for i, date_str in enumerate(df['Discovery_UTC']):
-                            if isinstance(date_str, str):
-                                try:
-                                    # Try different formats
-                                    for fmt in formats:
-                                        try:
-                                            dt = datetime.strptime(date_str.strip(), fmt)
-                                            df.at[i, 'Discovery_UTC'] = dt.strftime('%Y-%m-%d %H:%M:%S')
-                                            break
-                                        except ValueError:
-                                            continue
-                                except Exception:
-                                    pass
-                                    
-                        df.to_csv(self.output_csv, index=False)
-                        repairs_made.append(f"Attempted to fix {date_format_issues} date format issues")
-                
-            return len(issues_found) == 0, issues_found, repairs_made
-            
-        except Exception as e:
-            logger.error(f"Error verifying CSV integrity: {e}")
-            issues_found.append(f"Verification error: {str(e)}")
-            return False, issues_found, repairs_made
-
     def _create_backup_with_limit(self, filepath: str, max_backups: int = 5) -> str:
         """
         Create a backup of the file and manage backup count to keep only the most recent ones.
@@ -1704,7 +1387,7 @@ class GCNNoticeHandler:
         """
         try:
             with self.file_lock:
-                # Load existing data with better error handling
+                # Load existing data with error handling
                 try:
                     df = pd.read_csv(self.output_ascii, sep=r'\s+', quotechar='"', 
                                 quoting=csv.QUOTE_MINIMAL, dtype=str, na_filter=False)
@@ -1717,101 +1400,47 @@ class GCNNoticeHandler:
                     # Reorder columns to match expected format  
                     df = df[self.ascii_columns]
 
-                    # Fill NaN values with empty strings (preserve existing data)
-                    for col in self.ascii_columns:
-                        df[col] = df[col].fillna('')
+                    # Fill NaN values with empty strings
+                    df = df.fillna('')
                     
                 except (pd.errors.EmptyDataError, FileNotFoundError):
                     df = pd.DataFrame(columns=self.ascii_columns)
                     logger.info(f"Created new ASCII file: {self.output_ascii}")
                     
                 except Exception as load_error:
-                    logger.warning(f"pandas failed: {load_error}, attempting manual recovery")
+                    logger.warning(f"pandas failed to load file: {load_error}")
+                    
+                    # Create backup before recreating file
+                    if os.path.exists(self.output_ascii):
+                        backup_path = self._create_backup_with_limit(self.output_ascii, max_backups=5)
+                        logger.info(f"Created backup before recreation: {backup_path}")
+                    
                     df = pd.DataFrame(columns=self.ascii_columns)
-                    
-                    # Better manual recovery
-                    try:
-                        with open(self.output_ascii, 'r') as f:
-                            lines = f.read().strip().split('\n')
-                        
-                        if len(lines) > 1:
-                            header = lines[0].split()
-                            for line in lines[1:]:
-                                if line.strip():
-                                    # Better parsing logic
-                                    fields = []
-                                    current_field = ""
-                                    in_quotes = False
-                                    i = 0
-                                    
-                                    while i < len(line):
-                                        char = line[i]
-                                        if char == '"':
-                                            in_quotes = not in_quotes
-                                            current_field += char
-                                        elif char == ' ' and not in_quotes:
-                                            if current_field:
-                                                fields.append(current_field)
-                                                current_field = ""
-                                            # Skip consecutive spaces properly
-                                            while i + 1 < len(line) and line[i + 1] == ' ':
-                                                i += 1
-                                        else:
-                                            current_field += char
-                                        i += 1
-                                    
-                                    if current_field:
-                                        fields.append(current_field)
-                                    
-                                    # Handle field count mismatch
-                                    while len(fields) < len(header):
-                                        fields.append('')
-                                    if len(fields) > len(header):
-                                        fields = fields[:len(header)]
-                                    
-                                    # Clean quotes properly
-                                    cleaned_fields = []
-                                    for field in fields:
-                                        if field.startswith('"') and field.endswith('"') and len(field) > 1:
-                                            cleaned_fields.append(field[1:-1])
-                                        else:
-                                            cleaned_fields.append(field)
-                                    
-                                    row_dict = dict(zip(header, cleaned_fields))
-                                    
-                                    # Migration during manual recovery
-                                    if 'Facility' in row_dict and 'Primary_Facility' not in row_dict:
-                                        row_dict['Primary_Facility'] = row_dict['Facility']
-                                        row_dict['Best_Facility'] = row_dict['Facility']
-                                        row_dict['All_Facilities'] = row_dict['Facility']
-                                        row_dict['Last_Update'] = row_dict.get('Notice_date', '')
-                                        row_dict['thread_ts'] = ''
-                                    
-                                    # Ensure all columns exist
-                                    for col in self.ascii_columns:
-                                        if col not in row_dict:
-                                            row_dict[col] = ''
-                                    
-                                    df = pd.concat([df, pd.DataFrame([row_dict])], ignore_index=True)
-                    
-                    except Exception as recovery_error:
-                        logger.error(f"Manual recovery failed: {recovery_error}")
-                        df = pd.DataFrame(columns=self.ascii_columns)
+                    logger.info("Recreated empty DataFrame due to loading failure")
                 
-                # Rest of the logic for finding/updating existing events
+                # Find existing entry by checking if facility is in All_Facilities
                 facility = notice_data.get('Facility', '')
                 trigger_num = str(notice_data.get('Trigger_num', ''))
                 
                 existing_idx = None
                 if facility and trigger_num:
                     for idx, row in df.iterrows():
-                        # Check multiple facility columns for compatibility
-                        row_facility = (str(row.get('Primary_Facility', '')) or 
-                                    str(row.get('Best_Facility', '')) or 
-                                    str(row.get('Facility', ''))).strip()
-                        row_trigger = str(row.get('Trigger_num', '')).strip()
+                        # Clean row facilities value
+                        raw_facilities = row.get('All_Facilities', '')
+                        if pd.isna(raw_facilities) or raw_facilities in ['nan', 'None', None]:
+                            row_facilities = ''
+                        else:
+                            row_facilities = str(raw_facilities).strip().strip('"')
                         
-                        if row_facility == facility and row_trigger == trigger_num:
+                        # Clean row trigger value
+                        raw_trigger = row.get('Trigger_num', '')
+                        if pd.isna(raw_trigger) or raw_trigger in ['nan', 'None', None]:
+                            row_trigger = ''
+                        else:
+                            row_trigger = str(raw_trigger).strip().strip('"')
+                        
+                        if (facility in row_facilities.split(',') and 
+                            row_trigger == trigger_num):
                             existing_idx = idx
                             break
                 
@@ -1837,49 +1466,74 @@ class GCNNoticeHandler:
                 if existing_idx is not None:
                     # Update existing entry
                     for col, val in row_data.items():
-                        if val and val != 'nan':  # Better empty value check
-                            df.at[existing_idx, col] = val
+                        # Clean value
+                        if pd.isna(val) or val in ['nan', 'None', None]:
+                            clean_val = ''
+                        else:
+                            clean_val = str(val).strip().strip('"')
+                        
+                        if clean_val:  # Only update if value is not empty
+                            if col == 'All_Facilities':
+                                # Update All_Facilities by adding new facility if not present
+                                existing_raw = df.at[existing_idx, col]
+                                if pd.isna(existing_raw) or existing_raw in ['nan', 'None', None]:
+                                    existing_facilities = ''
+                                else:
+                                    existing_facilities = str(existing_raw).strip().strip('"')
+                                
+                                # Update facilities list
+                                if not existing_facilities:
+                                    updated_facilities = facility
+                                elif not facility:
+                                    updated_facilities = existing_facilities
+                                else:
+                                    facilities_list = [f.strip() for f in existing_facilities.split(',')]
+                                    if facility not in facilities_list:
+                                        facilities_list.append(facility)
+                                    updated_facilities = ','.join(facilities_list)
+                                
+                                df.at[existing_idx, col] = updated_facilities
+                            else:
+                                df.at[existing_idx, col] = val
+                    
                     logger.info(f"Updated existing entry for {facility} trigger {trigger_num}")
                 else:
-                    # Add new entry
+                    # Add new entry at the top
                     new_row_df = pd.DataFrame([row_data])
                     df = pd.concat([new_row_df, df], ignore_index=True)
                     logger.info(f"Added new entry for {row_data['Name']}")
                 
-                # Keep max events limit
+                # Keep max events limit with optimized sorting
                 if len(df) > self.ascii_max_events:
-                    df['Notice_date_clean'] = df['Notice_date'].str.strip('"')
-                    df = df.sort_values('Notice_date_clean', ascending=False).head(self.ascii_max_events)
-                    df = df.drop('Notice_date_clean', axis=1)
+                    # Sort by Notice_date directly without creating temporary column
+                    df['_sort_key'] = pd.to_datetime(df['Notice_date'].str.strip('"'), errors='coerce')
+                    df = df.sort_values('_sort_key', ascending=False, na_last=True).head(self.ascii_max_events)
+                    df = df.drop('_sort_key', axis=1)
                     logger.info(f"Kept {self.ascii_max_events} most recent events")
 
-                # Save with backup
+                # Create backup before saving
                 if os.path.exists(self.output_ascii):
                     backup_path = self._create_backup_with_limit(self.output_ascii, max_backups=5)
                     logger.info(f"Created backup: {backup_path}")
                 
-                # Better save logic with proper formatting
+                # Save with simplified formatting
                 with open(self.output_ascii, 'w') as f:
                     f.write(' '.join(self.ascii_columns) + '\n')
                     
                     for _, row in df.iterrows():
                         formatted_values = []
                         for col in self.ascii_columns:
-                            val = str(row.get(col, '')).strip()
-                            
-                            # Better NaN handling
-                            if pd.isna(val) or val == 'nan' or val == 'None':
+                            # Clean value
+                            raw_val = row.get(col, '')
+                            if pd.isna(raw_val) or raw_val in ['nan', 'None', None]:
                                 val = ''
+                            else:
+                                val = str(raw_val).strip().strip('"')
                             
-                            # Simplified quoting logic
-                            needs_quotes = (
-                                col in ['Name', 'Discovery_UTC', 'Notice_date', 'Last_Update', 'Redshift', 'Host_info'] or
-                                (col != 'thread_ts' and ' ' in val and val)
-                            )
-                            
-                            if val and needs_quotes:
-                                if not (val.startswith('"') and val.endswith('"')):
-                                    val = f'"{val}"'
+                            # Apply quotes for specific columns or values with spaces
+                            if val and (col in ['Name', 'Discovery_UTC', 'Notice_date', 'Last_Update', 
+                                            'Redshift', 'Host_info'] or ' ' in val):
+                                val = f'"{val}"'
                             
                             formatted_values.append(val)
                         
@@ -1887,47 +1541,10 @@ class GCNNoticeHandler:
                 
                 logger.info(f"ASCII file saved with {len(df)} entries")
                 return True
-
-        except Exception as e:
-            logger.error(f"Error saving to ASCII: {e}")
-            return False
-
-    def get_existing_event(self, facility: str, trigger_num: str) -> Optional[Dict[str, Any]]:
-        """
-        Get existing event data from ASCII file.
-        All existing functionality.
-        """
-        try:
-            normalized_facility = self._normalize_facility_name(facility)
-            
-            # Load with recovery (simplified)
-            try:
-                df = pd.read_csv(self.output_ascii, sep=r'\s+', 
-                            quotechar='"', quoting=csv.QUOTE_MINIMAL, 
-                            dtype=str)
-            except:
-                return None
-            
-            if df.empty:
-                return None
-            
-            # Search with backward compatibility
-            for _, row in df.iterrows():
-                row_facility = str(row.get('Primary_Facility', row.get('Facility', ''))).strip()
-                row_trigger = str(row.get('Trigger_num', '')).strip()
-                normalized_row_facility = self._normalize_facility_name(row_facility)
                 
-                if (normalized_row_facility == normalized_facility and 
-                    row_trigger == trigger_num):
-                    logger.info(f"Found existing event for {facility} trigger {trigger_num}, thread_ts: {row.get('thread_ts', '')}")
-                    return row.to_dict()
-            
-            logger.info(f"No existing event found for {facility} trigger {trigger_num}")
-            return None
-            
         except Exception as e:
-            logger.error(f"Error getting existing event: {e}")
-            return None
+            logger.error(f"Failed to save ASCII file: {e}")
+            return False
 
 #---------------------------------------Test Code----------------------------------------
 if __name__ == "__main__":
@@ -1936,8 +1553,8 @@ if __name__ == "__main__":
     ######################## Setup for test ########################
     
     # Set output CSV file and time window
-    csv_test_file = './test/gcn_notices_test.csv'
-    ascii_test_file = './test/gcn_notices_test_ascii.ascii'
+    csv_test_file = '/home/hongyp007/projects/GCN/gcn_bot/test_code/gcn_notices_test.csv'
+    ascii_test_file = '/home/hongyp007/projects/GCN/gcn_bot/test_code/gcn_notices_test_ascii.ascii'
     
     # Test notices for different facilities
     test_cases = [
@@ -2010,21 +1627,11 @@ ERROR_RADIUS:   0.5 [deg]"""
         level=logging.INFO,
         format='%(asctime)s - %(levelname)s - %(message)s',
         handlers=[
-            logging.FileHandler('./test/visibility_test.log'),
+            logging.FileHandler('/home/hongyp007/projects/GCN/gcn_bot/test_code/gcn_notice_handler.log', mode='w'),
             logging.StreamHandler()
         ]
     )
     test_logger = logging.getLogger(__name__)
-
-    # Verify CSV integrity
-    test_logger.info("\nVerifying CSV integrity...")
-    is_valid, issues, repairs = handler._verify_csv_integrity(repair=True)
-    if not is_valid:
-        test_logger.error(f"Issues found: {', '.join(issues)}")
-        if repairs:
-            test_logger.warning(f"Repairs made: {', '.join(repairs)}")
-    else:
-        test_logger.info("CSV integrity verified, no issues found.")
     
     # Parse and save notices
     for test_case in test_cases:

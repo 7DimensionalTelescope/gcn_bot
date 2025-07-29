@@ -2817,7 +2817,7 @@ def process_notice_and_send_message(topic, value, slack_client, slack_channel, i
         
         if facility and trigger_num:
             try:
-                existing_event = notice_handler.get_existing_event(facility, trigger_num)
+                existing_event = notice_handler._find_existing_event(facility, trigger_num, return_full_data=True)
                 if existing_event:
                     existing_thread_ts = existing_event.get('thread_ts', '')
                     is_update = True
