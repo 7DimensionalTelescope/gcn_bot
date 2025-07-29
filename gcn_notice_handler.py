@@ -255,21 +255,6 @@ class GCNNoticeHandler:
         self.file_lock = Lock()
         self.strict_parsing = strict_parsing
         
-        # Unified caching system
-        # GRB name sequence tracking (date -> letter)
-        self._grb_name_cache = {}  # Format: {'PREFIX_YYMMDD': 'latest_letter'}
-        
-        # Name consistency cache (facility, trigger_num) -> name
-        self._name_cache = {}  # Format: {(facility, trigger_num): name}
-        
-        # ASCII entry cache to minimize file I/O
-        self._ascii_entry_cache = {}  # Format: {(facility, trigger_num): row_data}
-        
-        # Cache control
-        self._cache_loaded = False  # Indicates if the cache has been loaded
-        self._last_cache_refresh = datetime.now()  # For controlling refresh frequency
-        self._cache_refresh_interval = 300  # 5 minutes
-        
         # For CSV verification
         self._last_verification = None
         
@@ -456,8 +441,10 @@ class GCNNoticeHandler:
         """
         Generate a consistent name with different prefixes based on facility.
         - GRB YYMMDD[A-Z] for most events
-        - EP YYMMDD[a-z] for Einstein Probe events
+        - EP YYMMDD[a-z] for Einstein Probe events  
         - IceCube-YYMMDD[A-Z] for IceCube events
+        
+        Simplified version without caching - relies on file operations only.
         """
         # First check if this is an existing event
         if facility and trigger_num:
@@ -490,186 +477,100 @@ class GCNNoticeHandler:
             # Get date in YYMMDD format
             date_key = trigger_date.strftime('%y%m%d')
             
-            # Create a composite key that includes the prefix to separate naming sequences
-            sequence_key = f"{prefix}_{date_key}"
+            # Find next available letter by reading ASCII file (more efficient)
+            used_letters = set()
             
-            # Check if prefix_date exists in cache
-            if sequence_key in self._grb_name_cache:
-                letter = self._grb_name_cache[sequence_key]
-                
-                # Get next letter
-                next_idx = alphabet.index(letter) + 1
-                if next_idx < len(alphabet):
-                    next_letter = alphabet[next_idx]
-                else:
-                    next_letter = alphabet[-1]
-                
-                # Update cache
-                self._grb_name_cache[sequence_key] = next_letter
-                
-                # Format the name based on facility type
-                if name_format == "dash":
-                    new_name = f"{prefix}-{date_key}{next_letter}"
-                else:
-                    new_name = f"{prefix} {date_key}{next_letter}"
-                
-            else:
-                # New date, start with first letter of appropriate alphabet
-                first_letter = alphabet[0]
-                self._grb_name_cache[sequence_key] = first_letter
-                
-                # Format the name based on facility type
-                if name_format == "dash":
-                    new_name = f"{prefix}-{date_key}{first_letter}"
-                else:
-                    new_name = f"{prefix} {date_key}{first_letter}"
-            
-            # Update name cache if we have facility and trigger_num
-            if facility and trigger_num:
-                self._name_cache[(facility, str(trigger_num))] = new_name
-                
-            return new_name
-                
-        except Exception as e:
-            logger.error(f"Error generating {prefix} name from cache: {e}")
-            
-            # Fallback to file-based generation if cache fails
-            try:
-                with self.file_lock:
+            with self.file_lock:
+                if os.path.exists(self.output_ascii):
                     try:
-                        with open(self.output_csv, 'r') as f:
-                            # Get non-empty lines
-                            lines = [line.strip() for line in f.readlines() if line.strip()]
-                            if not lines:
-                                first_letter = alphabet[0]
-                                # Format based on facility
-                                if name_format == "dash":
-                                    return f"{prefix}-{trigger_date.strftime('%y%m%d')}{first_letter}"
-                                else:
-                                    return f"{prefix} {trigger_date.strftime('%y%m%d')}{first_letter}"
-                            
-                            # Start from last non-empty line
-                            for line in reversed(lines):
-                                try:
-                                    grb_name_idx = self.csv_columns.index('Name')
-                                    discovery_col_idx = self.csv_columns.index('Discovery_UTC')
-                                    
-                                    fields = line.split(',')
-                                    
-                                    # Parse date with multiple format support
-                                    date_str = fields[discovery_col_idx].strip('"').strip()
-                                    
-                                    # Try multiple date formats
-                                    date_formats = ['%Y-%m-%d %H:%M:%S.%f', '%Y-%m-%d %H:%M:%S', 
-                                                '%Y-%m-%d %H:%M:%S.%f    ', '%Y-%m-%d %H:%M:%S       ']
-                                    
-                                    line_date = None
-                                    for date_format in date_formats:
-                                        try:
-                                            logger.debug(f"Attempting to parse '{date_str}' with format '{date_format}'")
-                                            line_date = datetime.strptime(date_str, date_format)
-                                            logger.debug(f"Successfully parsed date: {line_date}")
-                                            break
-                                        except ValueError as e:
-                                            logger.debug(f"Format '{date_format}' failed: {e}")
-                                            continue
-                                    
-                                    if not line_date:
-                                        logger.warning(f"Could not parse date: {date_str}")
-                                        continue
-                                    
-                                    # If different date, start with appropriate first letter
-                                    if line_date.date() != trigger_date.date():
-                                        continue
-                                    
-                                    grb_name = fields[grb_name_idx].strip('"')
-                                    
-                                    # Only process lines that match our prefix
-                                    if not grb_name.startswith(f"{prefix} "):
-                                        continue
-                                        
-                                    # Extract the sequence letter
-                                    sequence_letter = grb_name[-1]
-                                    
-                                    # Determine the appropriate alphabet for this name
-                                    idx_alphabet = ascii_lowercase if prefix == "EP" else ascii_uppercase
-                                    
-                                    # If not final letter, use next letter
-                                    if sequence_letter != idx_alphabet[-1]:
-                                        try:
-                                            next_sequence = idx_alphabet.index(sequence_letter) + 1
-                                            if next_sequence < 26:
-                                                new_name = f"{prefix} {trigger_date.strftime('%y%m%d')}{idx_alphabet[next_sequence]}"
-                                                
-                                                # Update name cache if we have facility and trigger_num
-                                                if facility and trigger_num:
-                                                    self._name_cache[(facility, str(trigger_num))] = new_name
-                                                    
-                                                return new_name
-                                            else:
-                                                new_name = f"{prefix} {trigger_date.strftime('%y%m%d')}{idx_alphabet[-1]}"
-                                                
-                                                # Update name cache if we have facility and trigger_num
-                                                if facility and trigger_num:
-                                                    self._name_cache[(facility, str(trigger_num))] = new_name
-                                                    
-                                                return new_name
-                                        except ValueError:
-                                            # If we can't find the letter in the expected alphabet, start fresh
-                                            new_name = f"{prefix} {trigger_date.strftime('%y%m%d')}{idx_alphabet[0]}"
-                                            
-                                            # Update name cache if we have facility and trigger_num
-                                            if facility and trigger_num:
-                                                self._name_cache[(facility, str(trigger_num))] = new_name
-                                                
-                                            return new_name
-                                    
-                                    # If final letter, continue to next line
-                                    continue
-                                    
-                                except (IndexError, ValueError) as e:
-                                    logger.warning(f"Error processing line: {e}")
-                                    continue
-                            
-                            # If no matching entries are found
-                            if name_format == "dash":
-                                new_name = f"{prefix}-{trigger_date.strftime('%y%m%d')}{next_letter}"
-                            else:
-                                new_name = f"{prefix} {trigger_date.strftime('%y%m%d')}{next_letter}"
-                            
-                            # Update name cache if we have facility and trigger_num
-                            if facility and trigger_num:
-                                self._name_cache[(facility, str(trigger_num))] = new_name
-                                
-                            return new_name
-                            
-                    except (FileNotFoundError, pd.errors.EmptyDataError):
-                        first_letter = alphabet[0]
-                        if name_format == "dash":
-                            new_name = f"{prefix}-{trigger_date.strftime('%y%m%d')}{first_letter}"
-                        else:
-                            new_name = f"{prefix} {trigger_date.strftime('%y%m%d')}{first_letter}"
+                        # Use pandas for cleaner ASCII parsing
+                        df = pd.read_csv(self.output_ascii, sep=r'\s+', 
+                                    quotechar='"', quoting=csv.QUOTE_MINIMAL, 
+                                    dtype=str, na_filter=False)
                         
-                # Update name cache if we have facility and trigger_num
-                if facility and trigger_num:
-                    self._name_cache[(facility, str(trigger_num))] = new_name
-                    
-                return new_name
-                    
-            except Exception as nested_e:
-                logger.error(f"Error in fallback name generation: {nested_e}")
-                last_letter = alphabet[-1]
-                
-                if name_format == "dash":
-                    new_name = f"{prefix}-{trigger_date.strftime('%y%m%d')}{last_letter}"
-                else:
-                    new_name = f"{prefix} {trigger_date.strftime('%y%m%d')}{last_letter}"
-                
-                # Update name cache if we have facility and trigger_num
-                if facility and trigger_num:
-                    self._name_cache[(facility, str(trigger_num))] = new_name
-                    
-                return new_name
+                        if not df.empty and 'Name' in df.columns:
+                            # Check each row for matching names
+                            for _, row in df.iterrows():
+                                name_field = str(row.get('Name', '')).strip().strip('"')
+                                
+                                # Parse different name formats
+                                if prefix == "IceCube":
+                                    # IceCube-YYMMDD[A-Z] format
+                                    pattern = rf"^{prefix}-{date_key}([A-Z])$"
+                                else:
+                                    # GRB YYMMDD[A-Z] or EP YYMMDD[a-z] format
+                                    if prefix == "EP":
+                                        pattern = rf"^{prefix}\s+{date_key}([a-z])$"
+                                    else:
+                                        pattern = rf"^{prefix}\s+{date_key}([A-Z])$"
+                                
+                                match = re.match(pattern, name_field)
+                                if match:
+                                    letter = match.group(1)
+                                    if letter in alphabet:
+                                        used_letters.add(letter)
+                                        logger.debug(f"Found used letter: {letter}")
+                                        
+                    except Exception as e:
+                        logger.debug(f"Error reading ASCII file: {e}")
+                        # Fallback to simple file reading if pandas fails
+                        try:
+                            with open(self.output_ascii, 'r') as f:
+                                for line in f:
+                                    # Simple regex to extract names from any format
+                                    name_match = re.search(r'"?([^"]*(?:GRB|EP|IceCube)[^"]*)"?', line)
+                                    if name_match:
+                                        name_field = name_match.group(1).strip()
+                                        
+                                        if prefix == "IceCube":
+                                            pattern = rf"^{prefix}-{date_key}([A-Z])$"
+                                        else:
+                                            if prefix == "EP":
+                                                pattern = rf"^{prefix}\s+{date_key}([a-z])$"
+                                            else:
+                                                pattern = rf"^{prefix}\s+{date_key}([A-Z])$"
+                                        
+                                        match = re.match(pattern, name_field)
+                                        if match:
+                                            letter = match.group(1)
+                                            if letter in alphabet:
+                                                used_letters.add(letter)
+                        except Exception as nested_e:
+                            logger.debug(f"Fallback ASCII reading failed: {nested_e}")
+            
+            # Find next available letter
+            next_letter = alphabet[0]  # Default to first letter
+            for letter in alphabet:
+                if letter not in used_letters:
+                    next_letter = letter
+                    logger.debug(f"Next available letter: {letter}")
+                    break
+            else:
+                # If all letters are used, use the last one (shouldn't happen normally)
+                next_letter = alphabet[-1]
+                logger.warning(f"All letters used for {prefix} {date_key}, using last letter")
+            
+            # Format the name based on facility type
+            if name_format == "dash":
+                new_name = f"{prefix}-{date_key}{next_letter}"
+            else:
+                new_name = f"{prefix} {date_key}{next_letter}"
+            
+            logger.info(f"Generated new name: {new_name}")
+            return new_name
+            
+        except Exception as e:
+            logger.error(f"Error generating {prefix} name: {e}")
+            
+            # Fallback: use 'A' or 'a' as first letter
+            first_letter = alphabet[0]
+            if name_format == "dash":
+                fallback_name = f"{prefix}-{date_key}{first_letter}"
+            else:
+                fallback_name = f"{prefix} {date_key}{first_letter}"
+            
+            logger.warning(f"Using fallback name: {fallback_name}")
+            return fallback_name
 
     @staticmethod
     def _normalize_error_to_deg(value, unit):
@@ -1656,21 +1557,33 @@ ERROR_RADIUS:   0.5 [deg]"""
         else:
             test_logger.error("Parsing failed!")
     
-    # Test caching mechanism
-    test_logger.info("\nTesting GRB name cache...")
-    # Reset cache to force initialization
-    handler._cache_loaded = False
-    handler._grb_name_cache = {}
-    
-    # Generate a name and check cache
+    # Test GRB name generation
+    test_logger.info("\nTesting GRB name generation...")
+
+    # Generate a name and test
     test_date = datetime.now()
     name1 = handler._generate_grb_name(test_date)
-    test_logger.info(f"Generated name from empty cache: {name1}")
-    test_logger.info(f"Cache contents: {handler._grb_name_cache}")
-    
-    # Generate another name for same date
+    test_logger.info(f"Generated name: {name1}")
+
+    # Generate another name for same date - should increment letter
     name2 = handler._generate_grb_name(test_date)
     test_logger.info(f"Generated second name for same date: {name2}")
-    test_logger.info(f"Cache contents: {handler._grb_name_cache}")
+
+    # Test different facility types
+    test_logger.info("\nTesting different facility types...")
+
+    # Einstein Probe
+    ep_name = handler._generate_grb_name(test_date, facility="EinsteinProbe")
+    test_logger.info(f"Einstein Probe name: {ep_name}")
+
+    # IceCube
+    icecube_name = handler._generate_grb_name(test_date, facility="IceCubeGOLD")
+    test_logger.info(f"IceCube name: {icecube_name}")
+
+    # Regular GRB
+    grb_name = handler._generate_grb_name(test_date, facility="SwiftXRT")
+    test_logger.info(f"Swift GRB name: {grb_name}")
+
+    test_logger.info("\nName generation test complete!")
     
     test_logger.info("\nTest complete! Check the output files for results.")
