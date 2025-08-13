@@ -1408,7 +1408,7 @@ class GCNNoticeHandler:
                 if len(df) > self.ascii_max_events:
                     # Sort by Notice_date directly without creating temporary column
                     df['_sort_key'] = pd.to_datetime(df['Notice_date'].str.strip('"'), errors='coerce')
-                    df = df.sort_values('_sort_key', ascending=False, na_last=True).head(self.ascii_max_events)
+                    df = df.sort_values('_sort_key', ascending=False, na_position='last').head(self.ascii_max_events)
                     df = df.drop('_sort_key', axis=1)
                     logger.info(f"Kept {self.ascii_max_events} most recent events")
 
