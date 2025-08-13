@@ -896,6 +896,7 @@ class SlackToOIntegration:
                 'singleExposure': int(form_data['exposure']),  # Single exposure time
                 'imageCount': int(form_data['imageCount']),
                 'obsmode': form_data['obsmode'],
+                'specmode': form_data['specmode'],
                 'selectedFilters': form_data['selectedFilters'],
                 'priority': form_data['priority'],
                 'binning': form_data['binning'],
@@ -2438,18 +2439,18 @@ def _send_too_email_if_criteria_met(notice_data: Dict[str, Any], visibility_info
         
         # Use base ToO config and add the specific reason
         custom_too_config = TOO_CONFIG.copy()
-        custom_too_config['additional_comments'] = f"ToO Reason: {reason}"
+        custom_too_config['comment'] = f"ToO Reason: {reason}"
         
         if visibility_info and visibility_info.get('status') == 'observable_now':
             # High priority for currently observable targets
             custom_too_config.update({
-                'priority': 'URGENT',
+                'priority': '50',
                 'abortObservation': 'No'
             })
         else:
             # Normal priority for other cases
             custom_too_config.update({
-                'priority': 'NORMAL',
+                'priority': '40',
                 'abortObservation': 'No'
             })
         
@@ -2557,19 +2558,19 @@ def setup_slack_handlers():
             
             # Create custom ToO configuration for this specific request
             custom_too_config = {
-                'singleExposure': int(email_data['singleExposure']),
-                'imageCount': int(email_data['imageCount']),
+                'exptime': int(email_data['singleExposure']),
+                'count': int(email_data['imageCount']),
                 'obsmode': email_data['obsmode'],
-                'selectedFilters': email_data['selectedFilters'],
+                'specmode': email_data['specmode'],
+                'filters': email_data['selectedFilters'],
                 'selectedTelNumber': email_data.get('selectedTelNumber', 1),
-                'abortObservation': email_data['abortObservation'],
+                'abortobservation': email_data['abortObservation'],
                 'priority': email_data['priority'],
                 'gain': email_data['gain'],
-                'radius': email_data.get('radius', '0'),
                 'binning': email_data['binning'],
-                'obsStartTime': email_data.get('obsStartTime', 'ASAP'),
-                'additional_comments': f"Submitted via Slack by {user_name} ({user_email})"
-            }
+                'obs_starttime': email_data.get('obsStartTime', 'ASAP'),
+                'comment': f"Submitted via Slack by {user_name} ({user_email})"
+            }   
             
             # Send ToO email using the existing emailer infrastructure
             email_success = emailer.send_too_email(
