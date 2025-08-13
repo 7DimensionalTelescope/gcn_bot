@@ -1,16 +1,15 @@
 #!/usr/bin/env python3
 """
-GCN Alert Monitoring System
-==========================
+GCN Alert Monitoring System with ToO Integration
+===============================================
 A real-time monitoring system for GCN (Gamma-ray Coordinates Network) alerts 
-with Slack bot and data storage capabilities.
+with Slack bot integration, data storage, and Target of Opportunity (ToO) request capabilities.
 
 Basic Information
 ----------------
 Author:         YoungPyo Hong
 Created:        2025-01-01
-Last Modified:  2025-03-06
-Version:        1.3.0
+Version:        2.0.0
 License:        MIT
 Copyright:      (c) 2025 YoungPyo Hong
 
@@ -27,52 +26,70 @@ Dependencies:
         - re:            Regular expression operations
         - threading:     Concurrent processing
         - datetime:      Time handling
+        - typing:        Type hints support
     2. Optional modules
         - gcn_notice_handler: Save GCN notice data to a CSV file (user module)
         - visibility_plotter: Create visibility plots for Slack (user module)
+        - astropy:       Astronomical calculations
+        - pytz:          Timezone handling
+        - tzlocal:       Local timezone detection
 
 Key Features
 -----------
 Real-time Monitoring:
-    - Continuous connection status monitoring
-    - Heartbeat message tracking
-    - Automatic reconnection handling
+    - Continuous connection status monitoring with automatic reconnection
+    - Heartbeat message tracking with detailed status reporting
+    - Multi-threaded processing for handling multiple alerts
 
 Data Processing:
-    - Classic text format support
-    - Modern JSON format support
-    - Test notice filtering
-    - Redundant data elimination
-    - Section-based message formatting
-    - Critical information highlighting
+    - Support for both classic text and modern JSON formats
+    - Advanced filtering of test and redundant notices
+    - Section-based message formatting with emoji support
+    - Critical information highlighting and prioritization
+    - 4-case visibility system for target observation planning
 
 Alert Management:
-    - Formatted Slack notifications with sections
-    - Connection status updates
-    - Error handling and reporting
-    - CSV and ASCII data storage for GRB events
+    - Rich Slack message formatting with interactive elements
+    - Threaded conversations for follow-up observations
+    - Automatic ToO request generation based on criteria
+    - Comprehensive error handling and status reporting
+    - CSV and ASCII data storage for GRB events with deduplication
+
+ToO (Target of Opportunity) Integration:
+    - Interactive Slack buttons for ToO requests
+    - Role-based access control for ToO submission
+    - Customizable observation parameters
+    - Automated email notifications for ToO approvals
+    - Form validation and error handling
 
 Usage
 -----
 Command:
     python gcn_bot.py
     
-Configuration:
-    1. Connection settings
-        - CONNECTION_TIMEOUT: Connection timeout in seconds
+Configuration (config.py):
+    1. Slack Integration
+        - SLACK_TOKEN:        Bot user OAuth token
+        - SLACK_CHANNEL:      Default channel for alerts
+        - SLACK_APP_TOKEN:    App-level token for WebSocket
+        - TOO_USER_GROUP:     Authorized user group for ToO requests
     
-    2. Slack configuration
-        - SLACK_TOKEN:        Slack bot authentication token
-        - SLACK_CHANNEL:      Slack channel name
+    2. GCN Configuration
+        - GCN_ID:             Client identifier
+        - GCN_SECRET:         Client authentication secret
+        - DISPLAY_TOPICS:     List of topics to monitor
     
-    3. GCN configuration
-        - GCN_ID:             GCN client identifier
-        - GCN_SECRET:         GCN client authentication secret
-    
-    4. GCNNoticeHandler configuration (optional)
+    3. Data Handling
         - TURN_ON_NOTICE:     Enable notice saving
-        - OUTPUT_NOTICE_CSV:         CSV file to store the processed notices
-        - OUTPUT_ASCII:       ASCII file to store the events
+        - OUTPUT_CSV:         CSV file for processed notices
+        - OUTPUT_ASCII:       ASCII file for GRB events
+        - ASCII_MAX_EVENTS:   Maximum events to store in ASCII file
+    
+    4. ToO Configuration
+        - TURN_ON_TOO_EMAIL:  Enable email notifications
+        - EMAIL_FROM:         Sender email address
+        - EMAIL_PASSWORD:     Email account password
+        - TOO_CONFIG:         Default observation parameters
 
 Monitored Facilities
 -------------------
@@ -99,58 +116,42 @@ Notices are formatted in a structured way with these sections:
     - [BASIC INFO]:    Title, notice date, notice type, trigger information
     - [LOCATION]:      Coordinates (RA/Dec), error radius
     - [TIMING]:        Discovery date/time or trigger time
-    - [ANALYSIS]:      Energy, significance, intensity values, etc.
+    - [ANALYSIS]:      Energy, significance, intensity values
+    - [VISIBILITY]:    Observation conditions and visibility window
     - [COMMENTS]:      Original comments with bullet points
-    - [ADDITIONAL INFO]: Extra facility-specific information
+    - [ADDITIONAL INFO]: Facility-specific information
 
-Important decision-making information is highlighted in bold.
+ToO Request Features:
+    - Interactive modal forms for observation parameters
+    - Real-time form validation
+    - Observation preview with visibility analysis
+    - Email notifications with observation details
+    - Automated follow-up scheduling
 
 Change Log
 ----------
+2.0.0 / 2025-08-01
+    - Added comprehensive ToO integration with Slack
+    - Implemented 4-case visibility system
+    - Added role-based access control
+    - Enhanced error handling and logging
+    - Improved message formatting with emoji support
+
 1.3.0 / 2025-03-06
     - Implemented section-based message formatting
     - Added bold highlighting for critical information
-    - Removed unnecessary message content
-    - Added facility name to message headers
     - Improved JSON notice formatting
-
-1.2.1 / 2025-02-05
-    - Added logging for better error handling
 
 1.2.0 / 2025-01-31
     - Enhanced message handling system
-        * Added '_format_json_message' function for better JSON formatting
-        * Improved structured message formatting for Einstein Probe and IceCube
     - Improved error handling and notifications
-        * Added detailed consumer error notifications to Slack
-        * Enhanced connection status messages with detailed timestamps
-    - Enhanced Slack message formatting
-        * Restructured message blocks for better readability
-        * Added status tracking in message footer
-    - Modified configuration settings
-        * Removed unused time window parameter
-        * Updated documentation to reflect current functionality
+    - Restructured message blocks for better readability
 
-1.1.1 / 2025-01-23: 
-    - Added configuration setting
-    - Added information of gcn_notice_handler in the documentation
+1.1.0 / 2025-01-21
+    - Integrated GCNNoticeHandler for GRB data processing
+    - Added CSV and ASCII data storage
 
-1.1.0 / 2025-01-21: 
-    - Integrated GCNNoticeHandler for GRB data processing and storage
-
-1.0.3 / 2025-01-19: 
-    - Added '_get_facility_name' function for extracting facility name from topic
-    - Modified 'format_message_for_slack' function to handle JSON format
-
-1.0.2 / 2025-01-08: 
-    - Added JSON format message handling
-    - Enhancing GCN server status monitoring using 'gcn.heartbeat'
-    - Organized the comments of topics
-
-1.0.1 / 2025-01-05: 
-    - Implemented connection monitoring
-
-1.0.0 / 2025-01-01:
+1.0.0 / 2025-01-01
     - Initial version release
 """
 from io import BytesIO
