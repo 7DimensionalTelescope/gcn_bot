@@ -188,9 +188,9 @@ logging.getLogger('kafka').setLevel(logging.ERROR)
 ############################## Imports ############################
 # Try to import visibility_plotter
 try:
-    from supy.supy.observer.visibility_plotter import VisibilityPlotter
+    from supy.supy.observer.plotter import VisibilityPlotter
     # Initialize the plotter
-    plotter = VisibilityPlotter(logger=logger)
+    plotter = VisibilityPlotter()
     visibility_available = True
 except ImportError as e:
     logger.warning(f"visibility_plotter module not available. Visibility plots will be disabled. Error: {e}")
@@ -2808,30 +2808,13 @@ def process_notice_and_send_message(topic, value, slack_client, slack_channel, i
                 logger.info(f"Generating visibility analysis for {notice_data.get('Name', 'target')}")
                 
                 # New visibility plotter handles all 4 cases internally
-                result = plotter.create_visibility_plot(
+                plot_path, visibility_info = plotter.create_plot(
                     ra=ra,
                     dec=dec,
-                    grb_name=notice_data.get('Name', ''),
-                    test_mode=is_test,
-                    minalt=MIN_ALTITUDE,
-                    minmoonsep=MIN_MOON_SEP
+                    target_name=notice_data.get('Name', ''),
+                    min_altitude=MIN_ALTITUDE,
+                    min_moon_separation=MIN_MOON_SEP
                 )
-                
-                if isinstance(result, tuple) and len(result) == 2:
-                    plot_path, visibility_info = result
-                    notice_data['visibility_info'] = visibility_info  # Store for comparison
-                
-                # Log the determined status
-                if visibility_info:
-                    status = visibility_info.get('status', 'unknown')
-                    logger.info(f"Visibility status determined: {status}")
-                    
-                    if status == 'not_observable':
-                        logger.info("No plot generated - target not observable")
-                    elif status == 'observable_tomorrow':
-                        logger.info("Generated tomorrow's sky plot with warning label")
-                    else:
-                        logger.info(f"Generated today's plot (show_current_time={status=='observable_now'})")
                 
             except Exception as e:
                 logger.error(f"Error creating visibility plot: {e}")
@@ -2870,7 +2853,7 @@ def process_notice_and_send_message(topic, value, slack_client, slack_channel, i
                         if 'coordinates' in differences and plot_path and os.path.exists(plot_path):
                             try:
                                 plot_title = f"Updated Visibility Plot: {notice_data.get('Name', 'Target')}"
-                                if visibility_info and visibility_info.get('showing_tomorrow'):
+                                if visibility_info and visibility_info.get('next_opportunity'):
                                     plot_title += " (Tomorrow's Sky)"
                                 
                                 slack_client.files_upload_v2(
@@ -2921,7 +2904,7 @@ def process_notice_and_send_message(topic, value, slack_client, slack_channel, i
                 # Add visibility blocks if available
                 visibility_blocks = []
                 if visibility_info:
-                    visibility_text = plotter.format_visibility_message(visibility_info)
+                    visibility_text = plotter.format_message(visibility_info)
                     visibility_blocks = [
                         {"type": "divider"},
                         {
@@ -3159,7 +3142,7 @@ def main():
                         continue
                     
                     # For topic logging
-                    logger.info('topic=%s, offset=%d', topic, message.offset())
+                    logger.info("========== Processing message from topic: %s =========", topic)
                     logger.debug("Message value: %s", value)
                     
                     # Process notice and send message
@@ -3169,11 +3152,11 @@ def main():
                         )
                         
                         if success:
-                            logger.info(f"Successfully processed notice from {topic}")
+                            logger.info(f"========== Successfully processed notice from {topic} =========")
                         else:
-                            logger.warning(f"Issue processing notice from {topic}: {response}")
+                            logger.warning(f"========== Issue processing notice from {topic}: {response} =========")
                     except Exception as process_error:
-                        logger.error(f"Error processing message from {topic}: {process_error}", exc_info=True)
+                        logger.error(f"========== Error processing message from {topic}: {process_error} =========", exc_info=True)
                     
             except Exception as e:
                 consecutive_errors += 1
