@@ -174,6 +174,8 @@ import pandas as pd
 import re
 import os
 import csv
+import shutil
+import glob
 from datetime import datetime
 from threading import Lock
 from typing import Dict, Any, Optional, Union, List, Tuple
@@ -374,7 +376,69 @@ class GCNNoticeHandler:
             if any(t in topic for t in topics):
                 return facility
         return None
-
+    
+    def _find_existing_event(self, facility: str, trigger_num: str, return_full_data: bool = False) -> Optional[Union[str, Dict[str, Any]]]:
+        """
+        Unified method to find existing event from ASCII file.
+        
+        Args:
+            facility (str): The facility name
+            trigger_num (str): The trigger number
+            return_full_data (bool): If True, return full event data; if False, return only GRB name
+            
+        Returns:
+            Optional[Union[str, Dict[str, Any]]]: 
+                - If return_full_data=False: GRB name (str) or None
+                - If return_full_data=True: Full event data (dict) or None
+        """
+        if not facility or not trigger_num:
+            return None
+            
+        try:
+            # Load ASCII file directly without caching
+            if not os.path.exists(self.output_ascii):
+                logger.info(f"ASCII file does not exist: {self.output_ascii}")
+                return None
+                
+            df = pd.read_csv(self.output_ascii, sep=r'\s+', 
+                            quotechar='"', quoting=csv.QUOTE_MINIMAL, 
+                            dtype=str, na_filter=False)
+            
+            if df.empty:
+                logger.info("ASCII file is empty")
+                return None
+            
+            # Normalize the search facility name
+            normalized_facility = self._normalize_facility_name(facility)
+            
+            # Search for matching event
+            for _, row in df.iterrows():
+                # Handle both old and new column formats for backward compatibility
+                row_facility = str(row.get('Primary_Facility', row.get('Facility', ''))).strip()
+                row_trigger = str(row.get('Trigger_num', '')).strip()
+                
+                # Normalize the row facility name for comparison
+                normalized_row_facility = self._normalize_facility_name(row_facility)
+                
+                # Check if facility and trigger number match
+                if (normalized_row_facility == normalized_facility and 
+                    row_trigger == str(trigger_num)):
+                    
+                    if return_full_data:
+                        logger.info(f"Found existing event for {facility} trigger {trigger_num}, thread_ts: {row.get('thread_ts', '')}")
+                        return row.to_dict()
+                    else:
+                        grb_name = row.get('Name', '')
+                        logger.info(f"Found existing event: {grb_name} for {facility} trigger {trigger_num} (matched with {row_facility})")
+                        return grb_name
+            
+            logger.info(f"No existing event found for {facility} trigger {trigger_num}")
+            return None
+            
+        except Exception as e:
+            logger.error(f"Error finding existing event: {e}")
+            return None
+        
     def _generate_grb_name(self, trigger_date: datetime, facility: str, df: pd.DataFrame) -> str:
         """
         Generate a consistent name with different prefixes based on facility.
@@ -1105,7 +1169,6 @@ class GCNNoticeHandler:
 
 #---------------------------------------Test Code----------------------------------------
 if __name__ == "__main__":
-    import shutil
     
     ######################## Setup for test ########################
     
