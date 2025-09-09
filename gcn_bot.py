@@ -2748,7 +2748,7 @@ def setup_slack_handlers():
             except Exception as notification_error:
                 logger.error(f"Failed to send error notification to user: {notification_error}")
 
-def process_notice_and_send_message(topic, value, slack_client, slack_channel, is_test=False):
+def process_notice_and_send_message(topic, value, slack_client, slack_channel, too_integration=too_integration, is_test=False):
     """
     Process a GCN notice and send to Slack with visibility plot.
     Updated to work seamlessly with new 4-case visibility system.
