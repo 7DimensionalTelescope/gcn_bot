@@ -1101,7 +1101,8 @@ def _filter_notice_text(text, topic):
         if "LC_URL:" in line:
             match = re.search(r"LC_URL:\s*([^\s]+)", line)
             if match:
-                lc_url = match.group(1)
+                original_lc_url = match.group(1)
+                lc_url = original_lc_url.replace("medres34", "all").replace("http://", "https://")
 
     # Process each line
     for line in lines:
