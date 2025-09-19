@@ -155,6 +155,7 @@ Change Log
 """
 from io import BytesIO
 from datetime import datetime, timezone
+from config import SLACK_CHANNEL_TEST
 from gcn_kafka import Consumer
 from slack_sdk import WebClient
 from slack_sdk.errors import SlackApiError
@@ -224,9 +225,11 @@ class Config:
     OUTPUT_CSV = 'gcn_notices.csv'
     OUTPUT_ASCII = 'grb_targets.ascii'
     ASCII_MAX_EVENTS = 10
-    TURN_ON_TOO_EMAIL = False
+    TURN_ON_TOO_EMAIL_SLACK = False
+    TURN_ON_TOO_EMAIL_AUTO = False
     EMAIL_FROM = "your_email@example.com"
     EMAIL_PASSWORD = "your_email_password"
+    EMAIL_TO = 'your_email@example.com'
     TOO_CONFIG = {
         'singleExposure': 100,
         'imageCount': 3,
@@ -287,9 +290,11 @@ CONNECTION_TIMEOUT = config.CONNECTION_TIMEOUT
 MIN_ALTITUDE = config.MIN_ALTITUDE
 MIN_MOON_SEP = config.MIN_MOON_SEP
 TURN_ON_NOTICE = config.TURN_ON_NOTICE
-TURN_ON_TOO_EMAIL = config.TURN_ON_TOO_EMAIL
+TURN_ON_TOO_EMAIL_SLACK = config.TURN_ON_TOO_EMAIL_SLACK
+TURN_ON_TOO_EMAIL_AUTO = config.TURN_ON_TOO_EMAIL_AUTO
 EMAIL_FROM = config.EMAIL_FROM
 EMAIL_PASSWORD = config.EMAIL_PASSWORD
+EMAIL_TO = config.EMAIL_TO
 TOO_CONFIG = config.TOO_CONFIG
 SLACK_TOKEN = config.SLACK_TOKEN
 SLACK_CHANNEL = config.SLACK_CHANNEL
@@ -641,6 +646,25 @@ class SlackToOIntegration:
                     }
                 },
                 
+                # Spec mode
+                {
+                    "type": "input",
+                    "block_id": "specmode_block",
+                    "element": {
+                        "type": "plain_text_input",
+                        "action_id": "specmode_input",
+                        "initial_value": "specall",
+                        "placeholder": {
+                            "type": "plain_text",
+                            "text": "specall"
+                        }
+                    },
+                    "label": {
+                        "type": "plain_text",
+                        "text": "Spec Mode *"
+                    }
+                },
+                
                 # Filters selection
                 {
                     "type": "input",
@@ -833,8 +857,10 @@ class SlackToOIntegration:
                 'ra': form_values['ra_block']['ra_input']['value'],
                 'dec': form_values['dec_block']['dec_input']['value'],
                 'exposure': form_values['exposure_block']['exposure_input']['value'],
+                'singleExposure': form_values['exposure_block']['exposure_input']['value'],
                 'imageCount': form_values['count_block']['count_input']['value'],
                 'obsmode': form_values['obsmode_block']['obsmode_input']['selected_option']['value'],
+                'specmode': form_values['specmode_block']['specmode_input']['value'],
                 'priority': form_values['priority_block']['priority_input']['selected_option']['value'],
                 'binning': form_values['binning_block']['binning_input']['selected_option']['value'],
                 'gain': form_values['gain_block']['gain_input']['selected_option']['value'],
@@ -858,85 +884,58 @@ class SlackToOIntegration:
     
     def convert_slack_form_to_email_data(self, form_data: Dict[str, Any], 
                                     user_name: str, user_email: str,
-                                    notice_data: Dict[str, Any]) -> Dict[str, Any]:
+                                    notice_data: Dict[str, Any],
+                                    email_to: Optional[List[str]] = "evan77333@gmail.com") -> Dict[str, Any]:
         """
-        Enhanced version of convert_slack_form_to_email_data method for SlackToOIntegration class.
-        
-        This function converts Slack modal form data to the exact format expected by 
-        GCNToOEmailer.send_too_email() method.
-        
-        Args:
-            form_data: Data extracted from Slack modal submission
-            user_name: Display name of user who submitted form
-            user_email: Email address of user who submitted form
-            notice_data: Original GCN notice data
-            
-        Returns:
-            Dictionary formatted for GCNToOEmailer.send_too_email()
+        Convert Slack form to email data using centralized logic.
         """
         try:
-            # Get current timestamp for submission
-            submission_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S UTC')
+            # Initialize temporary emailer for data preparation
+            emailer = GCNToOEmailer(
+                email_from=user_email,
+                email_to=email_to,
+                email_password=""  # Not needed for data prep
+            )
             
-            # Create email data structure expected by GCNToOEmailer
-            email_data = {
-                # User and submission info
-                'requester': user_email,
-                'submitter_name': user_name,
-                'submission_time': submission_time,
-                'submitted_via': 'Slack Bot',
-                
-                # Target information (required fields)
-                'target': form_data['target'],
-                'ra': form_data['ra'],
-                'dec': form_data['dec'],
-                
-                # Observation parameters
-                'exposure': int(form_data['exposure']) * int(form_data['imageCount']),  # Total exposure
-                'singleExposure': int(form_data['exposure']),  # Single exposure time
+            # Build too_config from form
+            too_config = {
+                'singleExposure': int(form_data['exposure']),
                 'imageCount': int(form_data['imageCount']),
-                'obsmode': form_data['obsmode'],
-                'specmode': form_data['specmode'],
-                'selectedFilters': form_data['selectedFilters'],
+                'obsmode': form_data.get('obsmode', 'Spec'),
+                'specmode': form_data.get('specmode', 'specall.specmode'),
+                'selectedFilters': form_data.get('selectedFilters', ['g', 'r', 'i']),
                 'priority': form_data['priority'],
                 'binning': form_data['binning'],
                 'gain': form_data['gain'],
                 'abortObservation': form_data['abortObservation'],
-                
-                # Additional fields for tcspy compatibility
-                'selectedTelNumber': 1,  # Default to 1 telescope
-                'radius': '0',  # Default radius
-                'obsStartTime': 'ASAP',  # Immediate start
-                'is_ToO': True,  # Always true for ToO requests
-                
-                # Include original notice info if available
-                'original_facility': notice_data.get('Facility', 'Unknown'),
-                'original_trigger': notice_data.get('Trigger_num', 'Unknown'),
-                'gcn_notice_type': notice_data.get('Notice_type', 'Unknown')
+                'comment': form_data.get('comments', '')
             }
             
-            # Handle comments with Slack-specific information
-            base_comments = form_data.get('comments', '')
-            slack_info = f"Submitted via Slack Bot by {user_name} ({user_email}) at {submission_time}"
+            # Merge notice data with form data
+            combined_data = {
+                'target': form_data['target'],
+                'ra': form_data['ra'],
+                'dec': form_data['dec'],
+                'Name': form_data['target'],
+                'RA': form_data['ra'],
+                'DEC': form_data['dec'],
+                'Facility': notice_data.get('Facility', 'Manual'),
+                'Trigger_num': notice_data.get('Trigger_num', 'N/A'),
+            }
             
-            if base_comments:
-                email_data['comments'] = f"{base_comments}\n\n--- Submission Info ---\n{slack_info}"
-            else:
-                email_data['comments'] = slack_info
-                
-            # Validate required fields
-            required_fields = ['target', 'ra', 'dec', 'requester']
-            missing_fields = [field for field in required_fields if not email_data.get(field)]
+            # Use centralized preparation
+            email_data = emailer.prepare_email_data(
+                combined_data,
+                too_config,
+                requester_email=user_email,
+                submitter_info={'name': user_name, 'email': user_email}
+            )
             
-            if missing_fields:
-                logger.error(f"Missing required fields in email data: {missing_fields}")
-                return {}
-                
-            logger.info(f"Successfully converted Slack form data to email format for target: {email_data['target']}")
+            logger.info(f"Successfully prepared email data for {email_data.get('target', 'Unknown')}")
             return email_data
             
         except Exception as e:
-            logger.error(f"Error converting Slack form data to email format: {e}")
+            logger.error(f"Error converting Slack form data: {e}", exc_info=True)
             return {}
 
 ############################## Initialize Clients ############################
@@ -2347,121 +2346,45 @@ def _format_thread_message(differences: Dict[str, Any], notice_data: Dict[str, A
         logger.error(f"Error formatting thread message: {e}")
         return f"🔄 *UPDATE: {notice_data.get('Facility', 'Unknown')}*\n> - ℹ️ *Status:* Updated information received"
 
-def _evaluate_too_criteria(notice_data: Dict[str, Any], visibility_info: Optional[Dict[str, Any]]) -> Tuple[bool, str]:
+def _send_too_email_if_criteria_met(notice_data: Dict[str, Any], 
+                                   visibility_info: Optional[Dict[str, Any]]) -> None:
     """
-    Evaluate whether a ToO request should be sent based on specific criteria.
-    Updated to work with new 4-case visibility system.
-    
-    Args:
-        notice_data: Parsed notice data
-        visibility_info: Visibility analysis information
-        
-    Returns:
-        Tuple[bool, str]: (should_send, reason)
+    Send ToO email if criteria are met using centralized logic.
     """
-    if not notice_data:
-        return False, "No notice data available"
-    
-    facility = notice_data.get('Facility', '')
-    target_name = notice_data.get('Name', 'Unknown Target')
-    
-    # Criteria 1: Currently observable targets with good conditions
-    if visibility_info:
-        status = visibility_info.get('status')
-        
-        if status == 'observable_now':
-            remaining_hours = visibility_info.get('remaining_hours', 0)
-            current_altitude = visibility_info.get('current_altitude', 0)
-            
-            # Only send ToO if we have sufficient time and good altitude
-            if remaining_hours >= 1.0 and current_altitude >= 30:
-                logger.info(f"ToO Criteria Met - Currently Observable: {target_name}")
-                return True, "Currently Observable with Good Conditions"
-            else:
-                logger.debug(f"Target observable but limited conditions (alt={current_altitude:.1f}°, {remaining_hours:.1f}h remaining)")
-                return False, f"Observable but limited conditions (alt={current_altitude:.1f}°, {remaining_hours:.1f}h remaining)"
-        
-        elif status == 'observable_later':
-            # For targets observable later tonight, only send ToO if:
-            # 1. Will be observable within 2 hours
-            # 2. Will have decent altitude when observable
-            hours_until = visibility_info.get('hours_until_observable', 999)
-            observable_hours = visibility_info.get('observable_hours', 0)
-            
-            if hours_until <= 2.0 and observable_hours >= 2.0:
-                logger.info(f"ToO Criteria Met - Observable Soon: {target_name}")
-                return True, f"Observable in {hours_until:.1f} hours"
-            else:
-                logger.debug(f"Target observable later but not urgent (in {hours_until:.1f}h, for {observable_hours:.1f}h)")
-                return False, f"Observable later but not urgent (in {hours_until:.1f}h)"
-        
-        elif status == 'observable_tomorrow':
-            # Generally don't send immediate ToO for tomorrow targets
-            # unless it's a very special case (handled above for neutrinos)
-            logger.debug(f"Target observable tomorrow - no immediate ToO needed")
-            return False, "Observable tomorrow - plan for next night"
-        
-        else:  # not_observable
-            logger.debug(f"Target not observable - no ToO possible")
-            return False, f"Not observable from Chile"
-    
-    # Default: No criteria met
-    logger.debug(f"No ToO criteria met for {facility} event")
-    return False, f"No immediate ToO criteria met for {facility} event"
-
-def _send_too_email_if_criteria_met(notice_data: Dict[str, Any], visibility_info: Optional[Dict[str, Any]]) -> None:
-    """
-    Send ToO email if specific criteria are met.
-    Updated to work with new 4-case visibility system.
-    
-    Args:
-        notice_data: Parsed notice data
-        visibility_info: Visibility analysis information
-    """
-    if not TURN_ON_TOO_EMAIL:
+    if not TURN_ON_TOO_EMAIL_AUTO:
         return
-        
-    # Evaluate ToO criteria
-    should_send, reason = _evaluate_too_criteria(notice_data, visibility_info)
     
-    if not should_send:
-        logger.debug(f"ToO not sent: {reason}")
-        return
-        
-    try:        
+    try:
         # Initialize emailer
         emailer = GCNToOEmailer(
             email_from=EMAIL_FROM,
-            email_to=["7dt.observation.alert@gmail.com"],
+            email_to=EMAIL_TO,  # Test email as requested
             email_password=EMAIL_PASSWORD,
             min_altitude=MIN_ALTITUDE,
             min_moon_sep=MIN_MOON_SEP
         )
         
-        # Use base ToO config and add the specific reason
-        custom_too_config = TOO_CONFIG.copy()
-        custom_too_config['comment'] = f"ToO Reason: {reason}"
+        # Use centralized evaluation logic
+        should_send, reason, too_config = emailer.evaluate_too_criteria(
+            notice_data, 
+            visibility_info
+        )
         
-        if visibility_info and visibility_info.get('status') == 'observable_now':
-            # High priority for currently observable targets
-            custom_too_config.update({
-                'priority': '50',
-                'abortObservation': 'No'
-            })
-        else:
-            # Normal priority for other cases
-            custom_too_config.update({
-                'priority': '40',
-                'abortObservation': 'No'
-            })
+        if not should_send:
+            logger.debug(f"ToO not sent: {reason}")
+            return
         
-        # Send ToO request
-        email_sent = emailer.process_notice(notice_data, custom_too_config, visibility_info)
+        # Add the reason to config
+        too_config['comment'] = f"Automatic ToO - {reason}"
+        
+        # Prepare and send email using centralized methods
+        email_data = emailer.prepare_email_data(notice_data, too_config)
+        email_sent = emailer.send_too_email(email_data)
         
         if email_sent:
-            logger.info(f"ToO email sent for {notice_data.get('Name', 'target')} - Reason: {reason}")
+            logger.info(f"ToO email sent for {notice_data.get('Name', 'target')} - {reason}")
         else:
-            logger.warning(f"ToO email failed to send for {notice_data.get('Name', 'target')} - Reason: {reason}")
+            logger.warning(f"ToO email failed for {notice_data.get('Name', 'target')}")
             
     except Exception as e:
         logger.error(f"Error sending ToO email: {e}")
@@ -2474,29 +2397,40 @@ def setup_slack_handlers():
     @app.view("too_request_modal")
     def handle_too_modal(ack, body, client):
         """
-        Handle modal submissions - Phase 3: Send actual emails using GCNToOEmailer
+        Handle ToO modal submissions - Process form and send email requests.
         
-        This function processes Slack ToO form submissions and sends actual emails
-        to the observation team using the existing GCNToOEmailer infrastructure.
+        This function:
+        1. Acknowledges the modal submission
+        2. Extracts and validates form data
+        3. Prepares email using centralized logic
+        4. Sends email to observation team
+        5. Posts confirmation or error messages to Slack
         """
+        # Acknowledge the modal submission immediately (required within 3 seconds)
         ack()
         
         try:
+            # Extract basic information from the submission
             view = body['view']
             user_id = body['user']['id']
-            thread_ts = body.get('message', {}).get('ts')  # For threaded responses
             
-            # Extract form data using the class method
+            # Get thread timestamp if this was triggered from a message
+            thread_ts = body.get('message', {}).get('ts')
+            
+            # Extract form data using the integration's method
             form_data = too_integration.extract_form_data(view['state']['values'])
             
             if not form_data:
                 raise ValueError("Failed to extract form data from modal submission")
             
-            # Parse original notice data from modal metadata
+            # Parse original notice data from modal metadata (if available)
+            notice_data = {}
             try:
-                notice_data = json.loads(view['private_metadata'])
-            except (json.JSONDecodeError, KeyError):
-                logger.warning("No notice data found in modal metadata, using empty dict")
+                if view.get('private_metadata'):
+                    notice_data = json.loads(view['private_metadata'])
+                    logger.debug(f"Parsed notice data from modal: {notice_data}")
+            except (json.JSONDecodeError, KeyError) as e:
+                logger.warning(f"No valid notice data in modal metadata: {e}")
                 notice_data = {}
             
             # Get user information
@@ -2504,112 +2438,117 @@ def setup_slack_handlers():
             user_email = too_integration.get_user_email(user_id)
             
             if not user_email:
-                raise ValueError("Could not retrieve user email address")
+                raise ValueError(f"Could not retrieve email address for user {user_id}")
             
-            # Convert Slack form data to GCNToOEmailer format
-            email_data = too_integration.convert_slack_form_to_email_data(
-                form_data, user_name, user_email, notice_data
-            )
-            
-            if not email_data:
-                raise ValueError("Failed to convert form data to email format")
-            
-            # Log the ToO request submission
-            logger.info(f"Processing ToO request from {user_name} ({user_email}) for target: {email_data.get('target', 'Unknown')}")
+            # Log the submission
+            logger.info(f"Processing ToO request from {user_name} ({user_email}) for target: {form_data.get('target', 'Unknown')}")
             
             # Check if email sending is enabled
-            if not TURN_ON_TOO_EMAIL:
-                # Send Slack confirmation without email
-                client.chat_postMessage(
+            if not TURN_ON_TOO_EMAIL_SLACK:
+                # Log the request but don't send email
+                logger.info(f"ToO request received but email disabled: {form_data['target']} by {user_name}")
+                
+                # Send confirmation message to Slack
+                client.chat_postEphemeral(
                     channel=SLACK_CHANNEL,
-                    text="⚠️ *ToO Request Logged* (Email disabled in config)\n"
-                        f"Target: {form_data['target']}\n"
-                        f"Requester: {user_name}\n"
-                        f"*Note: Email sending is currently disabled*",
+                    user=user_id,
+                    text=(
+                        f"📝 *ToO Request Logged* (Email sending disabled)\n\n"
+                        f"*Target:* {form_data['target']}\n"
+                        f"*Coordinates:* RA={form_data['ra']}°, Dec={form_data['dec']}°\n"
+                        f"*Requester:* {user_name}\n\n"
+                        f"⚠️ *Note: Email notifications are currently disabled in configuration*"
+                    ),
                     thread_ts=thread_ts
                 )
-                logger.info(f"ToO request logged but email disabled for {form_data['target']}")
                 return
             
-            # Initialize GCN ToO Emailer with current configuration
-            emailer = GCNToOEmailer(
-                email_from=EMAIL_FROM,
-                email_to=["7dt.observation.alert@gmail.com"],  # Primary observation team email
-                email_password=EMAIL_PASSWORD,
-                min_altitude=MIN_ALTITUDE,
-                min_moon_sep=MIN_MOON_SEP
-            )
-            
-            # Attempt to get visibility information for this target
+            # Check if we have visibility info (optional enhancement)
             visibility_info = None
             try:
-                if visibility_available and email_data.get('ra') and email_data.get('dec'):
-                    # Try to get visibility info using existing visibility system
-                    # This integrates with the visibility plotting functionality
-                    from visibility_analysis import get_visibility_info
-                    visibility_info = get_visibility_info(
-                        ra=float(email_data['ra']),
-                        dec=float(email_data['dec']),
-                        target_name=email_data['target']
+                # Try to get visibility info if coordinates are available
+                if visibility_available and form_data.get('ra') and form_data.get('dec'):
+                    ra_float = float(form_data['ra'])
+                    dec_float = float(form_data['dec'])
+                    
+                    # Create quick visibility check (optional)
+                    visibility_info = plotter.analyze_visibility(
+                        ra=ra_float,
+                        dec=dec_float,
+                        target_name=form_data['target'],
+                        min_altitude=MIN_ALTITUDE,
+                        min_moon_separation=MIN_MOON_SEP
                     )
-                    logger.info(f"Retrieved visibility info for {email_data['target']}")
             except Exception as vis_error:
-                logger.warning(f"Could not get visibility info: {vis_error}")
-                # Continue without visibility info - email will still be sent
+                logger.debug(f"Could not generate visibility info for manual request: {vis_error}")
+                visibility_info = None
+
+            email_data = too_integration.convert_slack_form_to_email_data(
+                form_data=form_data,  
+                user_name=user_name, 
+                user_email=EMAIL_FROM, 
+                notice_data=notice_data,
+                email_to=EMAIL_TO
+                )
             
-            # Create custom ToO configuration for this specific request
-            custom_too_config = {
-                'exptime': int(email_data['singleExposure']),
-                'count': int(email_data['imageCount']),
-                'obsmode': email_data['obsmode'],
-                'specmode': email_data['specmode'],
-                'filters': email_data['selectedFilters'],
-                'selectedTelNumber': email_data.get('selectedTelNumber', 1),
-                'abortobservation': email_data['abortObservation'],
-                'priority': email_data['priority'],
-                'gain': email_data['gain'],
-                'binning': email_data['binning'],
-                'obs_starttime': email_data.get('obsStartTime', 'ASAP'),
-                'comment': f"Submitted via Slack by {user_name} ({user_email})"
-            }   
+            if not email_data:
+                raise ValueError("Failed to prepare email data")
             
-            # Send ToO email using the existing emailer infrastructure
-            email_success = emailer.send_too_email(
-                notice_data=email_data,  # email_data is already in correct format
-                visibility_info=visibility_info,
-                too_config=custom_too_config
-            )
+            # Validate required fields before sending
+            required_fields = ['target', 'ra', 'dec', 'requester']
+            missing_fields = [field for field in required_fields if not email_data.get(field)]
             
-            # Handle email sending results
+            if missing_fields:
+                raise ValueError(f"Missing required fields: {', '.join(missing_fields)}")
+            
+            # Send the ToO email
+            logger.info(f"Sending ToO email for {email_data['target']}")
+            email_success = emailer.send_too_email(email_data)
+            
+            # Handle response based on email success
             if email_success:
-                # Success: Send confirmation to Slack with details
+                # Calculate total exposure time for display
+                total_exposure = int(form_data['exposure']) * int(form_data['imageCount'])
+                
+                # Format filter list for display
+                filter_str = ', '.join(form_data['selectedFilters']) if form_data['selectedFilters'] else 'None'
+                
+                # Create success message
                 success_message = (
                     f"✅ *ToO Request Sent Successfully*\n\n"
-                    f"**Target:** {form_data['target']}\n"
-                    f"**Coordinates:** RA {form_data['ra']}°, Dec {form_data['dec']}°\n"
-                    f"**Exposure:** {form_data['exposure']}s × {form_data['imageCount']} images "
-                    f"({form_data['totalExposureTime']}s total)\n"
-                    f"**Filters:** {', '.join(form_data['selectedFilters'])}\n"
-                    f"**Priority:** {form_data['priority']}\n"
-                    f"**Submitted by:** {user_name}\n\n"
-                    f"🔗 The observation team has been notified via email."
+                    f"*Target Information*\n"
+                    f"• *Name:* {form_data['target']}\n"
+                    f"• *Coordinates:* RA={form_data['ra']}°, Dec={form_data['dec']}°\n\n"
+                    f"*Observation Parameters*\n"
+                    f"• *Exposure:* {form_data['exposure']}s × {form_data['imageCount']} images "
+                    f"(Total: {total_exposure}s)\n"
+                    f"• *Mode:* {form_data['obsmode']}\n"
+                    f"• *Filters:* {filter_str}\n"
+                    f"• *Priority:* {form_data['priority']}\n"
+                    f"• *Abort Current:* {form_data['abortObservation']}\n\n"
+                    f"*Submission Details*\n"
+                    f"• *Submitted by:* {user_name}\n"
+                    f"• *Time:* {datetime.now().strftime('%Y-%m-%d %H:%M:%S UTC')}\n\n"
+                    f"📧 The observation team has been notified via email."
                 )
                 
-                # Add visibility information if available
+                # Add visibility status if available
                 if visibility_info:
-                    status = visibility_info.get('status', 'unknown')
-                    if status == 'observable_now':
-                        success_message += f"\n🌟 **Status:** Observable now!"
-                    elif status == 'observable_later':
-                        hours_until = visibility_info.get('hours_until_observable', 'unknown')
-                        success_message += f"\n⏰ **Status:** Observable in {hours_until} hours"
-                    elif status == 'observable_tomorrow':
-                        success_message += f"\n🌅 **Status:** Observable tomorrow night"
+                    vis_status = visibility_info.get('status', 'unknown')
+                    if vis_status == 'observable_now':
+                        success_message += f"\n\n🌃 *Visibility:* Currently observable"
+                    elif vis_status == 'observable_later':
+                        hours_until = visibility_info.get('hours_until_observable', 0)
+                        success_message += f"\n\n🌃 *Visibility:* Observable in {hours_until:.1f} hours"
+                    elif vis_status == 'observable_tomorrow':
+                        success_message += f"\n\n🌃 *Visibility:* Observable tomorrow night"
                     else:
-                        success_message += f"\n❓ **Status:** {status}"
+                        success_message += f"\n\n🌃 *Visibility:* Not observable from Chile"
                 
-                client.chat_postMessage(
+                # Send success message to user
+                client.chat_postEphemeral(
                     channel=SLACK_CHANNEL,
+                    user=user_id,
                     text=success_message,
                     thread_ts=thread_ts
                 )
@@ -2617,59 +2556,78 @@ def setup_slack_handlers():
                 logger.info(f"ToO email sent successfully for {form_data['target']} by {user_name}")
                 
             else:
-                # Email failed: Send error message to Slack
+                # Email failed - notify user
                 error_message = (
                     f"❌ *ToO Request Failed*\n\n"
-                    f"**Target:** {form_data['target']}\n"
-                    f"**Submitted by:** {user_name}\n\n"
-                    f"⚠️ Failed to send email to observation team.\n"
+                    f"*Target:* {form_data['target']}\n"
+                    f"*Submitted by:* {user_name}\n"
+                    f"*Time:* {datetime.now().strftime('%Y-%m-%d %H:%M:%S UTC')}\n\n"
+                    f"⚠️ Failed to send email to the observation team.\n"
                     f"Please try again or contact the system administrator.\n\n"
-                    f"**Your request has been logged for manual processing.**"
+                    f"*Your request details have been logged for manual processing.*"
                 )
                 
-                client.chat_postMessage(
+                # Send ephemeral error message (only visible to the user)
+                client.chat_postEphemeral(
                     channel=SLACK_CHANNEL,
+                    user=user_id,
                     text=error_message,
                     thread_ts=thread_ts
                 )
                 
-                logger.error(f"ToO email failed to send for {form_data['target']} by {user_name}")
-                
-                # Log the form data for manual processing
-                logger.error(f"MANUAL PROCESSING REQUIRED - ToO data: {json.dumps(form_data, indent=2)}")
+                # Log the full form data for manual recovery
+                logger.error(f"ToO email failed for {form_data['target']} by {user_name}")
+                logger.error(f"MANUAL PROCESSING REQUIRED - Form data:\n{json.dumps(form_data, indent=2)}")
+                logger.error(f"Email data:\n{json.dumps(email_data, indent=2)}")
         
         except ValueError as ve:
             # Handle validation errors
             error_msg = str(ve)
-            logger.warning(f"ToO form validation error: {error_msg}")
+            logger.warning(f"ToO form validation error from user {user_id}: {error_msg}")
             
             try:
                 client.chat_postEphemeral(
                     channel=SLACK_CHANNEL,
                     user=user_id,
-                    text=f"❌ **Validation Error:** {error_msg}\nPlease try submitting the form again."
+                    text=(
+                        f"❌ *Validation Error*\n\n"
+                        f"*Issue:* {error_msg}\n\n"
+                        f"Please check your form input and try again.\n"
+                        f"If this issue persists, contact the system administrator."
+                    )
                 )
             except Exception as slack_error:
-                logger.error(f"Failed to send validation error message to Slack: {slack_error}")
+                logger.error(f"Failed to send validation error to Slack: {slack_error}")
         
         except Exception as e:
             # Handle unexpected errors
             logger.error(f"Unexpected error in handle_too_modal: {e}", exc_info=True)
             
             try:
-                client.chat_postMessage(
+                # Attempt to notify user of the error
+                client.chat_postEphemeral(
                     channel=SLACK_CHANNEL,
+                    user=user_id,
                     text=(
                         f"❌ *System Error*\n\n"
-                        f"An unexpected error occurred while processing the ToO request.\n"
-                        f"**Error:** {str(e)}\n\n"
+                        f"An unexpected error occurred while processing your ToO request.\n\n"
+                        f"*Error:* {str(e)}\n\n"
                         f"Please contact the system administrator or try again later.\n"
-                        f"Your request details have been logged for manual review."
-                    ),
-                    thread_ts=thread_ts
+                        f"Your request has been logged for manual review.\n\n"
+                        f"*Time:* {datetime.now().strftime('%Y-%m-%d %H:%M:%S UTC')}"
+                    )
                 )
-            except Exception as slack_error:
-                logger.error(f"Failed to send error message to Slack: {slack_error}")
+            except Exception as notification_error:
+                logger.error(f"Failed to send error notification to user: {notification_error}")
+            
+            # Log form data for recovery even in case of system errors
+            try:
+                if 'form_data' in locals():
+                    logger.error(f"ERROR RECOVERY - Form data:\n{json.dumps(form_data, indent=2)}")
+                if 'notice_data' in locals():
+                    logger.error(f"ERROR RECOVERY - Notice data:\n{json.dumps(notice_data, indent=2)}")
+            except Exception as log_error:
+                logger.error(f"Failed to log recovery data: {log_error}")
 
     @app.action("submit_too_request")
     def handle_submit_too_request(ack, body, client, logger):
@@ -2809,7 +2767,7 @@ def process_notice_and_send_message(topic, value, slack_client, slack_channel, t
                 logger.info(f"Generating visibility analysis for {notice_data.get('Name', 'target')}")
                 
                 # New visibility plotter handles all 4 cases internally
-                plot_path, visibility_info = plotter.create_plot(
+                plot_path, visibility_info = plotter.analyze_visibility(
                     ra=ra,
                     dec=dec,
                     target_name=notice_data.get('Name', ''),

@@ -1,0 +1,22 @@
+{
+    "requester": "gcnbottoo@gmail.com",
+    "target": "New_GRB_Event",
+    "ra": null,
+    "dec": null,
+    "singleExposure": 100,
+    "imageCount": 3,
+    "exposure": 300,
+    "obsmode": "Spec",
+    "selectedFilters": [
+        "r",
+        "i"
+    ],
+    "selectedTelNumber": 1,
+    "abortObservation": "Yes",
+    "priority": "High",
+    "gain": "High",
+    "radius": "0",
+    "binning": "1",
+    "obsStartTime": "2025-09-19 13:37:43",
+    "comments": "New event None. Facility: None. Trigger: None. Automatic ToO request from GCN Alert System."
+}
