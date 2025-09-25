@@ -226,6 +226,7 @@ class Config:
     ASCII_MAX_EVENTS = 10
     TURN_ON_TOO_EMAIL = False
     EMAIL_FROM = "your_email@example.com"
+    EMAIL_TO = "your_email@example.com"
     EMAIL_PASSWORD = "your_email_password"
     TOO_CONFIG = {
         'singleExposure': 100,
@@ -289,6 +290,7 @@ MIN_MOON_SEP = config.MIN_MOON_SEP
 TURN_ON_NOTICE = config.TURN_ON_NOTICE
 TURN_ON_TOO_EMAIL = config.TURN_ON_TOO_EMAIL
 EMAIL_FROM = config.EMAIL_FROM
+EMAIL_TO = config.EMAIL_TO
 EMAIL_PASSWORD = config.EMAIL_PASSWORD
 TOO_CONFIG = config.TOO_CONFIG
 SLACK_TOKEN = config.SLACK_TOKEN
@@ -2432,7 +2434,7 @@ def _send_too_email_if_criteria_met(notice_data: Dict[str, Any], visibility_info
         # Initialize emailer
         emailer = GCNToOEmailer(
             email_from=EMAIL_FROM,
-            email_to=["7dt.observation.alert@gmail.com"],
+            email_to=EMAIL_TO,
             email_password=EMAIL_PASSWORD,
             min_altitude=MIN_ALTITUDE,
             min_moon_sep=MIN_MOON_SEP
@@ -2534,7 +2536,7 @@ def setup_slack_handlers():
             # Initialize GCN ToO Emailer with current configuration
             emailer = GCNToOEmailer(
                 email_from=EMAIL_FROM,
-                email_to=["7dt.observation.alert@gmail.com"],  # Primary observation team email
+                email_to=EMAIL_TO,  # Primary observation team email
                 email_password=EMAIL_PASSWORD,
                 min_altitude=MIN_ALTITUDE,
                 min_moon_sep=MIN_MOON_SEP
