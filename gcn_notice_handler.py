@@ -413,23 +413,29 @@ class GCNNoticeHandler:
             
             # Search for matching event
             for _, row in df.iterrows():
-                # Handle both old and new column formats for backward compatibility
-                row_facility = str(row.get('Primary_Facility', row.get('Facility', ''))).strip()
                 row_trigger = str(row.get('Trigger_num', '')).strip()
                 
-                # Normalize the row facility name for comparison
-                normalized_row_facility = self._normalize_facility_name(row_facility)
-                
-                # Check if facility and trigger number match
-                if (normalized_row_facility == normalized_facility and 
-                    row_trigger == str(trigger_num)):
+                # Check trigger number first (exact match)
+                if row_trigger != str(trigger_num).strip():
+                    continue
                     
+                # Check facility match - look in All_Facilities column
+                all_facilities = str(row.get('All_Facilities', '')).strip()
+                if not all_facilities:
+                    continue
+                    
+                # Split facilities and normalize each one
+                facilities_list = [f.strip() for f in all_facilities.split(',')]
+                normalized_facilities = [self._normalize_facility_name(f) for f in facilities_list]
+                
+                # Check if our normalized facility matches any in the list
+                if normalized_facility in normalized_facilities:
                     if return_full_data:
                         logger.info(f"Found existing event for {facility} trigger {trigger_num}, thread_ts: {row.get('thread_ts', '')}")
                         return row.to_dict()
                     else:
-                        grb_name = row.get('Name', '')
-                        logger.info(f"Found existing event: {grb_name} for {facility} trigger {trigger_num} (matched with {row_facility})")
+                        grb_name = row.get('Name', '').strip().strip('"')
+                        logger.info(f"Found existing event: {grb_name} for {facility} trigger {trigger_num}")
                         return grb_name
             
             logger.info(f"No existing event found for {facility} trigger {trigger_num}")
@@ -1095,7 +1101,7 @@ class GCNNoticeHandler:
                 # --- 1. Load Existing Data ---
                 try:
                     df = pd.read_csv(self.output_ascii, sep=r'\s+', quotechar='"',
-                                     quoting=csv.QUOTE_MINIMAL, dtype=str, na_filter=False)
+                                    quoting=csv.QUOTE_MINIMAL, dtype=str, na_filter=False)
                     missing_cols = set(self.ascii_columns) - set(df.columns)
                     for col in missing_cols: df[col] = ''
                     df = df[self.ascii_columns].fillna('')
@@ -1112,10 +1118,23 @@ class GCNNoticeHandler:
                 
                 existing_idx = None
                 if facility and trigger_num and not df.empty:
-                    mask = (df['Trigger_num'].astype(str).str.strip() == trigger_num) & \
-                           (df['All_Facilities'].astype(str).str.contains(rf'\b{facility}\b', regex=True, na=False))
-                    indices = df.index[mask]
-                    if not indices.empty: existing_idx = indices[0]
+                    # Find by trigger number and normalized facility
+                    normalized_facility = self._normalize_facility_name(facility)
+                    
+                    for idx, row in df.iterrows():
+                        row_trigger = str(row.get('Trigger_num', '')).strip()
+                        if row_trigger != trigger_num:
+                            continue
+                            
+                        # Check if this facility family is already in All_Facilities
+                        all_facilities = str(row.get('All_Facilities', '')).strip()
+                        if all_facilities:
+                            facilities_list = [f.strip() for f in all_facilities.split(',')]
+                            normalized_facilities = [self._normalize_facility_name(f) for f in facilities_list]
+                            
+                            if normalized_facility in normalized_facilities:
+                                existing_idx = idx
+                                break
 
                 # --- 3. Update or Append Logic ---
                 if existing_idx is not None:
@@ -1123,29 +1142,46 @@ class GCNNoticeHandler:
                     name = df.at[existing_idx, 'Name']
                     notice_data['Name'] = name
                     
+                    # Update All_Facilities to include this specific facility
                     existing_facilities = set(str(df.at[existing_idx, 'All_Facilities']).split(','))
+                    existing_facilities = {f.strip() for f in existing_facilities if f.strip()}
                     existing_facilities.add(facility)
-                    notice_data['All_Facilities'] = ','.join(sorted([f for f in existing_facilities if f]))
-
+                    
+                    # Update fields
                     for col, value in notice_data.items():
                         if col in df.columns and str(value).strip():
                             df.at[existing_idx, col] = value
+                    
+                    # Update All_Facilities
+                    df.at[existing_idx, 'All_Facilities'] = ','.join(sorted(existing_facilities))
                     df.at[existing_idx, 'Last_Update'] = notice_data.get('Notice_date', '')
+                    
+                    # Update thread_ts if provided
+                    if thread_ts:
+                        df.at[existing_idx, 'thread_ts'] = thread_ts
+                        logger.info(f"Updated thread_ts for existing entry: {thread_ts}")
+                        
                     logger.info(f"Updated existing entry for {facility} trigger {trigger_num}.")
                 else:
                     # APPEND new event
-                    name = self._generate_grb_name(notice_data['Discovery_UTC'], facility, df)
-                    notice_data['Name'] = name
+                    if 'Name' not in notice_data or not notice_data['Name']:
+                        name = self._generate_grb_name(notice_data['Discovery_UTC'], facility, df)
+                        notice_data['Name'] = name
+                    else:
+                        name = notice_data['Name']
+                        logger.info(f"Using pre-assigned name: {name}")
                     
                     row_data = {col: notice_data.get(col, '') for col in self.ascii_columns}
                     row_data.update({
-                        'Primary_Facility': facility, 'Best_Facility': facility,
-                        'All_Facilities': facility, 'Last_Update': notice_data.get('Notice_date', ''),
-                        'thread_ts': thread_ts or ''
+                        'Primary_Facility': facility, 
+                        'Best_Facility': facility,
+                        'All_Facilities': facility, 
+                        'Last_Update': notice_data.get('Notice_date', ''),
+                        'thread_ts': thread_ts if thread_ts else ''
                     })
                     new_row_df = pd.DataFrame([row_data])
                     df = pd.concat([new_row_df, df], ignore_index=True)
-                    logger.info(f"Added new entry for {name}.")
+                    logger.info(f"Added new entry for {name} with thread_ts: {thread_ts if thread_ts else 'empty'}")
 
                 # --- 4. Trim DataFrame to Max Events ---
                 if len(df) > self.ascii_max_events:
@@ -1155,9 +1191,12 @@ class GCNNoticeHandler:
                 
                 # --- 5. Backup and Save ---
                 self._create_backup_with_limit(self.output_ascii, max_backups=5)
+                
+                # Ensure thread_ts column is preserved in output
                 df.to_csv(
                     self.output_ascii, sep=' ', header=True, index=False,
-                    quoting=csv.QUOTE_MINIMAL, quotechar='"'
+                    quoting=csv.QUOTE_MINIMAL, quotechar='"',
+                    columns=self.ascii_columns  # Explicitly specify column order
                 )
                 
                 logger.info(f"ASCII file '{self.output_ascii}' saved successfully with {len(df)} entries.")

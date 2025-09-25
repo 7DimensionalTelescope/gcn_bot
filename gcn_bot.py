@@ -2544,10 +2544,7 @@ def setup_slack_handlers():
             visibility_info = None
             try:
                 if visibility_available and email_data.get('ra') and email_data.get('dec'):
-                    # Try to get visibility info using existing visibility system
-                    # This integrates with the visibility plotting functionality
-                    from visibility_analysis import get_visibility_info
-                    visibility_info = get_visibility_info(
+                    visibility_info = plotter.analyze_visibility(
                         ra=float(email_data['ra']),
                         dec=float(email_data['dec']),
                         target_name=email_data['target']
@@ -2597,14 +2594,13 @@ def setup_slack_handlers():
                 
                 # Add visibility information if available
                 if visibility_info:
-                    status = visibility_info.get('status', 'unknown')
-                    if status == 'observable_now':
-                        success_message += f"\n🌟 **Status:** Observable now!"
-                    elif status == 'observable_later':
-                        hours_until = visibility_info.get('hours_until_observable', 'unknown')
-                        success_message += f"\n⏰ **Status:** Observable in {hours_until} hours"
-                    elif status == 'observable_tomorrow':
-                        success_message += f"\n🌅 **Status:** Observable tomorrow night"
+                    status = visibility_info.get('current_status', 'unknown')
+                    if status == 'OBSERVABLE':
+                        if visibility_info.get('when_observable') == 'now':
+                            success_message += f"\n🌟 **Status:** Observable now!"
+                        else:
+                            hours_until = visibility_info.get('current_window', 'unknown')['remaining_hours']
+                            success_message += f"\n⏰ **Status:** Observable in {hours_until} hours"
                     else:
                         success_message += f"\n❓ **Status:** {status}"
                 
@@ -2788,11 +2784,19 @@ def process_notice_and_send_message(topic, value, slack_client, slack_channel, t
         
         if facility and trigger_num:
             try:
+                # Get the full existing event data including thread_ts
                 existing_event = notice_handler._find_existing_event(facility, trigger_num, return_full_data=True)
                 if existing_event:
-                    existing_thread_ts = existing_event.get('thread_ts', '')
-                    is_update = True
-                    logger.info(f"Found existing event for {facility} trigger {trigger_num}, thread_ts: {existing_thread_ts}")
+                    # ALWAYS use the existing name if found
+                    existing_name = existing_event.get('Name', '').strip().strip('"')
+                    if existing_name:
+                        notice_data['Name'] = existing_name
+                        logger.info(f"Using existing name '{existing_name}' for {facility} trigger {trigger_num}")
+                    
+                    # Check for thread_ts to determine if this is a thread update
+                    existing_thread_ts = existing_event.get('thread_ts', '').strip()
+                    is_update = bool(existing_thread_ts)
+                    logger.info(f"Found existing event for {facility} trigger {trigger_num}, thread_ts: {existing_thread_ts}, is_update: {is_update}")
             except Exception as e:
                 logger.error(f"Error checking existing event: {e}")
                 existing_event = None
