@@ -643,6 +643,25 @@ class SlackToOIntegration:
                     }
                 },
                 
+                # Spec mode
+                {
+                    "type": "input",
+                    "block_id": "specmode_block",
+                    "element": {
+                        "type": "plain_text_input",
+                        "action_id": "specmode_input",
+                        "initial_value": "specall",
+                        "placeholder": {
+                            "type": "plain_text",
+                            "text": "specall"
+                        }
+                    },
+                    "label": {
+                        "type": "plain_text",
+                        "text": "Spec Mode *"
+                    }
+                },
+                
                 # Filters selection
                 {
                     "type": "input",
@@ -835,8 +854,10 @@ class SlackToOIntegration:
                 'ra': form_values['ra_block']['ra_input']['value'],
                 'dec': form_values['dec_block']['dec_input']['value'],
                 'exposure': form_values['exposure_block']['exposure_input']['value'],
+                'singleExposure': form_values['exposure_block']['exposure_input']['value'],
                 'imageCount': form_values['count_block']['count_input']['value'],
                 'obsmode': form_values['obsmode_block']['obsmode_input']['selected_option']['value'],
+                'specmode': form_values['specmode_block']['specmode_input']['value'],
                 'priority': form_values['priority_block']['priority_input']['selected_option']['value'],
                 'binning': form_values['binning_block']['binning_input']['selected_option']['value'],
                 'gain': form_values['gain_block']['gain_input']['selected_option']['value'],
@@ -2369,9 +2390,9 @@ def _evaluate_too_criteria(notice_data: Dict[str, Any], visibility_info: Optiona
     
     # Criteria 1: Currently observable targets with good conditions
     if visibility_info:
-        status = visibility_info.get('status')
+        status = visibility_info.get('current_status')
         
-        if status == 'observable_now':
+        if status == 'OBSERVABLE':
             remaining_hours = visibility_info.get('remaining_hours', 0)
             current_altitude = visibility_info.get('current_altitude', 0)
             
@@ -2383,7 +2404,7 @@ def _evaluate_too_criteria(notice_data: Dict[str, Any], visibility_info: Optiona
                 logger.debug(f"Target observable but limited conditions (alt={current_altitude:.1f}°, {remaining_hours:.1f}h remaining)")
                 return False, f"Observable but limited conditions (alt={current_altitude:.1f}°, {remaining_hours:.1f}h remaining)"
         
-        elif status == 'observable_later':
+        elif status == 'OBSERVABLE LATER':
             # For targets observable later tonight, only send ToO if:
             # 1. Will be observable within 2 hours
             # 2. Will have decent altitude when observable
@@ -2397,7 +2418,7 @@ def _evaluate_too_criteria(notice_data: Dict[str, Any], visibility_info: Optiona
                 logger.debug(f"Target observable later but not urgent (in {hours_until:.1f}h, for {observable_hours:.1f}h)")
                 return False, f"Observable later but not urgent (in {hours_until:.1f}h)"
         
-        elif status == 'observable_tomorrow':
+        elif status == 'OBSERVABLE TOMORROW':
             # Generally don't send immediate ToO for tomorrow targets
             # unless it's a very special case (handled above for neutrinos)
             logger.debug(f"Target observable tomorrow - no immediate ToO needed")
@@ -2444,7 +2465,7 @@ def _send_too_email_if_criteria_met(notice_data: Dict[str, Any], visibility_info
         custom_too_config = TOO_CONFIG.copy()
         custom_too_config['comment'] = f"ToO Reason: {reason}"
         
-        if visibility_info and visibility_info.get('status') == 'observable_now':
+        if visibility_info and visibility_info.get('current_status') == 'Observable Now':
             # High priority for currently observable targets
             custom_too_config.update({
                 'priority': '50',
@@ -2542,20 +2563,6 @@ def setup_slack_handlers():
                 min_moon_sep=MIN_MOON_SEP
             )
             
-            # Attempt to get visibility information for this target
-            visibility_info = None
-            try:
-                if visibility_available and email_data.get('ra') and email_data.get('dec'):
-                    visibility_info = plotter.analyze_visibility(
-                        ra=float(email_data['ra']),
-                        dec=float(email_data['dec']),
-                        target_name=email_data['target']
-                    )
-                    logger.info(f"Retrieved visibility info for {email_data['target']}")
-            except Exception as vis_error:
-                logger.warning(f"Could not get visibility info: {vis_error}")
-                # Continue without visibility info - email will still be sent
-            
             # Create custom ToO configuration for this specific request
             custom_too_config = {
                 'exptime': int(email_data['singleExposure']),
@@ -2575,7 +2582,6 @@ def setup_slack_handlers():
             # Send ToO email using the existing emailer infrastructure
             email_success = emailer.send_too_email(
                 notice_data=email_data,  # email_data is already in correct format
-                visibility_info=visibility_info,
                 too_config=custom_too_config
             )
             
@@ -2593,18 +2599,6 @@ def setup_slack_handlers():
                     f"**Submitted by:** {user_name}\n\n"
                     f"🔗 The observation team has been notified via email."
                 )
-                
-                # Add visibility information if available
-                if visibility_info:
-                    status = visibility_info.get('current_status', 'unknown')
-                    if status == 'OBSERVABLE':
-                        if visibility_info.get('when_observable') == 'now':
-                            success_message += f"\n🌟 **Status:** Observable now!"
-                        else:
-                            hours_until = visibility_info.get('current_window', 'unknown')['remaining_hours']
-                            success_message += f"\n⏰ **Status:** Observable in {hours_until} hours"
-                    else:
-                        success_message += f"\n❓ **Status:** {status}"
                 
                 client.chat_postMessage(
                     channel=SLACK_CHANNEL,
@@ -2625,8 +2619,9 @@ def setup_slack_handlers():
                     f"**Your request has been logged for manual processing.**"
                 )
                 
-                client.chat_postMessage(
+                client.chat_postEphemeral(
                     channel=SLACK_CHANNEL,
+                    user=user_id,
                     text=error_message,
                     thread_ts=thread_ts
                 )
@@ -2655,8 +2650,9 @@ def setup_slack_handlers():
             logger.error(f"Unexpected error in handle_too_modal: {e}", exc_info=True)
             
             try:
-                client.chat_postMessage(
+                client.chat_postEphemeral(
                     channel=SLACK_CHANNEL,
+                    user=user_id,
                     text=(
                         f"❌ *System Error*\n\n"
                         f"An unexpected error occurred while processing the ToO request.\n"
@@ -2786,19 +2782,11 @@ def process_notice_and_send_message(topic, value, slack_client, slack_channel, t
         
         if facility and trigger_num:
             try:
-                # Get the full existing event data including thread_ts
                 existing_event = notice_handler._find_existing_event(facility, trigger_num, return_full_data=True)
                 if existing_event:
-                    # ALWAYS use the existing name if found
-                    existing_name = existing_event.get('Name', '').strip().strip('"')
-                    if existing_name:
-                        notice_data['Name'] = existing_name
-                        logger.info(f"Using existing name '{existing_name}' for {facility} trigger {trigger_num}")
-                    
-                    # Check for thread_ts to determine if this is a thread update
-                    existing_thread_ts = existing_event.get('thread_ts', '').strip()
-                    is_update = bool(existing_thread_ts)
-                    logger.info(f"Found existing event for {facility} trigger {trigger_num}, thread_ts: {existing_thread_ts}, is_update: {is_update}")
+                    existing_thread_ts = existing_event.get('thread_ts', '')
+                    is_update = True
+                    logger.info(f"Found existing event for {facility} trigger {trigger_num}, thread_ts: {existing_thread_ts}")
             except Exception as e:
                 logger.error(f"Error checking existing event: {e}")
                 existing_event = None
