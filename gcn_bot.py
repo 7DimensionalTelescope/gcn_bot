@@ -9,7 +9,7 @@ Basic Information
 ----------------
 Author:         YoungPyo Hong
 Created:        2025-01-01
-Last Modified:  2025-03-06
+Last Modified:  2025-09-25
 Version:        1.3.0
 License:        MIT
 Copyright:      (c) 2025 YoungPyo Hong
@@ -311,7 +311,6 @@ last_heartbeat = datetime.now()
 heartbeat_lock = Lock()
 last_connection_status = True  # True = connected, False = disconnected
 socket_handler = None
-os.environ["NUMEXPR_MAX_THREADS"] = "4"
 reconnect_attempts = 0
 max_reconnect_attempts = 5
 consumer_lock = Lock()  # For thread-safe consumer replacement
@@ -994,6 +993,15 @@ notice_handler = GCNNoticeHandler(
     output_csv=OUTPUT_CSV,
     output_ascii=OUTPUT_ASCII,
     ascii_max_events=ASCII_MAX_EVENTS
+)
+
+# Initialize ToO emailer
+emailer = GCNToOEmailer(
+    email_from=EMAIL_FROM,
+    email_to=EMAIL_TO,
+    email_password=EMAIL_PASSWORD,
+    min_altitude=MIN_ALTITUDE,
+    min_moon_sep=MIN_MOON_SEP
 )
 
 ############################## Initialize argument parser ############################
@@ -2370,124 +2378,91 @@ def _format_thread_message(differences: Dict[str, Any], notice_data: Dict[str, A
         logger.error(f"Error formatting thread message: {e}")
         return f"🔄 *UPDATE: {notice_data.get('Facility', 'Unknown')}*\n> - ℹ️ *Status:* Updated information received"
 
-def _evaluate_too_criteria(notice_data: Dict[str, Any], visibility_info: Optional[Dict[str, Any]]) -> Tuple[bool, str]:
+def _evaluate_too_criteria(notice_data: Dict[str, Any], analysis: Optional[Dict[str, Any]]) -> Tuple[bool, str]:
     """
-    Evaluate whether a ToO request should be sent based on specific criteria.
-    Updated to work with new 4-case visibility system.
-    
-    Args:
-        notice_data: Parsed notice data
-        visibility_info: Visibility analysis information
-        
-    Returns:
-        Tuple[bool, str]: (should_send, reason)
+    Evaluate ToO criteria based on the standardized analysis object.
     """
-    if not notice_data:
-        return False, "No notice data available"
+    if not notice_data or not analysis:
+        return False, "No notice or analysis data available"
     
-    facility = notice_data.get('Facility', '')
     target_name = notice_data.get('Name', 'Unknown Target')
+    tonight = analysis.get("tonight", {})
     
     # Criteria 1: Currently observable targets with good conditions
-    if visibility_info:
-        status = visibility_info.get('current_status')
+    if tonight.get("status") == "OBSERVABLE" and tonight.get("when") == "now":
+        window = tonight.get("window", {})
+        remaining_hours = window.get("time_remaining_hours", 0)
         
-        if status == 'OBSERVABLE':
-            remaining_hours = visibility_info.get('remaining_hours', 0)
-            current_altitude = visibility_info.get('current_altitude', 0)
-            
-            # Only send ToO if we have sufficient time and good altitude
-            if remaining_hours >= 1.0 and current_altitude >= 30:
-                logger.info(f"ToO Criteria Met - Currently Observable: {target_name}")
-                return True, "Currently Observable with Good Conditions"
-            else:
-                logger.debug(f"Target observable but limited conditions (alt={current_altitude:.1f}°, {remaining_hours:.1f}h remaining)")
-                return False, f"Observable but limited conditions (alt={current_altitude:.1f}°, {remaining_hours:.1f}h remaining)"
-        
-        elif status == 'OBSERVABLE LATER':
-            # For targets observable later tonight, only send ToO if:
-            # 1. Will be observable within 2 hours
-            # 2. Will have decent altitude when observable
-            hours_until = visibility_info.get('hours_until_observable', 999)
-            observable_hours = visibility_info.get('observable_hours', 0)
-            
-            if hours_until <= 2.0 and observable_hours >= 2.0:
-                logger.info(f"ToO Criteria Met - Observable Soon: {target_name}")
-                return True, f"Observable in {hours_until:.1f} hours"
-            else:
-                logger.debug(f"Target observable later but not urgent (in {hours_until:.1f}h, for {observable_hours:.1f}h)")
-                return False, f"Observable later but not urgent (in {hours_until:.1f}h)"
-        
-        elif status == 'OBSERVABLE TOMORROW':
-            # Generally don't send immediate ToO for tomorrow targets
-            # unless it's a very special case (handled above for neutrinos)
-            logger.debug(f"Target observable tomorrow - no immediate ToO needed")
-            return False, "Observable tomorrow - plan for next night"
-        
-        else:  # not_observable
-            logger.debug(f"Target not observable - no ToO possible")
-            return False, f"Not observable from Chile"
+        # visibility_plotter can be enhanced to provide current altitude
+        # For now, we assume if it's observable, altitude is fine.
+        if remaining_hours >= 1.0:
+            logger.info(f"ToO Criteria Met - Currently Observable: {target_name}")
+            return True, "Currently Observable with Good Conditions"
+        else:
+            return False, f"Observable but limited time remaining ({remaining_hours:.1f}h)"
+
+    # Criteria 2: Targets observable later tonight, but soon
+    elif tonight.get("status") == "OBSERVABLE" and tonight.get("when") == "later":
+        window = tonight.get("window", {})
+        hours_until = window.get("time_until_start_hours", 999)
+        duration = window.get("duration_hours", 0)
+
+        if hours_until <= 2.0 and duration >= 2.0:
+            logger.info(f"ToO Criteria Met - Observable Soon: {target_name}")
+            return True, f"Observable in {hours_until:.1f} hours"
+        else:
+            return False, f"Observable later but not urgent (in {hours_until:.1f}h)"
     
     # Default: No criteria met
-    logger.debug(f"No ToO criteria met for {facility} event")
-    return False, f"No immediate ToO criteria met for {facility} event"
+    reason = tonight.get("reason", "Not observable tonight")
+    return False, reason
 
-def _send_too_email_if_criteria_met(notice_data: Dict[str, Any], visibility_info: Optional[Dict[str, Any]]) -> None:
+def _send_too_email_if_criteria_met(notice_data: Dict[str, Any], analysis: Optional[Dict[str, Any]]) -> None:
     """
-    Send ToO email if specific criteria are met.
-    Updated to work with new 4-case visibility system.
-    
-    Args:
-        notice_data: Parsed notice data
-        visibility_info: Visibility analysis information
+    Send ToO email if specific criteria are met, with special handling for neutrinos.
     """
     if not TURN_ON_TOO_EMAIL:
         return
         
-    # Evaluate ToO criteria
-    should_send, reason = _evaluate_too_criteria(notice_data, visibility_info)
+    should_send, reason = _evaluate_too_criteria(notice_data, analysis)
     
     if not should_send:
         logger.debug(f"ToO not sent: {reason}")
         return
         
-    try:        
-        # Initialize emailer
-        emailer = GCNToOEmailer(
-            email_from=EMAIL_FROM,
-            email_to=EMAIL_TO,
-            email_password=EMAIL_PASSWORD,
-            min_altitude=MIN_ALTITUDE,
-            min_moon_sep=MIN_MOON_SEP
-        )
-        
-        # Use base ToO config and add the specific reason
-        custom_too_config = TOO_CONFIG.copy()
-        custom_too_config['comment'] = f"ToO Reason: {reason}"
-        
-        if visibility_info and visibility_info.get('current_status') == 'Observable Now':
-            # High priority for currently observable targets
-            custom_too_config.update({
-                'priority': '50',
-                'abortObservation': 'No'
-            })
+    try:
+        base_config = TOO_CONFIG.copy()
+        facility = notice_data.get('Facility', '')
+
+        # If the event is from IceCube, AMON, or HAWC, apply special ToO configuration
+        if any(fac in facility for fac in ["IceCube", "AMON", "HAWC"]):
+            logger.info(f"Neutrino event detected from {facility}. Applying special ToO configuration.")
+            custom_too_config = emailer.customize_too_for_neutrino(base_config, notice_data, analysis)
         else:
-            # Normal priority for other cases
-            custom_too_config.update({
-                'priority': '40',
-                'abortObservation': 'No'
-            })
+            # For general events, set priority based on observability
+            custom_too_config = base_config
+            # Adjust the condition based on the actual structure of the analysis object
+            if analysis and analysis.get("tonight", {}).get("when") == "now":
+                custom_too_config['priority'] = '50' # Use meaningful string instead of number
+            else:
+                custom_too_config['priority'] = '60'
         
-        # Send ToO request
-        email_sent = emailer.process_notice(notice_data, custom_too_config, visibility_info)
+        custom_too_config['comments'] = f"Automated ToO from GCN Bot. Reason: {reason}"
+
+        # The emailer uses global variables and explicitly names the analysis parameter
+        email_sent = emailer.send_too_email(
+            notice_data=notice_data,
+            analysis=analysis,
+            too_config=custom_too_config
+        )
         
         if email_sent:
             logger.info(f"ToO email sent for {notice_data.get('Name', 'target')} - Reason: {reason}")
         else:
-            logger.warning(f"ToO email failed to send for {notice_data.get('Name', 'target')} - Reason: {reason}")
+            logger.warning(f"ToO email failed to send for {notice_data.get('Name', 'target')}")
             
     except Exception as e:
-        logger.error(f"Error sending ToO email: {e}")
+        logger.error(f"Error sending ToO email: {e}", exc_info=True)
 
 def setup_slack_handlers():
     """Setup Slack event handlers for ToO integration"""
@@ -2554,14 +2529,19 @@ def setup_slack_handlers():
                 logger.info(f"ToO request logged but email disabled for {form_data['target']}")
                 return
             
-            # Initialize GCN ToO Emailer with current configuration
-            emailer = GCNToOEmailer(
-                email_from=EMAIL_FROM,
-                email_to=EMAIL_TO,  # Primary observation team email
-                email_password=EMAIL_PASSWORD,
-                min_altitude=MIN_ALTITUDE,
-                min_moon_sep=MIN_MOON_SEP
-            )
+            # Attempt to get visibility information for this target
+            visibility_info = None
+            try:
+                if visibility_available and email_data.get('ra') and email_data.get('dec'):
+                    visibility_info = plotter.analyze_visibility(
+                        ra=float(email_data['ra']),
+                        dec=float(email_data['dec']),
+                        target_name=email_data['target']
+                    )
+                    logger.info(f"Retrieved visibility info for {email_data['target']}")
+            except Exception as vis_error:
+                logger.warning(f"Could not get visibility info: {vis_error}")
+                # Continue without visibility info - email will still be sent
             
             # Create custom ToO configuration for this specific request
             custom_too_config = {
@@ -2792,27 +2772,26 @@ def process_notice_and_send_message(topic, value, slack_client, slack_channel, t
                 existing_event = None
         
         # 3. Process visibility information if coordinates available
-        plot_path = None
-        visibility_info = None
+        analysis  = None
         
         ra = notice_data.get('RA')
         dec = notice_data.get('DEC')
+        name = notice_data.get('Name', 'GRB Candidate')
         
         if visibility_available and ra is not None and dec is not None:
             try:
-                logger.info(f"Generating visibility analysis for {notice_data.get('Name', 'target')}")
+                logger.info(f"Generating visibility analysis for {name}")
                 
-                # New visibility plotter handles all 4 cases internally
-                plot_path, visibility_info = plotter.create_plot(
+                analysis = plotter.analyze_visibility(
                     ra=ra,
                     dec=dec,
-                    target_name=notice_data.get('Name', ''),
+                    target_name=name,
                     min_altitude=MIN_ALTITUDE,
                     min_moon_separation=MIN_MOON_SEP
                 )
                 
             except Exception as e:
-                logger.error(f"Error creating visibility plot: {e}")
+                logger.error(f"Error during visibility analysis: {e}")
         
         # 4. Save to databases (skip if this is a test message)
         csv_status = False
@@ -2845,21 +2824,26 @@ def process_notice_and_send_message(topic, value, slack_client, slack_channel, t
                         logger.info(f"Sent thread update for {facility} trigger {trigger_num}")
                         
                         # Add visibility plot to thread if coordinates changed and plot available
-                        if 'coordinates' in differences and plot_path and os.path.exists(plot_path):
+                        if 'coordinates' in differences and analysis:
+                            plot_path = None
                             try:
-                                plot_title = f"Updated Visibility Plot: {notice_data.get('Name', 'Target')}"
-                                if visibility_info and visibility_info.get('next_opportunity'):
-                                    plot_title += " (Tomorrow's Sky)"
+                                # Create plot
+                                plot_path = plotter.create_plot(analysis)
                                 
-                                slack_client.files_upload_v2(
-                                    file_uploads=[{"file": plot_path}],
-                                    channel=slack_channel,
-                                    thread_ts=existing_thread_ts,
-                                    title=plot_title
-                                )
-                                logger.info(f"Uploaded updated visibility plot to thread")
+                                if plot_path and os.path.exists(plot_path):
+                                    plot_title = f"Updated Visibility Plot: {notice_data.get('Name')}"
+                                    slack_client.files_upload_v2(
+                                        file_uploads=[{"file": plot_path}],
+                                        channel=slack_channel,
+                                        thread_ts=existing_thread_ts,
+                                        title=plot_title
+                                    )
+                                    logger.info(f"Uploaded updated visibility plot to thread")
                             except Exception as plot_error:
                                 logger.error(f"Error uploading plot to thread: {plot_error}")
+                            finally:
+                                if plot_path and os.path.exists(plot_path):
+                                    os.remove(plot_path)
                                 
                     except Exception as e:
                         logger.error(f"Error sending thread update: {e}")
@@ -2896,25 +2880,17 @@ def process_notice_and_send_message(topic, value, slack_client, slack_channel, t
                 if slack_message is None:
                     return False, "Message formatting failed"
                 
-                # Add visibility blocks if available
-                visibility_blocks = []
-                if visibility_info:
-                    visibility_text = plotter.format_message(visibility_info)
-                    visibility_blocks = [
-                        {"type": "divider"},
-                        {
-                            "type": "header",
-                            "text": {"type": "plain_text", "text": "Visibility Information"}
-                        },
-                        {
-                            "type": "section",
-                            "text": {"type": "mrkdwn", "text": visibility_text}
-                        }
-                    ]
+                message_blocks = slack_message.get('blocks', [])
                 
-                # Combine all blocks
-                message_blocks = slack_message.get('blocks', []) + visibility_blocks
-
+                # Add visibility blocks if available
+                if analysis:
+                    visibility_text = analysis["summary"]["formatted_message"]
+                    message_blocks.extend([
+                        {"type": "divider"},
+                        {"type": "header", "text": {"type": "plain_text", "text": "Visibility Information"}},
+                        {"type": "section", "text": {"type": "mrkdwn", "text": visibility_text}}
+                    ])
+                
                 # Add ToO button if GRB keywords are present
                 grb_keywords = ['GRB', 'Fermi', 'Swift', 'IceCube', 'HAWC', 'AMON']
                 if any(keyword.lower() in topic.lower() for keyword in grb_keywords):
@@ -2973,24 +2949,29 @@ def process_notice_and_send_message(topic, value, slack_client, slack_channel, t
                                 logger.error(f"Error sending URL message: {e}")
                         
                         # Add visibility plot as thread reply (if available)
-                        if plot_path and os.path.exists(plot_path):
+                        if analysis:
+                            plot_path = None
                             try:
-                                plot_title = f"Visibility Plot: {notice_data.get('Name', 'Target')}"
-                                if visibility_info and visibility_info.get('showing_tomorrow'):
-                                    plot_title += " (Tomorrow's Sky)"
+                                # Create plot
+                                plot_path = plotter.create_plot(analysis)
                                 
-                                slack_client.files_upload_v2(
-                                    file_uploads=[{"file": plot_path}],
-                                    channel=slack_channel,
-                                    thread_ts=new_thread_ts,
-                                    title=plot_title
-                                )
-                                logger.info(f"Uploaded visibility plot to thread")
+                                if plot_path and os.path.exists(plot_path):
+                                    slack_client.files_upload_v2(
+                                        file_uploads=[{"file": plot_path}],
+                                        channel=slack_channel,
+                                        thread_ts=new_thread_ts,
+                                        title=f"Visibility Plot: {notice_data.get('Name')}"
+                                    )
+                                    logger.info(f"Uploaded visibility plot to thread")
                             except Exception as plot_error:
-                                logger.error(f"Error uploading plot to thread: {plot_error}")
+                                logger.error(f"Error handling plot: {plot_error}")
+                            finally:
+                                # Always remove temporary file
+                                if plot_path and os.path.exists(plot_path):
+                                    os.remove(plot_path)
                         
                         # Send ToO email if criteria are met
-                        _send_too_email_if_criteria_met(notice_data, visibility_info)
+                        _send_too_email_if_criteria_met(notice_data, analysis)
                         
                         # Clean up plot file if it was created (for successful message sending)
                         if plot_path and os.path.exists(plot_path) and not plot_path.startswith('./test_plots'):

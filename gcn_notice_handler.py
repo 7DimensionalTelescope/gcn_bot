@@ -314,7 +314,41 @@ class GCNNoticeHandler:
             'Host_info',             # Usually empty from notices
             'thread_ts'              # Slack thread timestamp
         ]
-
+    PATTERNS = {
+        'fermi': {
+            'ra': r"GRB_RA:.*?(\d+\.\d+)d.*?\(J2000\)",
+            'dec': r"GRB_DEC:.*?([-+]?\d+\.\d+)d.*?\(J2000\)",
+            'error': r"GRB_ERROR:\s*([\d.]+)\s*\[(\w+).*?\]",
+            'date': r"GRB_DATE:.*?(\d{2})/(\d{2})/(\d{2})",
+            'time': r"GRB_TIME:.*?{([\d:\.]+)}\s*UT",
+            'trigger_num': r"TRIGGER_NUM:\s*(\d+)"
+        },
+        'swift': {
+            'ra': r"(?:GRB_RA|POINT_RA):.*?(\d+\.\d+)d?.*\(J2000\)",
+            'dec': r"(?:GRB_DEC|POINT_DEC):.*?([-+]?\d+\.\d+)d?.*\(J2000\)",
+            'error': r"GRB_ERROR:\s*([\d.]+)\s*\[(\w+).*?\]",
+            'date': r"(?:GRB_DATE|IMG_START_DATE):.*?(\d{2})/(\d{2})/(\d{2})",
+            'time': r"(?:GRB_TIME|IMG_START_TIME):.*?{([\d:\.]+)}\s*UT",
+            'trigger_num': r"TRIGGER_NUM:\s*(\d+)"
+        },
+        'amon': {
+            'ra': r"SRC_RA:.*?(\d+\.\d+)d?.*?\(J2000\)",
+            'dec': r"SRC_DEC:.*?([-+]?\d+\.\d+)d?.*?\(J2000\)",
+            'error': r"SRC_ERROR:\s*([\d.]+)\s*\[(\w+).*?\]",
+            'date': r"DISCOVERY_DATE:.*?(\d{2})/(\d{2})/(\d{2})",
+            'time': r"DISCOVERY_TIME:.*?{([\d:\.]+)}\s*UT",
+            'trigger_num': r"EVENT_NUM:\s*(\d+)"
+        },
+        'calet': {
+            'ra': r"POINT_RA:.*?(\d+\.\d+)d?.*?\(J2000\)",
+            'dec': r"POINT_DEC:.*?([-+]?\d+\.\d+)d?.*?\(J2000\)",
+            'error': None, # CALET has no error field
+            'date': r"TRIGGER_DATE:.*?(\d{2})/(\d{2})/(\d{2})",
+            'time': r"TRIGGER_TIME:.*?{([\d:\.]+)}\s*UT",
+            'trigger_num': r"TRIGGER_NUM:\s*(\d+)"
+        }
+    }
+    
     def _normalize_facility_name(self, facility: str) -> str:
         """
         Normalize facility names for consistent comparison across different instruments.
@@ -560,7 +594,7 @@ class GCNNoticeHandler:
             logger.error(f"Error creating notice data: {e}")
             raise
 
-    def _parse_notice(self, text, facility, patterns):
+    def _parse_text_notice(self, text: str, facility: str, patterns: Dict[str, str]) -> Optional[Dict[str, Any]]:
         """
         Core parsing function for all notice types.
         
@@ -721,151 +755,9 @@ class GCNNoticeHandler:
             else:
                 logger.error(f"No valid information found in {facility} notice")
                 return None
-
-        except Exception as e:
-            logger.error(f"Error parsing {facility} notice: {str(e)} - Core parsing function")
-            return None
-
-    def _parse_notice_fermi(self, text, facility):
-        """Parse Fermi format notices."""
-        try:
-            patterns = {
-                'notice_date': r"NOTICE_DATE:\s*(\w{3})\s*(\d{2})\s*(\w{3})\s*(\d{2})\s*(\d{2}):(\d{2}):(\d{2})\s*UT", # DD/MM/YY HH:MM:SS UT
-                'trigger_num': r"TRIGGER_NUM:\s*(\d+)",
-                'date': r"GRB_DATE:.*?(\d{2})/(\d{2})/(\d{2})",  # YY/MM/DD
-                'time': r"GRB_TIME:.*?{([\d:\.]+)}\s*UT", # HH:MM:SS
-                'ra': r"GRB_RA:.*?(\d+\.\d+)d.*?\(J2000\)",
-                'dec': r"GRB_DEC:.*?([-+]?\d+\.\d+)d.*?\(J2000\)",
-                'error': r"GRB_ERROR:\s*([\d.]+)\s*\[(\w+).*?\]"
-            }
-            logger.debug(f"Starting to parse {facility} notice - Fermi format")
-            return self._parse_notice(text, facility, patterns)
         
         except Exception as e:
-            logger.error(f"Error parsing {facility} notice: {str(e)} - Fermi format")
-            return None
-
-    def _parse_notice_swift(self, text, facility):
-        """
-        Parse Swift format notices for BAT, XRT, and UVOT.
-        """
-        try:
-            # Define patterns with multiple possible field names
-            patterns = {
-                'notice_date': r"NOTICE_DATE:\s*(\w{3})\s*(\d{2})\s*(\w{3})\s*(\d{2})\s*(\d{2}):(\d{2}):(\d{2})\s*UT",
-                'trigger_num': r"TRIGGER_NUM:\s*(\d+)",
-                # Try both GRB_DATE and IMG_START_DATE patterns
-                'date': r"(?:GRB_DATE|IMG_START_DATE):.*?(\d{2})/(\d{2})/(\d{2})",  # YY/MM/DD
-                # Try both GRB_TIME and IMG_START_TIME patterns
-                'time': r"(?:GRB_TIME|IMG_START_TIME):\s*(?:\d+.\d+)\s*(?:SOD)?\s*{([^}]+)}",
-                # Handle both decimal degree formats
-                'ra': r"GRB_RA:.*?(\d+\.\d+)d?\s*{[^}]+}\s*\(J2000\)",
-                'dec': r"GRB_DEC:.*?([-+]?\d+\.\d+)d?\s*{[^}]+}\s*\(J2000\)",
-                'error': r"GRB_ERROR:\s*([\d.]+)\s*\[(\w+).*?\]"
-            }
-            
-            logger.info(f"Starting to parse {facility} notice - Swift format")
-            return self._parse_notice(text, facility, patterns)
-            
-        except Exception as e:
-            logger.error(f"Error parsing {facility} notice: {str(e)} - Swift format")
-            return None
-
-    def _parse_notice_amon(self, text, facility):
-        """
-        Parse AMON-style notices (AMON_NU_EM_COINC, ICECUBE_CASCADE, 
-        ICECUBE_ASTROTRACK_GOLD/BRONZE, HAWC_BURST_MONITOR).
-        """
-        try:
-            # Common patterns across all AMON notice types
-            patterns = {
-                'notice_date': r"NOTICE_DATE:\s*(\w{3})\s*(\d{2})\s*(\w{3})\s*(\d{2})\s*(\d{2}):(\d{2}):(\d{2})\s*UT",
-                'trigger_num': r"EVENT_NUM:\s*(\d+)",
-                'ra': r"SRC_RA:.*?(\d+\.\d+)d?.*?\(J2000\)",
-                'dec': r"SRC_DEC:.*?([-+]?\d+\.\d+)d?.*?\(J2000\)",
-                'error': r"SRC_ERROR:.*?([\d.]+)\s*\[(\w+)"
-            }
-            
-            # Add specific date/time patterns
-            if facility in ['AMON', 'IceCubeCASCADE', 'IceCubeBRONZE', 'IceCubeGOLD']:
-                patterns.update({
-                    'date': r"DISCOVERY_DATE:.*?(\d{2})/(\d{2})/(\d{2})",  # YY/MM/DD
-                    'time': r"DISCOVERY_TIME:.*?{([\d:\.]+)}\s*UT" # HH:MM:SS
-                })
-                
-                # Add IceCube-specific fields but don't store in notice_data
-                if facility in ['IceCubeBRONZE', 'IceCubeGOLD']:
-                    patterns.update({
-                        'energy': r"ENERGY:\s*([\d.]+e[+-]?\d+)\s*\[TeV\]",
-                        'signalness': r"SIGNALNESS:\s*([\d.]+e[+-]?\d+)\s*\[dn\]",
-                        'far': r"FAR:\s*([\d.]+)\s*\[yr\^-1\]"
-                    })
-                elif facility == 'IceCubeCASCADE':
-                    patterns.update({
-                        'energy': r"ENERGY:\s*([\d.]+)\s*\[TeV\]",
-                        'signalness': r"SIGNALNESS:\s*([\d.]+e[+-]?\d+)\s*\[dn\]",
-                        'far': r"FAR:\s*([\d.]+)\s*\[yr\^-1\]",
-                        'event_name': r"EVENT_NAME:\s*(IceCubeCascade-\w+)"
-                    })
-            elif facility == 'AMON':
-                patterns.update({
-                    'date': r"DISCOVERY_DATE:.*?(\d{2})/(\d{2})/(\d{2})",  # YY/MM/DD
-                    'time': r"DISCOVERY_TIME:.*?{([\d:\.]+)}\s*UT", # HH:MM:SS
-                    'coinc_pair': r"COINC_PAIR:\s*\d+\s+(\S+)",
-                    'delta_t': r"DELTA_T:\s*([\d.]+)"
-                })
-                
-            logger.info(f"Starting to parse {facility} notice - AMON format")
-            parsed_data = self._parse_notice(text, facility, patterns)
-            
-            # Extract IceCube-specific fields for use in memory (but not DB storage)
-            icecube_info = {}
-            for field in ['energy', 'signalness', 'far', 'coinc_pair', 'delta_t', 'event_name']:
-                pattern = patterns.get(field)
-                if pattern:
-                    match = re.search(pattern, text, re.DOTALL)
-                    if match:
-                        icecube_info[field] = match.group(1)
-                        logger.debug(f"Extracted {field}: {icecube_info[field]}")
-            
-            # For CASCADE events, use the event_name as Name if provided
-            if 'event_name' in icecube_info and parsed_data:
-                parsed_data['event_name_override'] = icecube_info['event_name']
-                
-            # Store IceCube-specific info in parsed_data's 'extra_info' field
-            # This won't be saved to the database but can be used for display and ToO
-            if parsed_data and icecube_info:
-                parsed_data['icecube_info'] = icecube_info
-            
-            return parsed_data
-            
-        except Exception as e:
-            logger.error(f"Error parsing {facility} notice: {str(e)} - AMON format")
-            return None
-
-    def _parse_notice_calet(self, text, facility):
-        """Parse CALET format notices."""
-        try:
-            patterns = {
-                'notice_date': r"NOTICE_DATE:\s*(\w{3})\s*(\d{2})\s*(\w{3})\s*(\d{2})\s*(\d{2}):(\d{2}):(\d{2})\s*UT",
-                'trigger_num': r"TRIGGER_NUM:\s*(\d+)",
-                'date': r"TRIGGER_DATE:.*?(\d{2})/(\d{2})/(\d{2})",
-                'time': r"TRIGGER_TIME:.*?{([\d:\.]+)}\s*UT",
-                'ra': r"POINT_RA:.*?(\d+\.\d+)d?.*?\(J2000\)",
-                'dec': r"POINT_DEC:.*?([-+]?\d+\.\d+)d?.*?\(J2000\)",
-            }
-            
-            logger.info(f"Starting to parse {facility} notice - CALET format")
-            parsed_data = self._parse_notice(text, facility, patterns)
-            
-            # Set error to 0.0 for CALET format since it doesn't have an error
-            if parsed_data:
-                parsed_data['Error'] = 0.0
-            
-            return parsed_data
-            
-        except Exception as e:
-            logger.error(f"Error parsing {facility} notice: {str(e)} - CALET format")
+            logger.error(f"Error parsing {facility} notice: {str(e)} - Core parsing function")
             return None
 
     def _parse_notice_einstein_probe(self, text, facility):
@@ -1034,45 +926,28 @@ class GCNNoticeHandler:
 
 #---------------------------------------Main Function----------------------------------------
     def parse_notice(self, formatted_text: Union[str, bytes], topic: str) -> Optional[Dict[str, Any]]:
-        """
-        Parse notice and extract relevant information.
-        
-        Args:
-            formatted_text (str): Formatted text of the notice.
-            topic (str): Topic of the notice.
-        
-        Returns:
-            notice_data (dict): Parsed notice data.
-        """
         facility = self._get_facility(topic)
         if not facility:
-            logger.warning(f"Facility not found in topic: {topic}")
             return None
 
-        try:
-            if isinstance(formatted_text, bytes):
-                formatted_text = formatted_text.decode('utf-8')
-            else:
-                formatted_text = formatted_text
+        if isinstance(formatted_text, bytes):
+            formatted_text = formatted_text.decode('utf-8', 'ignore')
 
-            # Route to appropriate parser based on facility
-            if 'Swift' in facility:
-                return self._parse_notice_swift(formatted_text, facility)
-            elif 'Fermi' in facility:
-                return self._parse_notice_fermi(formatted_text, facility)
-            elif any(fac in facility for fac in ['AMON', 'IceCubeCASCADE', 'HAWC', 'IceCubeBRONZE', 'IceCubeGOLD', 'IceCube']):
-                return self._parse_notice_amon(formatted_text, facility)
-            elif 'CALET' in facility:
-                return self._parse_notice_calet(formatted_text, facility)
-            elif 'EinsteinProbe' in facility: # JSON
-                return self._parse_notice_einstein_probe(formatted_text, facility)
-            else:
-                logger.warning(f"No parser available for facility: {facility}")
-                return None
+        if 'EinsteinProbe' in facility:
+            return self._parse_notice_einstein_probe(formatted_text, facility)
+        
+        # Simplified routing logic
+        parser_key = None
+        if 'Swift' in facility: parser_key = 'swift'
+        elif 'Fermi' in facility: parser_key = 'fermi'
+        elif any(f in facility for f in ['AMON', 'IceCube', 'HAWC']): parser_key = 'amon'
+        elif 'CALET' in facility: parser_key = 'calet'
 
-        except Exception as e:
-            logger.error(f"Error parsing notice: {str(e)}")
-            return None
+        if parser_key:
+            return self._parse_text_notice(formatted_text, facility, self.PATTERNS[parser_key])
+        
+        logger.warning(f"No parser available for facility: {facility}")
+        return None
 
     def save_to_csv(self, notice_data: Dict[str, Any]) -> bool:
         """
