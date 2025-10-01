@@ -224,7 +224,8 @@ class Config:
     OUTPUT_CSV = 'gcn_notices.csv'
     OUTPUT_ASCII = 'grb_targets.ascii'
     ASCII_MAX_EVENTS = 10
-    TURN_ON_TOO_EMAIL = False
+    TURN_ON_TOO_EMAIL_SLACK = False
+    TURN_ON_TOO_EMAIL_AUTO = False
     EMAIL_FROM = "your_email@example.com"
     EMAIL_TO = "your_email@example.com"
     EMAIL_PASSWORD = "your_email_password"
@@ -288,7 +289,8 @@ CONNECTION_TIMEOUT = config.CONNECTION_TIMEOUT
 MIN_ALTITUDE = config.MIN_ALTITUDE
 MIN_MOON_SEP = config.MIN_MOON_SEP
 TURN_ON_NOTICE = config.TURN_ON_NOTICE
-TURN_ON_TOO_EMAIL = config.TURN_ON_TOO_EMAIL
+TURN_ON_TOO_EMAIL_SLACK = config.TURN_ON_TOO_EMAIL_SLACK
+TURN_ON_TOO_EMAIL_AUTO = config.TURN_ON_TOO_EMAIL_AUTO
 EMAIL_FROM = config.EMAIL_FROM
 EMAIL_TO = config.EMAIL_TO
 EMAIL_PASSWORD = config.EMAIL_PASSWORD
@@ -2421,7 +2423,7 @@ def _send_too_email_if_criteria_met(notice_data: Dict[str, Any], analysis: Optio
     """
     Send ToO email if specific criteria are met, with special handling for neutrinos.
     """
-    if not TURN_ON_TOO_EMAIL:
+    if not TURN_ON_TOO_EMAIL_AUTO:
         return
         
     should_send, reason = _evaluate_too_criteria(notice_data, analysis)
@@ -2454,6 +2456,12 @@ def _send_too_email_if_criteria_met(notice_data: Dict[str, Any], analysis: Optio
             notice_data=notice_data,
             analysis=analysis,
             too_config=custom_too_config
+        )
+        
+        # Send confirmation to Slack
+        slack_client.chat_postMessage(
+            channel=SLACK_CHANNEL,
+            text=f"ToO email sent for {notice_data.get('Name', 'target')} - Reason: {reason}"
         )
         
         if email_sent:
@@ -2516,10 +2524,11 @@ def setup_slack_handlers():
             logger.info(f"Processing ToO request from {user_name} ({user_email}) for target: {email_data.get('target', 'Unknown')}")
             
             # Check if email sending is enabled
-            if not TURN_ON_TOO_EMAIL:
+            if not TURN_ON_TOO_EMAIL_SLACK:
                 # Send Slack confirmation without email
-                client.chat_postMessage(
+                client.chat_postEphemeral(
                     channel=SLACK_CHANNEL,
+                    user=user_id,
                     text="⚠️ *ToO Request Logged* (Email disabled in config)\n"
                         f"Target: {form_data['target']}\n"
                         f"Requester: {user_name}\n"
@@ -2580,8 +2589,9 @@ def setup_slack_handlers():
                     f"🔗 The observation team has been notified via email."
                 )
                 
-                client.chat_postMessage(
+                client.chat_postEphemeral(
                     channel=SLACK_CHANNEL,
+                    user=user_id,
                     text=success_message,
                     thread_ts=thread_ts
                 )

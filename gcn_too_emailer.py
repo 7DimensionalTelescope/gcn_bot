@@ -146,17 +146,18 @@ class GCNToOEmailer:
         default_config = {
             'singleExposure': 100,       # Default exposure time in seconds
             'imageCount': 3,             # Default number of images
-            'obsmode': 'Deep',           # Default observation mode
-            'selectedFilters': ['r', 'i'], # Default filters
-            'selectedTelNumber': 1,      # Default number of telescopes
-            'abortObservation': 'Yes',   # Default abort setting
-            'priority': 'High',          # Default priority
-            'gain': 'High',              # Default gain
+            'obsmode': 'Spec',           # Default observation mode
+            'specmode': 'specall.specmode',       # Default spec mode
+            'abortObservation': 'No',   # Default abort setting
+            'priority': '50',          # Default priority
+            'gain': '2750',              # Default gain
             'radius': '0',               # Default radius
             'binning': '1',              # Default binning
         }
-        
-        # Use provided config or defaults
+        if not default_config['obsmode'] == 'Spec':
+            default_config['selectedFilters'] = ['g', 'r', 'i']
+            
+        # Use provided config or defaults   
         if too_config is None:
             too_config = {}
         
@@ -207,7 +208,10 @@ class GCNToOEmailer:
         
         # Allow custom comments to be appended
         if too_config.get('additional_comments'):
+            self.logger.debug("Appending additional comments to email")
             email_data['comments'] += f" {too_config['additional_comments']}"
+    
+        self.logger.debug("Successfully prepared email data for target: %s", target_name)
         
         return email_data
     
