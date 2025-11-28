@@ -189,6 +189,9 @@ old/
 *.ascii
 grb_targets.ascii
 grb_targets.ascii.backup.*
+too_request*
+*analysis*/
+*analysis*.py
 
 # test
 *test*.py

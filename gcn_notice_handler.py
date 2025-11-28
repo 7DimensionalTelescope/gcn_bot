@@ -174,6 +174,8 @@ import pandas as pd
 import re
 import os
 import csv
+import shutil
+import glob
 from datetime import datetime
 from threading import Lock
 from typing import Dict, Any, Optional, Union, List, Tuple
@@ -312,7 +314,41 @@ class GCNNoticeHandler:
             'Host_info',             # Usually empty from notices
             'thread_ts'              # Slack thread timestamp
         ]
-
+    PATTERNS = {
+        'fermi': {
+            'ra': r"GRB_RA:.*?(\d+\.\d+)d.*?\(J2000\)",
+            'dec': r"GRB_DEC:.*?([-+]?\d+\.\d+)d.*?\(J2000\)",
+            'error': r"GRB_ERROR:\s*([\d.]+)\s*\[(\w+).*?\]",
+            'date': r"GRB_DATE:.*?(\d{2})/(\d{2})/(\d{2})",
+            'time': r"GRB_TIME:.*?{([\d:\.]+)}\s*UT",
+            'trigger_num': r"TRIGGER_NUM:\s*(\d+)"
+        },
+        'swift': {
+            'ra': r"(?:GRB_RA|POINT_RA):.*?(\d+\.\d+)d?.*\(J2000\)",
+            'dec': r"(?:GRB_DEC|POINT_DEC):.*?([-+]?\d+\.\d+)d?.*\(J2000\)",
+            'error': r"GRB_ERROR:\s*([\d.]+)\s*\[(\w+).*?\]",
+            'date': r"(?:GRB_DATE|IMG_START_DATE):.*?(\d{2})/(\d{2})/(\d{2})",
+            'time': r"(?:GRB_TIME|IMG_START_TIME):.*?{([\d:\.]+)}\s*UT",
+            'trigger_num': r"TRIGGER_NUM:\s*(\d+)"
+        },
+        'amon': {
+            'ra': r"SRC_RA:.*?(\d+\.\d+)d?.*?\(J2000\)",
+            'dec': r"SRC_DEC:.*?([-+]?\d+\.\d+)d?.*?\(J2000\)",
+            'error': r"SRC_ERROR:\s*([\d.]+)\s*\[(\w+).*?\]",
+            'date': r"DISCOVERY_DATE:.*?(\d{2})/(\d{2})/(\d{2})",
+            'time': r"DISCOVERY_TIME:.*?{([\d:\.]+)}\s*UT",
+            'trigger_num': r"EVENT_NUM:\s*(\d+)"
+        },
+        'calet': {
+            'ra': r"POINT_RA:.*?(\d+\.\d+)d?.*?\(J2000\)",
+            'dec': r"POINT_DEC:.*?([-+]?\d+\.\d+)d?.*?\(J2000\)",
+            'error': None, # CALET has no error field
+            'date': r"TRIGGER_DATE:.*?(\d{2})/(\d{2})/(\d{2})",
+            'time': r"TRIGGER_TIME:.*?{([\d:\.]+)}\s*UT",
+            'trigger_num': r"TRIGGER_NUM:\s*(\d+)"
+        }
+    }
+    
     def _normalize_facility_name(self, facility: str) -> str:
         """
         Normalize facility names for consistent comparison across different instruments.
@@ -360,6 +396,21 @@ class GCNNoticeHandler:
         # For other facilities, return as-is
         return facility
 
+    def _get_facility(self, topic: str) -> Optional[str]:
+        """
+        Determine the facility from the topic.
+        
+        Args:
+            topic (str): The topic of the GCN notice.
+            
+        Returns:
+            str or None: The facility name if found, None otherwise
+        """
+        for facility, topics in self.monitored_facilities.items():
+            if any(t in topic for t in topics):
+                return facility
+        return None
+    
     def _find_existing_event(self, facility: str, trigger_num: str, return_full_data: bool = False) -> Optional[Union[str, Dict[str, Any]]]:
         """
         Unified method to find existing event from ASCII file.
@@ -396,23 +447,29 @@ class GCNNoticeHandler:
             
             # Search for matching event
             for _, row in df.iterrows():
-                # Handle both old and new column formats for backward compatibility
-                row_facility = str(row.get('Primary_Facility', row.get('Facility', ''))).strip()
                 row_trigger = str(row.get('Trigger_num', '')).strip()
                 
-                # Normalize the row facility name for comparison
-                normalized_row_facility = self._normalize_facility_name(row_facility)
-                
-                # Check if facility and trigger number match
-                if (normalized_row_facility == normalized_facility and 
-                    row_trigger == str(trigger_num)):
+                # Check trigger number first (exact match)
+                if row_trigger != str(trigger_num).strip():
+                    continue
                     
+                # Check facility match - look in All_Facilities column
+                all_facilities = str(row.get('All_Facilities', '')).strip()
+                if not all_facilities:
+                    continue
+                    
+                # Split facilities and normalize each one
+                facilities_list = [f.strip() for f in all_facilities.split(',')]
+                normalized_facilities = [self._normalize_facility_name(f) for f in facilities_list]
+                
+                # Check if our normalized facility matches any in the list
+                if normalized_facility in normalized_facilities:
                     if return_full_data:
                         logger.info(f"Found existing event for {facility} trigger {trigger_num}, thread_ts: {row.get('thread_ts', '')}")
                         return row.to_dict()
                     else:
-                        grb_name = row.get('Name', '')
-                        logger.info(f"Found existing event: {grb_name} for {facility} trigger {trigger_num} (matched with {row_facility})")
+                        grb_name = row.get('Name', '').strip().strip('"')
+                        logger.info(f"Found existing event: {grb_name} for {facility} trigger {trigger_num}")
                         return grb_name
             
             logger.info(f"No existing event found for {facility} trigger {trigger_num}")
@@ -421,23 +478,8 @@ class GCNNoticeHandler:
         except Exception as e:
             logger.error(f"Error finding existing event: {e}")
             return None
-
-    def _get_facility(self, topic: str) -> Optional[str]:
-        """
-        Determine the facility from the topic.
         
-        Args:
-            topic (str): The topic of the GCN notice.
-            
-        Returns:
-            str or None: The facility name if found, None otherwise
-        """
-        for facility, topics in self.monitored_facilities.items():
-            if any(t in topic for t in topics):
-                return facility
-        return None
-
-    def _generate_grb_name(self, trigger_date: datetime, facility: Optional[str] = None, trigger_num: Optional[str] = None) -> str:
+    def _generate_grb_name(self, trigger_date: datetime, facility: str, df: pd.DataFrame) -> str:
         """
         Generate a consistent name with different prefixes based on facility.
         - GRB YYMMDD[A-Z] for most events
@@ -446,131 +488,37 @@ class GCNNoticeHandler:
         
         Simplified version without caching - relies on file operations only.
         """
-        # First check if this is an existing event
-        if facility and trigger_num:
-            existing_name = self._find_existing_event(facility, str(trigger_num), return_full_data=False)
-            if existing_name:
-                logger.info(f"Using existing name {existing_name} for {facility} trigger {trigger_num}")
-                return existing_name
+        # Determine the prefix and alphabet based on the facility
+        is_einstein_probe = "EinsteinProbe" in facility
+        is_icecube = any(ice_fac in facility for ice_fac in ["IceCube", "AMON"])
         
-        # Determine the prefix based on facility
-        is_einstein_probe = facility == "EinsteinProbe"
-        is_icecube = any(ice_fac in str(facility) for ice_fac in ["IceCube", "AMON"])
-        
-        # Set prefix and format based on facility type
         if is_icecube:
-            prefix = "IceCube"
-            name_format = "dash"  # IceCube-YYMMDD[A-Z]
-            alphabet = ascii_uppercase
+            prefix, name_format, alphabet = "IceCube", "dash", ascii_uppercase
         elif is_einstein_probe:
-            prefix = "EP"
-            name_format = "space"  # EP YYMMDD[a-z]
-            alphabet = ascii_lowercase
+            prefix, name_format, alphabet = "EP", "space", ascii_lowercase
         else:
-            prefix = "GRB"
-            name_format = "space"  # GRB YYMMDD[A-Z]
-            alphabet = ascii_uppercase
+            prefix, name_format, alphabet = "GRB", "space", ascii_uppercase
+
+        date_key = trigger_date.strftime('%y%m%d')
+        used_letters = set()
+
+        # Find used letters for this prefix and date from the existing DataFrame
+        if not df.empty and 'Name' in df.columns:
+            name_pattern = re.compile(rf"^{prefix}[-\s]{date_key}([A-Za-z])$")
+            for name in df['Name']:
+                match = name_pattern.match(str(name).strip().strip('"'))
+                if match:
+                    used_letters.add(match.group(1))
+
+        # Find the next available letter
+        next_letter = next((letter for letter in alphabet if letter not in used_letters), alphabet[-1])
         
-        logger.info(f"Generating new {prefix} name for date: {trigger_date.strftime('%Y-%m-%d')}")
+        # Format the new name
+        separator = "-" if name_format == "dash" else " "
+        new_name = f"{prefix}{separator}{date_key}{next_letter}"
         
-        try:
-            # Get date in YYMMDD format
-            date_key = trigger_date.strftime('%y%m%d')
-            
-            # Find next available letter by reading ASCII file (more efficient)
-            used_letters = set()
-            
-            with self.file_lock:
-                if os.path.exists(self.output_ascii):
-                    try:
-                        # Use pandas for cleaner ASCII parsing
-                        df = pd.read_csv(self.output_ascii, sep=r'\s+', 
-                                    quotechar='"', quoting=csv.QUOTE_MINIMAL, 
-                                    dtype=str, na_filter=False)
-                        
-                        if not df.empty and 'Name' in df.columns:
-                            # Check each row for matching names
-                            for _, row in df.iterrows():
-                                name_field = str(row.get('Name', '')).strip().strip('"')
-                                
-                                # Parse different name formats
-                                if prefix == "IceCube":
-                                    # IceCube-YYMMDD[A-Z] format
-                                    pattern = rf"^{prefix}-{date_key}([A-Z])$"
-                                else:
-                                    # GRB YYMMDD[A-Z] or EP YYMMDD[a-z] format
-                                    if prefix == "EP":
-                                        pattern = rf"^{prefix}\s+{date_key}([a-z])$"
-                                    else:
-                                        pattern = rf"^{prefix}\s+{date_key}([A-Z])$"
-                                
-                                match = re.match(pattern, name_field)
-                                if match:
-                                    letter = match.group(1)
-                                    if letter in alphabet:
-                                        used_letters.add(letter)
-                                        logger.debug(f"Found used letter: {letter}")
-                                        
-                    except Exception as e:
-                        logger.debug(f"Error reading ASCII file: {e}")
-                        # Fallback to simple file reading if pandas fails
-                        try:
-                            with open(self.output_ascii, 'r') as f:
-                                for line in f:
-                                    # Simple regex to extract names from any format
-                                    name_match = re.search(r'"?([^"]*(?:GRB|EP|IceCube)[^"]*)"?', line)
-                                    if name_match:
-                                        name_field = name_match.group(1).strip()
-                                        
-                                        if prefix == "IceCube":
-                                            pattern = rf"^{prefix}-{date_key}([A-Z])$"
-                                        else:
-                                            if prefix == "EP":
-                                                pattern = rf"^{prefix}\s+{date_key}([a-z])$"
-                                            else:
-                                                pattern = rf"^{prefix}\s+{date_key}([A-Z])$"
-                                        
-                                        match = re.match(pattern, name_field)
-                                        if match:
-                                            letter = match.group(1)
-                                            if letter in alphabet:
-                                                used_letters.add(letter)
-                        except Exception as nested_e:
-                            logger.debug(f"Fallback ASCII reading failed: {nested_e}")
-            
-            # Find next available letter
-            next_letter = alphabet[0]  # Default to first letter
-            for letter in alphabet:
-                if letter not in used_letters:
-                    next_letter = letter
-                    logger.debug(f"Next available letter: {letter}")
-                    break
-            else:
-                # If all letters are used, use the last one (shouldn't happen normally)
-                next_letter = alphabet[-1]
-                logger.warning(f"All letters used for {prefix} {date_key}, using last letter")
-            
-            # Format the name based on facility type
-            if name_format == "dash":
-                new_name = f"{prefix}-{date_key}{next_letter}"
-            else:
-                new_name = f"{prefix} {date_key}{next_letter}"
-            
-            logger.info(f"Generated new name: {new_name}")
-            return new_name
-            
-        except Exception as e:
-            logger.error(f"Error generating {prefix} name: {e}")
-            
-            # Fallback: use 'A' or 'a' as first letter
-            first_letter = alphabet[0]
-            if name_format == "dash":
-                fallback_name = f"{prefix}-{date_key}{first_letter}"
-            else:
-                fallback_name = f"{prefix} {date_key}{first_letter}"
-            
-            logger.warning(f"Using fallback name: {fallback_name}")
-            return fallback_name
+        logger.info(f"Generated new name: {new_name}")
+        return new_name
 
     @staticmethod
     def _normalize_error_to_deg(value, unit):
@@ -625,15 +573,9 @@ class GCNNoticeHandler:
             if notice_date is not None:
                 notice_date = notice_date.replace(microsecond=0)
             
-            # Check for event_name_override for CASCADE events
-            if 'event_name_override' in kwargs and kwargs['event_name_override']:
-                name = kwargs['event_name_override']
-            else:
-                name = self._generate_grb_name(trigger_date, facility, trigger_num) if trigger_date else ''
-            
             notice_data = {
                 'GCN_ID': f"GCN_{facility}_{trigger_num}",
-                'Name': name,
+                'Name': '',
                 'RA': ra if ra is not None else '',
                 'DEC': dec if dec is not None else '',
                 'Error': error if error is not None else '',
@@ -652,7 +594,7 @@ class GCNNoticeHandler:
             logger.error(f"Error creating notice data: {e}")
             raise
 
-    def _parse_notice(self, text, facility, patterns):
+    def _parse_text_notice(self, text: str, facility: str, patterns: Dict[str, str]) -> Optional[Dict[str, Any]]:
         """
         Core parsing function for all notice types.
         
@@ -813,151 +755,9 @@ class GCNNoticeHandler:
             else:
                 logger.error(f"No valid information found in {facility} notice")
                 return None
-
-        except Exception as e:
-            logger.error(f"Error parsing {facility} notice: {str(e)} - Core parsing function")
-            return None
-
-    def _parse_notice_fermi(self, text, facility):
-        """Parse Fermi format notices."""
-        try:
-            patterns = {
-                'notice_date': r"NOTICE_DATE:\s*(\w{3})\s*(\d{2})\s*(\w{3})\s*(\d{2})\s*(\d{2}):(\d{2}):(\d{2})\s*UT", # DD/MM/YY HH:MM:SS UT
-                'trigger_num': r"TRIGGER_NUM:\s*(\d+)",
-                'date': r"GRB_DATE:.*?(\d{2})/(\d{2})/(\d{2})",  # YY/MM/DD
-                'time': r"GRB_TIME:.*?{([\d:\.]+)}\s*UT", # HH:MM:SS
-                'ra': r"GRB_RA:.*?(\d+\.\d+)d.*?\(J2000\)",
-                'dec': r"GRB_DEC:.*?([-+]?\d+\.\d+)d.*?\(J2000\)",
-                'error': r"GRB_ERROR:\s*([\d.]+)\s*\[(\w+).*?\]"
-            }
-            logger.debug(f"Starting to parse {facility} notice - Fermi format")
-            return self._parse_notice(text, facility, patterns)
         
         except Exception as e:
-            logger.error(f"Error parsing {facility} notice: {str(e)} - Fermi format")
-            return None
-
-    def _parse_notice_swift(self, text, facility):
-        """
-        Parse Swift format notices for BAT, XRT, and UVOT.
-        """
-        try:
-            # Define patterns with multiple possible field names
-            patterns = {
-                'notice_date': r"NOTICE_DATE:\s*(\w{3})\s*(\d{2})\s*(\w{3})\s*(\d{2})\s*(\d{2}):(\d{2}):(\d{2})\s*UT",
-                'trigger_num': r"TRIGGER_NUM:\s*(\d+)",
-                # Try both GRB_DATE and IMG_START_DATE patterns
-                'date': r"(?:GRB_DATE|IMG_START_DATE):.*?(\d{2})/(\d{2})/(\d{2})",  # YY/MM/DD
-                # Try both GRB_TIME and IMG_START_TIME patterns
-                'time': r"(?:GRB_TIME|IMG_START_TIME):\s*(?:\d+.\d+)\s*(?:SOD)?\s*{([^}]+)}",
-                # Handle both decimal degree formats
-                'ra': r"GRB_RA:.*?(\d+\.\d+)d?\s*{[^}]+}\s*\(J2000\)",
-                'dec': r"GRB_DEC:.*?([-+]?\d+\.\d+)d?\s*{[^}]+}\s*\(J2000\)",
-                'error': r"GRB_ERROR:\s*([\d.]+)\s*\[(\w+).*?\]"
-            }
-            
-            logger.info(f"Starting to parse {facility} notice - Swift format")
-            return self._parse_notice(text, facility, patterns)
-            
-        except Exception as e:
-            logger.error(f"Error parsing {facility} notice: {str(e)} - Swift format")
-            return None
-
-    def _parse_notice_amon(self, text, facility):
-        """
-        Parse AMON-style notices (AMON_NU_EM_COINC, ICECUBE_CASCADE, 
-        ICECUBE_ASTROTRACK_GOLD/BRONZE, HAWC_BURST_MONITOR).
-        """
-        try:
-            # Common patterns across all AMON notice types
-            patterns = {
-                'notice_date': r"NOTICE_DATE:\s*(\w{3})\s*(\d{2})\s*(\w{3})\s*(\d{2})\s*(\d{2}):(\d{2}):(\d{2})\s*UT",
-                'trigger_num': r"EVENT_NUM:\s*(\d+)",
-                'ra': r"SRC_RA:.*?(\d+\.\d+)d?.*?\(J2000\)",
-                'dec': r"SRC_DEC:.*?([-+]?\d+\.\d+)d?.*?\(J2000\)",
-                'error': r"SRC_ERROR:.*?([\d.]+)\s*\[(\w+)"
-            }
-            
-            # Add specific date/time patterns
-            if facility in ['AMON', 'IceCubeCASCADE', 'IceCubeBRONZE', 'IceCubeGOLD']:
-                patterns.update({
-                    'date': r"DISCOVERY_DATE:.*?(\d{2})/(\d{2})/(\d{2})",  # YY/MM/DD
-                    'time': r"DISCOVERY_TIME:.*?{([\d:\.]+)}\s*UT" # HH:MM:SS
-                })
-                
-                # Add IceCube-specific fields but don't store in notice_data
-                if facility in ['IceCubeBRONZE', 'IceCubeGOLD']:
-                    patterns.update({
-                        'energy': r"ENERGY:\s*([\d.]+e[+-]?\d+)\s*\[TeV\]",
-                        'signalness': r"SIGNALNESS:\s*([\d.]+e[+-]?\d+)\s*\[dn\]",
-                        'far': r"FAR:\s*([\d.]+)\s*\[yr\^-1\]"
-                    })
-                elif facility == 'IceCubeCASCADE':
-                    patterns.update({
-                        'energy': r"ENERGY:\s*([\d.]+)\s*\[TeV\]",
-                        'signalness': r"SIGNALNESS:\s*([\d.]+e[+-]?\d+)\s*\[dn\]",
-                        'far': r"FAR:\s*([\d.]+)\s*\[yr\^-1\]",
-                        'event_name': r"EVENT_NAME:\s*(IceCubeCascade-\w+)"
-                    })
-            elif facility == 'AMON':
-                patterns.update({
-                    'date': r"DISCOVERY_DATE:.*?(\d{2})/(\d{2})/(\d{2})",  # YY/MM/DD
-                    'time': r"DISCOVERY_TIME:.*?{([\d:\.]+)}\s*UT", # HH:MM:SS
-                    'coinc_pair': r"COINC_PAIR:\s*\d+\s+(\S+)",
-                    'delta_t': r"DELTA_T:\s*([\d.]+)"
-                })
-                
-            logger.info(f"Starting to parse {facility} notice - AMON format")
-            parsed_data = self._parse_notice(text, facility, patterns)
-            
-            # Extract IceCube-specific fields for use in memory (but not DB storage)
-            icecube_info = {}
-            for field in ['energy', 'signalness', 'far', 'coinc_pair', 'delta_t', 'event_name']:
-                pattern = patterns.get(field)
-                if pattern:
-                    match = re.search(pattern, text, re.DOTALL)
-                    if match:
-                        icecube_info[field] = match.group(1)
-                        logger.debug(f"Extracted {field}: {icecube_info[field]}")
-            
-            # For CASCADE events, use the event_name as Name if provided
-            if 'event_name' in icecube_info and parsed_data:
-                parsed_data['event_name_override'] = icecube_info['event_name']
-                
-            # Store IceCube-specific info in parsed_data's 'extra_info' field
-            # This won't be saved to the database but can be used for display and ToO
-            if parsed_data and icecube_info:
-                parsed_data['icecube_info'] = icecube_info
-            
-            return parsed_data
-            
-        except Exception as e:
-            logger.error(f"Error parsing {facility} notice: {str(e)} - AMON format")
-            return None
-
-    def _parse_notice_calet(self, text, facility):
-        """Parse CALET format notices."""
-        try:
-            patterns = {
-                'notice_date': r"NOTICE_DATE:\s*(\w{3})\s*(\d{2})\s*(\w{3})\s*(\d{2})\s*(\d{2}):(\d{2}):(\d{2})\s*UT",
-                'trigger_num': r"TRIGGER_NUM:\s*(\d+)",
-                'date': r"TRIGGER_DATE:.*?(\d{2})/(\d{2})/(\d{2})",
-                'time': r"TRIGGER_TIME:.*?{([\d:\.]+)}\s*UT",
-                'ra': r"POINT_RA:.*?(\d+\.\d+)d?.*?\(J2000\)",
-                'dec': r"POINT_DEC:.*?([-+]?\d+\.\d+)d?.*?\(J2000\)",
-            }
-            
-            logger.info(f"Starting to parse {facility} notice - CALET format")
-            parsed_data = self._parse_notice(text, facility, patterns)
-            
-            # Set error to 0.0 for CALET format since it doesn't have an error
-            if parsed_data:
-                parsed_data['Error'] = 0.0
-            
-            return parsed_data
-            
-        except Exception as e:
-            logger.error(f"Error parsing {facility} notice: {str(e)} - CALET format")
+            logger.error(f"Error parsing {facility} notice: {str(e)} - Core parsing function")
             return None
 
     def _parse_notice_einstein_probe(self, text, facility):
@@ -1055,46 +855,6 @@ class GCNNoticeHandler:
             logger.error(f"Unexpected error parsing {facility} notice: {e}")
             return None
 
-    def _safe_csv_read(self, filepath):
-        """Safely read a CSV file, handling various error conditions."""
-        try:
-            # Try standard pandas read
-            return pd.read_csv(filepath)
-        except pd.errors.EmptyDataError:
-            logger.warning(f"CSV file {filepath} is empty")
-            return pd.DataFrame(columns=self.csv_columns)
-        except pd.errors.ParserError:
-            # If parser error, try a more robust approach
-            logger.warning(f"Parser error in CSV file {filepath}, attempting line-by-line read")
-            
-            valid_rows = []
-            expected_fields = len(self.csv_columns)
-            
-            with open(filepath, 'r') as f:
-                try:
-                    header = next(f).strip().split(',')
-                    for i, line in enumerate(f, 1):
-                        try:
-                            fields = line.strip().split(',')
-                            if len(fields) == expected_fields:
-                                valid_rows.append(fields)
-                            else:
-                                logger.warning(f"Line {i} has {len(fields)} fields, expected {expected_fields}")
-                        except Exception as e:
-                            logger.warning(f"Error processing line {i}: {e}")
-                except StopIteration:
-                    # File is empty or only has header
-                    return pd.DataFrame(columns=self.csv_columns)
-            
-            # Create DataFrame from valid rows
-            if valid_rows:
-                return pd.DataFrame(valid_rows, columns=header)
-            else:
-                return pd.DataFrame(columns=self.csv_columns)
-        except Exception as e:
-            logger.error(f"Unexpected error reading CSV file {filepath}: {e}")
-            return pd.DataFrame(columns=self.csv_columns)
-
     def _create_backup_with_limit(self, filepath: str, max_backups: int = 5) -> str:
         """
         Create a backup of the file and manage backup count to keep only the most recent ones.
@@ -1113,7 +873,6 @@ class GCNNoticeHandler:
         try:
             # Create new backup with timestamp
             backup_path = f"{filepath}.backup.{int(time.time())}"
-            import shutil
             shutil.copy2(filepath, backup_path)
             logger.debug(f"Created backup: {backup_path}")
             
@@ -1135,8 +894,6 @@ class GCNNoticeHandler:
             max_backups (int): Maximum number of backup files to keep
         """
         try:
-            import glob
-            
             # Find all backup files for this filepath
             backup_pattern = f"{filepath}.backup.*"
             backup_files = glob.glob(backup_pattern)
@@ -1148,8 +905,7 @@ class GCNNoticeHandler:
             # Sort by modification time (newest first)
             backup_files.sort(key=lambda x: os.path.getmtime(x), reverse=True)
             
-            # Keep only the most recent max_backups files
-            files_to_keep = backup_files[:max_backups]
+            # Identify files to remove
             files_to_remove = backup_files[max_backups:]
             
             # Remove old backup files
@@ -1162,294 +918,171 @@ class GCNNoticeHandler:
                 except Exception as e:
                     logger.warning(f"Failed to remove backup file {old_backup}: {e}")
             
-            logger.info(f"Cleaned up {removed_count} old backup files, keeping {len(files_to_keep)} most recent")
+            if removed_count > 0:
+                logger.info(f"Cleaned up {removed_count} old backup files, keeping {max_backups} most recent")
                 
         except Exception as e:
             logger.error(f"Error during backup cleanup: {e}")
 
 #---------------------------------------Main Function----------------------------------------
     def parse_notice(self, formatted_text: Union[str, bytes], topic: str) -> Optional[Dict[str, Any]]:
-        """
-        Parse notice and extract relevant information.
-        
-        Args:
-            formatted_text (str): Formatted text of the notice.
-            topic (str): Topic of the notice.
-        
-        Returns:
-            notice_data (dict): Parsed notice data.
-        """
         facility = self._get_facility(topic)
         if not facility:
-            logger.warning(f"Facility not found in topic: {topic}")
             return None
 
-        try:
-            if isinstance(formatted_text, bytes):
-                formatted_text = formatted_text.decode('utf-8')
-            else:
-                formatted_text = formatted_text
+        if isinstance(formatted_text, bytes):
+            formatted_text = formatted_text.decode('utf-8', 'ignore')
 
-            # Route to appropriate parser based on facility
-            if 'Swift' in facility:
-                return self._parse_notice_swift(formatted_text, facility)
-            elif 'Fermi' in facility:
-                return self._parse_notice_fermi(formatted_text, facility)
-            elif any(fac in facility for fac in ['AMON', 'IceCubeCASCADE', 'HAWC', 'IceCubeBRONZE', 'IceCubeGOLD', 'IceCube']):
-                return self._parse_notice_amon(formatted_text, facility)
-            elif 'CALET' in facility:
-                return self._parse_notice_calet(formatted_text, facility)
-            elif 'EinsteinProbe' in facility: # JSON
-                return self._parse_notice_einstein_probe(formatted_text, facility)
-            else:
-                logger.warning(f"No parser available for facility: {facility}")
-                return None
+        if 'EinsteinProbe' in facility:
+            return self._parse_notice_einstein_probe(formatted_text, facility)
+        
+        # Simplified routing logic
+        parser_key = None
+        if 'Swift' in facility: parser_key = 'swift'
+        elif 'Fermi' in facility: parser_key = 'fermi'
+        elif any(f in facility for f in ['AMON', 'IceCube', 'HAWC']): parser_key = 'amon'
+        elif 'CALET' in facility: parser_key = 'calet'
 
-        except Exception as e:
-            logger.error(f"Error parsing notice: {str(e)}")
-            return None
+        if parser_key:
+            return self._parse_text_notice(formatted_text, facility, self.PATTERNS[parser_key])
+        
+        logger.warning(f"No parser available for facility: {facility}")
+        return None
 
     def save_to_csv(self, notice_data: Dict[str, Any]) -> bool:
         """
-        Save notice data to CSV file.
-        Always appends as a new row, but name consistency is maintained
-        through the _generate_grb_name function.
-        
-        Args:
-            notice_data (dict): Notice data to be saved.
-        
-        Returns:
-            Bool: True if notice data is saved successfully, False otherwise.
+        Saves notice data to a CSV file using pandas for robustness and efficiency.
         """
         try:
             with self.file_lock:
-                # Format numeric values again just to be sure
-                formatted_data = notice_data.copy()
-                
-                # Format numeric fields to 2 decimal places
-                for field in ['RA', 'DEC', 'Error']:
-                    if field in formatted_data and formatted_data[field] not in ('', None):
-                        formatted_data[field] = round(float(formatted_data[field]), 2)
-                
-                # Format date fields to remove microseconds
-                for field in ['Discovery_UTC', 'Notice_date']:
-                    if field in formatted_data and formatted_data[field] not in ('', None):
-                        if isinstance(formatted_data[field], datetime):
-                            formatted_data[field] = formatted_data[field].replace(microsecond=0)
-                
-                # Create a row with None for missing columns
-                row_data = {col: formatted_data.get(col, None) for col in self.csv_columns}
-                
-                # Check if file exists
+                new_row_df = pd.DataFrame([notice_data]).reindex(columns=self.csv_columns)
                 file_exists = os.path.exists(self.output_csv)
-                
-                # Create new file with header if it doesn't exist
-                if not file_exists:
-                    with open(self.output_csv, 'w', newline='') as f:
-                        writer = csv.DictWriter(f, fieldnames=self.csv_columns)
-                        writer.writeheader()
-                        writer.writerow(row_data)
-                        logger.info(f"Created new CSV file with header: {self.output_csv}")
-                    return True
-                
-                # Check first line for header (up to 1024 characters)
-                with open(self.output_csv, 'r') as f:
-                    first_line = f.read(1024).strip().split("\n")[0]
-                
-                # Check if header is present
-                has_header = all(col in first_line for col in self.csv_columns)
-                
-                if not has_header:
-                    logger.warning(f"CSV file missing header at top line: {self.output_csv}")
-                
-                # Check if last character is a newline
-                with open(self.output_csv, 'rb+') as f:
-                    f.seek(-1, os.SEEK_END)  # Move to the last character
-                    last_char = f.read(1).decode('utf-8', errors='ignore')
-
-                    if last_char not in ('\n', '\r'):
-                        f.write(b'\n')  # Add a newline if missing
-                
-                # Append new data
-                with open(self.output_csv, 'a', newline='') as f:
-                    writer = csv.DictWriter(f, fieldnames=self.csv_columns)
-                    writer.writerow(row_data)
-                    logger.info(f"Added new row to CSV for {formatted_data.get('Name', 'Unknown')}")
-                
+                new_row_df.to_csv(
+                    self.output_csv, mode='a', header=not file_exists, index=False,
+                    quoting=csv.QUOTE_MINIMAL
+                )
+                logger.info(f"Successfully saved entry for {notice_data.get('Name', 'N/A')} to {self.output_csv}")
                 return True
-
         except Exception as e:
-            logger.error(f"Error saving to CSV: {e}")
+            logger.error(f"Failed to save to CSV file '{self.output_csv}': {e}", exc_info=True)
             return False
 
     def save_to_ascii(self, notice_data: Dict[str, Any], thread_ts: Optional[str] = None) -> bool:
         """
-        Save/update notice data to ASCII file with error handling.
+        Saves or updates notice data in a space-delimited ASCII file.
         """
         try:
             with self.file_lock:
-                # Load existing data with error handling
+                # --- 1. Load Existing Data ---
                 try:
-                    df = pd.read_csv(self.output_ascii, sep=r'\s+', quotechar='"', 
-                                quoting=csv.QUOTE_MINIMAL, dtype=str, na_filter=False)
-                    
-                    # Ensure all required columns exist
-                    for col in self.ascii_columns:
-                        if col not in df.columns:
-                            df[col] = ''
-
-                    # Reorder columns to match expected format  
-                    df = df[self.ascii_columns]
-
-                    # Fill NaN values with empty strings
-                    df = df.fillna('')
-                    
+                    df = pd.read_csv(self.output_ascii, sep=r'\s+', quotechar='"',
+                                    quoting=csv.QUOTE_MINIMAL, dtype=str, na_filter=False)
+                    missing_cols = set(self.ascii_columns) - set(df.columns)
+                    for col in missing_cols: df[col] = ''
+                    df = df[self.ascii_columns].fillna('')
                 except (pd.errors.EmptyDataError, FileNotFoundError):
                     df = pd.DataFrame(columns=self.ascii_columns)
-                    logger.info(f"Created new ASCII file: {self.output_ascii}")
-                    
                 except Exception as load_error:
-                    logger.warning(f"pandas failed to load file: {load_error}")
-                    
-                    # Create backup before recreating file
-                    if os.path.exists(self.output_ascii):
-                        backup_path = self._create_backup_with_limit(self.output_ascii, max_backups=5)
-                        logger.info(f"Created backup before recreation: {backup_path}")
-                    
+                    logger.warning(f"Failed to load '{self.output_ascii}', will recreate: {load_error}")
+                    self._create_backup_with_limit(self.output_ascii, max_backups=5)
                     df = pd.DataFrame(columns=self.ascii_columns)
-                    logger.info("Recreated empty DataFrame due to loading failure")
-                
-                # Find existing entry by checking if facility is in All_Facilities
-                facility = notice_data.get('Facility', '')
-                trigger_num = str(notice_data.get('Trigger_num', ''))
+
+                # --- 2. Prepare Data and Find Existing Entry ---
+                facility = str(notice_data.get('Facility', '')).strip()
+                trigger_num = str(notice_data.get('Trigger_num', '')).strip()
                 
                 existing_idx = None
-                if facility and trigger_num:
-                    for idx, row in df.iterrows():
-                        # Clean row facilities value
-                        raw_facilities = row.get('All_Facilities', '')
-                        if pd.isna(raw_facilities) or raw_facilities in ['nan', 'None', None]:
-                            row_facilities = ''
-                        else:
-                            row_facilities = str(raw_facilities).strip().strip('"')
-                        
-                        # Clean row trigger value
-                        raw_trigger = row.get('Trigger_num', '')
-                        if pd.isna(raw_trigger) or raw_trigger in ['nan', 'None', None]:
-                            row_trigger = ''
-                        else:
-                            row_trigger = str(raw_trigger).strip().strip('"')
-                        
-                        if (facility in row_facilities.split(',') and 
-                            row_trigger == trigger_num):
-                            existing_idx = idx
-                            break
-                
-                # Create new row data
-                row_data = {
-                    'GCN_ID': notice_data.get('GCN_ID', ''),
-                    'Name': notice_data.get('Name', ''),
-                    'RA': str(notice_data.get('RA', '')),
-                    'DEC': str(notice_data.get('DEC', '')),
-                    'Error': str(notice_data.get('Error', '')),
-                    'Discovery_UTC': notice_data.get('Discovery_UTC', ''),
-                    'Primary_Facility': facility,
-                    'Best_Facility': facility,
-                    'All_Facilities': facility,
-                    'Trigger_num': trigger_num,
-                    'Notice_date': notice_data.get('Notice_date', ''),
-                    'Last_Update': notice_data.get('Notice_date', ''),
-                    'Redshift': notice_data.get('Redshift', ''),
-                    'Host_info': notice_data.get('Host_info', ''),
-                    'thread_ts': thread_ts or ''
-                }
-                
-                if existing_idx is not None:
-                    # Update existing entry
-                    for col, val in row_data.items():
-                        # Clean value
-                        if pd.isna(val) or val in ['nan', 'None', None]:
-                            clean_val = ''
-                        else:
-                            clean_val = str(val).strip().strip('"')
-                        
-                        if clean_val:  # Only update if value is not empty
-                            if col == 'All_Facilities':
-                                # Update All_Facilities by adding new facility if not present
-                                existing_raw = df.at[existing_idx, col]
-                                if pd.isna(existing_raw) or existing_raw in ['nan', 'None', None]:
-                                    existing_facilities = ''
-                                else:
-                                    existing_facilities = str(existing_raw).strip().strip('"')
-                                
-                                # Update facilities list
-                                if not existing_facilities:
-                                    updated_facilities = facility
-                                elif not facility:
-                                    updated_facilities = existing_facilities
-                                else:
-                                    facilities_list = [f.strip() for f in existing_facilities.split(',')]
-                                    if facility not in facilities_list:
-                                        facilities_list.append(facility)
-                                    updated_facilities = ','.join(facilities_list)
-                                
-                                df.at[existing_idx, col] = updated_facilities
-                            else:
-                                df.at[existing_idx, col] = val
+                if facility and trigger_num and not df.empty:
+                    # Find by trigger number and normalized facility
+                    normalized_facility = self._normalize_facility_name(facility)
                     
-                    logger.info(f"Updated existing entry for {facility} trigger {trigger_num}")
+                    for idx, row in df.iterrows():
+                        row_trigger = str(row.get('Trigger_num', '')).strip()
+                        if row_trigger != trigger_num:
+                            continue
+                            
+                        # Check if this facility family is already in All_Facilities
+                        all_facilities = str(row.get('All_Facilities', '')).strip()
+                        if all_facilities:
+                            facilities_list = [f.strip() for f in all_facilities.split(',')]
+                            normalized_facilities = [self._normalize_facility_name(f) for f in facilities_list]
+                            
+                            if normalized_facility in normalized_facilities:
+                                existing_idx = idx
+                                break
+
+                # --- 3. Update or Append Logic ---
+                if existing_idx is not None:
+                    # UPDATE existing event
+                    name = df.at[existing_idx, 'Name']
+                    notice_data['Name'] = name
+                    
+                    # Update All_Facilities to include this specific facility
+                    existing_facilities = set(str(df.at[existing_idx, 'All_Facilities']).split(','))
+                    existing_facilities = {f.strip() for f in existing_facilities if f.strip()}
+                    existing_facilities.add(facility)
+                    
+                    # Update fields
+                    for col, value in notice_data.items():
+                        if col in df.columns and str(value).strip():
+                            df.at[existing_idx, col] = value
+                    
+                    # Update All_Facilities
+                    df.at[existing_idx, 'All_Facilities'] = ','.join(sorted(existing_facilities))
+                    df.at[existing_idx, 'Last_Update'] = notice_data.get('Notice_date', '')
+                    
+                    # Update thread_ts if provided
+                    if thread_ts:
+                        df.at[existing_idx, 'thread_ts'] = thread_ts
+                        logger.info(f"Updated thread_ts for existing entry: {thread_ts}")
+                        
+                    logger.info(f"Updated existing entry for {facility} trigger {trigger_num}.")
                 else:
-                    # Add new entry at the top
+                    # APPEND new event
+                    if 'Name' not in notice_data or not notice_data['Name']:
+                        name = self._generate_grb_name(notice_data['Discovery_UTC'], facility, df)
+                        notice_data['Name'] = name
+                    else:
+                        name = notice_data['Name']
+                        logger.info(f"Using pre-assigned name: {name}")
+                    
+                    row_data = {col: notice_data.get(col, '') for col in self.ascii_columns}
+                    row_data.update({
+                        'Primary_Facility': facility, 
+                        'Best_Facility': facility,
+                        'All_Facilities': facility, 
+                        'Last_Update': notice_data.get('Notice_date', ''),
+                        'thread_ts': thread_ts if thread_ts else ''
+                    })
                     new_row_df = pd.DataFrame([row_data])
                     df = pd.concat([new_row_df, df], ignore_index=True)
-                    logger.info(f"Added new entry for {row_data['Name']}")
-                
-                # Keep max events limit with optimized sorting
-                if len(df) > self.ascii_max_events:
-                    # Sort by Notice_date directly without creating temporary column
-                    df['_sort_key'] = pd.to_datetime(df['Notice_date'].str.strip('"'), errors='coerce')
-                    df = df.sort_values('_sort_key', ascending=False, na_position='last').head(self.ascii_max_events)
-                    df = df.drop('_sort_key', axis=1)
-                    logger.info(f"Kept {self.ascii_max_events} most recent events")
+                    logger.info(f"Added new entry for {name} with thread_ts: {thread_ts if thread_ts else 'empty'}")
 
-                # Create backup before saving
-                if os.path.exists(self.output_ascii):
-                    backup_path = self._create_backup_with_limit(self.output_ascii, max_backups=5)
-                    logger.info(f"Created backup: {backup_path}")
+                # --- 4. Trim DataFrame to Max Events ---
+                if len(df) > self.ascii_max_events:
+                    df['_sort_key'] = pd.to_datetime(df['Notice_date'], errors='coerce')
+                    df = df.sort_values('_sort_key', ascending=False, na_position='last').head(self.ascii_max_events)
+                    df = df.drop(columns=['_sort_key'])
                 
-                # Save with simplified formatting
-                with open(self.output_ascii, 'w') as f:
-                    f.write(' '.join(self.ascii_columns) + '\n')
-                    
-                    for _, row in df.iterrows():
-                        formatted_values = []
-                        for col in self.ascii_columns:
-                            # Clean value
-                            raw_val = row.get(col, '')
-                            if pd.isna(raw_val) or raw_val in ['nan', 'None', None]:
-                                val = ''
-                            else:
-                                val = str(raw_val).strip().strip('"')
-                            
-                            # Apply quotes for specific columns or values with spaces
-                            if val and (col in ['Name', 'Discovery_UTC', 'Notice_date', 'Last_Update', 
-                                            'Redshift', 'Host_info'] or ' ' in val):
-                                val = f'"{val}"'
-                            
-                            formatted_values.append(val)
-                        
-                        f.write(' '.join(formatted_values) + '\n')
+                # --- 5. Backup and Save ---
+                self._create_backup_with_limit(self.output_ascii, max_backups=5)
                 
-                logger.info(f"ASCII file saved with {len(df)} entries")
+                # Ensure thread_ts column is preserved in output
+                df.to_csv(
+                    self.output_ascii, sep=' ', header=True, index=False,
+                    quoting=csv.QUOTE_MINIMAL, quotechar='"',
+                    columns=self.ascii_columns  # Explicitly specify column order
+                )
+                
+                logger.info(f"ASCII file '{self.output_ascii}' saved successfully with {len(df)} entries.")
                 return True
-                
+
         except Exception as e:
-            logger.error(f"Failed to save ASCII file: {e}")
+            logger.error(f"A critical error occurred in save_to_ascii: {e}", exc_info=True)
             return False
 
 #---------------------------------------Test Code----------------------------------------
 if __name__ == "__main__":
-    import shutil
     
     ######################## Setup for test ########################
     

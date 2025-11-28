@@ -91,9 +91,9 @@ class GCNToOEmailer:
             
             # If we have visibility info, check if currently observable or soon
             if visibility_info:
-                status = visibility_info.get('status', '')
+                status = visibility_info.get('current_status', '')
                 
-                if status == 'observable_now':
+                if status == 'Observable Now':
                     self.logger.info(f"Target is currently observable. Sending ToO request.")
                     return True
                     
@@ -129,16 +129,16 @@ class GCNToOEmailer:
             return True
 
     def _prepare_email_content(self, notice_data: Dict[str, Any], 
-                            visibility_info: Optional[Dict[str, Any]] = None,
+                            analysis: Optional[Dict[str, Any]] = None,
                             too_config: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         """
         Prepare email content from notice data with visibility information.
         
         Args:
             notice_data: Dictionary containing notice information
-            visibility_info: Optional dictionary with visibility analysis
+            analysis: Optional dictionary with visibility analysis
             too_config: Optional dictionary with configuration options
-                
+            
         Returns:
             Dictionary containing email content
         """
@@ -146,17 +146,18 @@ class GCNToOEmailer:
         default_config = {
             'singleExposure': 100,       # Default exposure time in seconds
             'imageCount': 3,             # Default number of images
-            'obsmode': 'Deep',           # Default observation mode
-            'selectedFilters': ['r', 'i'], # Default filters
-            'selectedTelNumber': 1,      # Default number of telescopes
-            'abortObservation': 'Yes',   # Default abort setting
-            'priority': 'High',          # Default priority
-            'gain': 'High',              # Default gain
+            'obsmode': 'Spec',           # Default observation mode
+            'specmode': 'specall.specmode',       # Default spec mode
+            'abortObservation': 'No',   # Default abort setting
+            'priority': '50',          # Default priority
+            'gain': '2750',              # Default gain
             'radius': '0',               # Default radius
             'binning': '1',              # Default binning
         }
-        
-        # Use provided config or defaults
+        if not default_config['obsmode'] == 'Spec':
+            default_config['selectedFilters'] = ['g', 'r', 'i']
+            
+        # Use provided config or defaults   
         if too_config is None:
             too_config = {}
         
@@ -166,28 +167,20 @@ class GCNToOEmailer:
         # Calculate total exposure time
         total_exposure = obs_config['singleExposure'] * obs_config['imageCount']
         
-        # Create visibility status string
+        # Create visibility status string from the new analysis object
         visibility_status = "Not available"
-        if visibility_info:
-            status = visibility_info.get('status', '')
-            
-            if status == 'observable_now':
-                end_time = visibility_info.get('observable_end')
-                if end_time:  # Check if end_time is not None
-                    end_time_str = end_time.strftime('%H:%M')
-                else:
-                    end_time_str = "Unknown"
-                visibility_status = f"Currently observable until {end_time_str} CLT"
-            elif status == 'observable_later':
-                hours_until = visibility_info.get('hours_until_observable', 0)
-                start_time = visibility_info.get('observable_start')
-                if start_time:  # Check if start_time is not None
-                    start_time_str = start_time.strftime('%H:%M')
-                else:
-                    start_time_str = "Unknown"
-                visibility_status = f"Observable in {hours_until:.1f} hours (from {start_time_str} CLT)"
-            else:
-                visibility_status = f"Not observable: {visibility_info.get('reason', 'Unknown limitation')}"
+        if analysis and analysis.get('tonight'):
+            tonight = analysis['tonight']
+            if tonight['status'] == 'OBSERVABLE':
+                if tonight['when'] == 'now':
+                    end_time = datetime.fromisoformat(tonight['window']['end_time_utc'].replace('Z', '+00:00')).strftime('%H:%M')
+                    visibility_status = f"Currently observable until {end_time} CLT"
+                elif tonight['when'] == 'later':
+                    start_time = datetime.fromisoformat(tonight['window']['start_time_utc'].replace('Z', '+00:00')).strftime('%H:%M')
+                    hours_until = tonight['window']['time_until_start_hours']
+                    visibility_status = f"Observable in {hours_until:.1f} hours (from {start_time} CLT)"
+            else: # Not observable
+                visibility_status = f"Not observable: {tonight.get('reason', 'Unknown')}"
         
         # Create data dictionary for email
         email_data = {
@@ -210,15 +203,18 @@ class GCNToOEmailer:
             'comments': f"New event {notice_data.get('Name')}. "
                         f"Facility: {notice_data.get('Facility')}. "
                         f"Trigger: {notice_data.get('Trigger_num')}. "
-                        f"Visibility: {visibility_status}. "
                         f"Automatic ToO request from GCN Alert System."
         }
         
         # Allow custom comments to be appended
         if too_config.get('additional_comments'):
+            self.logger.debug("Appending additional comments to email")
             email_data['comments'] += f" {too_config['additional_comments']}"
+    
+        self.logger.debug("Successfully prepared email data for target: %s", target_name)
         
         return email_data
+    
     def _determine_neutrino_priority(self, notice_data):
         """
         Determine priority level for neutrino events.
@@ -312,7 +308,7 @@ class GCNToOEmailer:
 
     def send_too_email(self, 
                        notice_data: Dict[str, Any],
-                       visibility_info: Optional[Dict[str, Any]] = None,
+                       analysis: Optional[Dict[str, Any]] = None,
                        too_config: Optional[Dict[str, Any]] = None) -> bool:
         """
         Send ToO request email with visibility information.
@@ -326,18 +322,17 @@ class GCNToOEmailer:
             Boolean indicating if email was sent successfully
         """
         try:
-            # Prepare email data with visibility info
-            email_data = self._prepare_email_content(notice_data, visibility_info, too_config)
+            email_data = self._prepare_email_content(notice_data, analysis, too_config)
             
-            # Construct subject with visibility status for quick recognition
-            status_prefix = ""
-            if visibility_info:
-                if visibility_info.get('status') == 'observable_now':
-                    status_prefix = "🟢 [URGENT-OBSERVABLE NOW] "
-                elif visibility_info.get('status') == 'observable_later':
-                    status_prefix = "🟠 [SCHEDULED] "
-                else:
-                    status_prefix = "🔴 [ALERT] "
+            # Construct subject with status from the analysis object
+            status_prefix = "🔴 [ALERT] "
+            if analysis and analysis.get('tonight'):
+                tonight = analysis['tonight']
+                if tonight.get('status') == 'OBSERVABLE':
+                    if tonight.get('when') == 'now':
+                        status_prefix = "🟢 [URGENT-OBSERVABLE NOW] "
+                    else: # 'later'
+                        status_prefix = "🟠 [SCHEDULED] "
             
             subject = f"{status_prefix}7DT ToO Request for {email_data['target']}"
             
@@ -352,35 +347,35 @@ class GCNToOEmailer:
                 
             # Include visibility status in the email body with appropriate emoji
             visibility_section = ""
-            if visibility_info:
-                status = visibility_info.get('status', '')
+            if analysis:
+                status = analysis.get('status', '')
                 
                 if status == 'observable_now':
                     # Safe access to observable_end with fallback
-                    end_time = visibility_info.get('observable_end')
+                    end_time = analysis.get('observable_end')
                     end_time_str = end_time.strftime('%H:%M') if end_time else "Unknown"
                     
                     visibility_section = (
                         "**Visibility Status: 🟢 CURRENTLY OBSERVABLE**\n"
                         f"- Observable until: {end_time_str} CLT\n"
-                        f"- Current altitude: {visibility_info.get('current_altitude', 0):.1f}°\n"
-                        f"- Moon separation: {visibility_info.get('current_moon_separation', 0):.1f}°\n"
+                        f"- Current altitude: {analysis.get('current_altitude', 0):.1f}°\n"
+                        f"- Moon separation: {analysis.get('current_moon_separation', 0):.1f}°\n"
                     )
                 elif status == 'observable_later':
                     # Safe access with fallbacks
-                    start_time = visibility_info.get('observable_start')
+                    start_time = analysis.get('observable_start')
                     start_time_str = start_time.strftime('%H:%M') if start_time else "Unknown"
                     
                     visibility_section = (
                         "**Visibility Status: 🟠 OBSERVABLE LATER TONIGHT**\n"
                         f"- Observable from: {start_time_str} CLT\n"
-                        f"- Observable window: {visibility_info.get('observable_hours', 0):.1f} hours\n"
+                        f"- Observable window: {analysis.get('observable_hours', 0):.1f} hours\n"
                         f"- Recommended start: {start_time_str} CLT\n"
                     )
                 else:
                     visibility_section = (
                         "**Visibility Status: 🔴 NOT OBSERVABLE**\n"
-                        f"- Reason: {visibility_info.get('reason', 'Unknown limitation')}\n"
+                        f"- Reason: {analysis.get('reason', 'Unknown limitation')}\n"
                     )
             
             email_body = f"""
@@ -400,8 +395,6 @@ AUTOMATIC ToO Request - GRB Alert
 - Obsmode: {email_data['obsmode']}
     {details1}
     {details2}
-
-{visibility_section}
 
 **Detailed Settings**
 --------------------
