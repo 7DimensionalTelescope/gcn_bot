@@ -172,3 +172,26 @@ cython_debug/
 
 # PyPI configuration file
 .pypirc
+
+# Config file
+.config.py
+config.py
+
+# Image
+*.png
+test_plots/
+
+# Old folder
+old/
+
+# results
+*.csv
+*.ascii
+grb_targets.ascii
+grb_targets.ascii.backup.*
+
+# test
+*test*.py
+*test*.ascii*
+*test*.csv
+*test*

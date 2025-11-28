@@ -1,0 +1,3 @@
+[submodule "supy"]
+	path = supy
+	url = https://github.com/7DimensionalTelescope/supy.git
