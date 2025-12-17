@@ -847,121 +847,27 @@ class SlackToOIntegration:
     
     def extract_form_data(self, form_values: Dict[str, Any]) -> Dict[str, Any]:
         """Extract and format form data from Slack modal submission."""
-        try:
-            # Extract all form fields
-            form_data = {
-                'requester': form_values['requester_block']['requester_input']['value'],
-                'target': form_values['target_block']['target_input']['value'],
-                'ra': form_values['ra_block']['ra_input']['value'],
-                'dec': form_values['dec_block']['dec_input']['value'],
-                'exposure': form_values['exposure_block']['exposure_input']['value'],
-                'singleExposure': form_values['exposure_block']['exposure_input']['value'],
-                'imageCount': form_values['count_block']['count_input']['value'],
-                'obsmode': form_values['obsmode_block']['obsmode_input']['selected_option']['value'],
-                'specmode': form_values['specmode_block']['specmode_input']['value'],
-                'priority': form_values['priority_block']['priority_input']['selected_option']['value'],
-                'binning': form_values['binning_block']['binning_input']['selected_option']['value'],
-                'gain': form_values['gain_block']['gain_input']['selected_option']['value'],
-                'abortObservation': form_values['abort_block']['abort_input']['selected_option']['value'],
-                'comments': form_values['comments_block']['comments_input']['value']
-            }
-            
-            # Extract filters if selected
-            filters_options = form_values.get('filters_block', {}).get('filters_input', {}).get('selected_options', [])
-            form_data['selectedFilters'] = [opt['value'] for opt in filters_options]
-            
-            # Add computed fields
-            form_data['totalExposureTime'] = int(form_data['exposure']) * int(form_data['imageCount'])
-            form_data['is_ToO'] = form_data['abortObservation'] == 'Yes'
-            
-            return form_data
-            
-        except Exception as e:
-            logger.error(f"Error extracting form data: {e}")
-            return {}
-    
-    def convert_slack_form_to_email_data(self, form_data: Dict[str, Any], 
-                                    user_name: str, user_email: str,
-                                    notice_data: Dict[str, Any]) -> Dict[str, Any]:
-        """
-        Enhanced version of convert_slack_form_to_email_data method for SlackToOIntegration class.
+        form_data = {
+            'requester': form_values['requester_block']['requester_input']['value'],
+            'target': form_values['target_block']['target_input']['value'],
+            'ra': form_values['ra_block']['ra_input']['value'],
+            'dec': form_values['dec_block']['dec_input']['value'],
+            'exposure': form_values['exposure_block']['exposure_input']['value'],
+            'imageCount': form_values['count_block']['count_input']['value'],
+            'obsmode': form_values['obsmode_block']['obsmode_input']['selected_option']['value'],
+            'specmode': form_values.get('specmode_block', {}).get('specmode_input', {}).get('selected_option', {}).get('value', 'Spec'),
+            'priority': form_values['priority_block']['priority_input']['selected_option']['value'],
+            'binning': form_values['binning_block']['binning_input']['selected_option']['value'],
+            'gain': form_values['gain_block']['gain_input']['selected_option']['value'],
+            'abortObservation': form_values['abort_block']['abort_input']['selected_option']['value'],
+            'comments': form_values['comments_block']['comments_input']['value']
+        }
         
-        This function converts Slack modal form data to the exact format expected by 
-        GCNToOEmailer.send_too_email() method.
+        # Extract filters
+        filters_options = form_values.get('filters_block', {}).get('filters_input', {}).get('selected_options', [])
+        form_data['selectedFilters'] = [opt['value'] for opt in filters_options]
         
-        Args:
-            form_data: Data extracted from Slack modal submission
-            user_name: Display name of user who submitted form
-            user_email: Email address of user who submitted form
-            notice_data: Original GCN notice data
-            
-        Returns:
-            Dictionary formatted for GCNToOEmailer.send_too_email()
-        """
-        try:
-            # Get current timestamp for submission
-            submission_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S UTC')
-            
-            # Create email data structure expected by GCNToOEmailer
-            email_data = {
-                # User and submission info
-                'requester': user_email,
-                'submitter_name': user_name,
-                'submission_time': submission_time,
-                'submitted_via': 'Slack Bot',
-                
-                # Target information (required fields)
-                'target': form_data['target'],
-                'ra': form_data['ra'],
-                'dec': form_data['dec'],
-                
-                # Observation parameters
-                'exposure': int(form_data['exposure']) * int(form_data['imageCount']),  # Total exposure
-                'singleExposure': int(form_data['exposure']),  # Single exposure time
-                'imageCount': int(form_data['imageCount']),
-                'obsmode': form_data['obsmode'],
-                'specmode': form_data['specmode'],
-                'selectedFilters': form_data['selectedFilters'],
-                'priority': form_data['priority'],
-                'binning': form_data['binning'],
-                'gain': form_data['gain'],
-                'abortObservation': form_data['abortObservation'],
-                
-                # Additional fields for tcspy compatibility
-                'selectedTelNumber': 1,  # Default to 1 telescope
-                'radius': '0',  # Default radius
-                'obsStartTime': 'ASAP',  # Immediate start
-                'is_ToO': True,  # Always true for ToO requests
-                
-                # Include original notice info if available
-                'original_facility': notice_data.get('Facility', 'Unknown'),
-                'original_trigger': notice_data.get('Trigger_num', 'Unknown'),
-                'gcn_notice_type': notice_data.get('Notice_type', 'Unknown')
-            }
-            
-            # Handle comments with Slack-specific information
-            base_comments = form_data.get('comments', '')
-            slack_info = f"Submitted via Slack Bot by {user_name} ({user_email}) at {submission_time}"
-            
-            if base_comments:
-                email_data['comments'] = f"{base_comments}\n\n--- Submission Info ---\n{slack_info}"
-            else:
-                email_data['comments'] = slack_info
-                
-            # Validate required fields
-            required_fields = ['target', 'ra', 'dec', 'requester']
-            missing_fields = [field for field in required_fields if not email_data.get(field)]
-            
-            if missing_fields:
-                logger.error(f"Missing required fields in email data: {missing_fields}")
-                return {}
-                
-            logger.info(f"Successfully converted Slack form data to email format for target: {email_data['target']}")
-            return email_data
-            
-        except Exception as e:
-            logger.error(f"Error converting Slack form data to email format: {e}")
-            return {}
+        return form_data
 
 ############################## Initialize Clients ############################
 # Initialize Slack client

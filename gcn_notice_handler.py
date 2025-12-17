@@ -321,7 +321,8 @@ class GCNNoticeHandler:
             'error': r"GRB_ERROR:\s*([\d.]+)\s*\[(\w+).*?\]",
             'date': r"GRB_DATE:.*?(\d{2})/(\d{2})/(\d{2})",
             'time': r"GRB_TIME:.*?{([\d:\.]+)}\s*UT",
-            'trigger_num': r"TRIGGER_NUM:\s*(\d+)"
+            'trigger_num': r"TRIGGER_NUM:\s*(\d+)",
+            'notice_date': r"NOTICE_DATE:\s*(\w{3})\s+(\d{1,2})\s+(\w{3})\s+(\d{2})\s+(\d{2}):(\d{2}):(\d{2}(?:\.\d+)?)\s*UT"  # Add this line
         },
         'swift': {
             'ra': r"(?:GRB_RA|POINT_RA):.*?(\d+\.\d+)d?.*\(J2000\)",
@@ -329,7 +330,8 @@ class GCNNoticeHandler:
             'error': r"GRB_ERROR:\s*([\d.]+)\s*\[(\w+).*?\]",
             'date': r"(?:GRB_DATE|IMG_START_DATE):.*?(\d{2})/(\d{2})/(\d{2})",
             'time': r"(?:GRB_TIME|IMG_START_TIME):.*?{([\d:\.]+)}\s*UT",
-            'trigger_num': r"TRIGGER_NUM:\s*(\d+)"
+            'trigger_num': r"TRIGGER_NUM:\s*(\d+)",
+            'notice_date': r"NOTICE_DATE:\s*(\w{3})\s+(\d{1,2})\s+(\w{3})\s+(\d{2})\s+(\d{2}):(\d{2}):(\d{2}(?:\.\d+)?)\s*UT"  # Add this line
         },
         'amon': {
             'ra': r"SRC_RA:.*?(\d+\.\d+)d?.*?\(J2000\)",
@@ -337,15 +339,17 @@ class GCNNoticeHandler:
             'error': r"SRC_ERROR:\s*([\d.]+)\s*\[(\w+).*?\]",
             'date': r"DISCOVERY_DATE:.*?(\d{2})/(\d{2})/(\d{2})",
             'time': r"DISCOVERY_TIME:.*?{([\d:\.]+)}\s*UT",
-            'trigger_num': r"EVENT_NUM:\s*(\d+)"
+            'trigger_num': r"EVENT_NUM:\s*(\d+)",
+            'notice_date': r"NOTICE_DATE:\s*(\w{3})\s+(\d{1,2})\s+(\w{3})\s+(\d{2})\s+(\d{2}):(\d{2}):(\d{2}(?:\.\d+)?)\s*UT"  # Add this line
         },
         'calet': {
             'ra': r"POINT_RA:.*?(\d+\.\d+)d?.*?\(J2000\)",
             'dec': r"POINT_DEC:.*?([-+]?\d+\.\d+)d?.*?\(J2000\)",
-            'error': None, # CALET has no error field
+            'error': None,
             'date': r"TRIGGER_DATE:.*?(\d{2})/(\d{2})/(\d{2})",
             'time': r"TRIGGER_TIME:.*?{([\d:\.]+)}\s*UT",
-            'trigger_num': r"TRIGGER_NUM:\s*(\d+)"
+            'trigger_num': r"TRIGGER_NUM:\s*(\d+)",
+            'notice_date': r"NOTICE_DATE:\s*(\w{3})\s+(\d{1,2})\s+(\w{3})\s+(\d{2})\s+(\d{2}):(\d{2}):(\d{2}(?:\.\d+)?)\s*UT"  # Add this line
         }
     }
     
@@ -435,7 +439,7 @@ class GCNNoticeHandler:
                 return None
                 
             df = pd.read_csv(self.output_ascii, sep=r'\s+', 
-                            quotechar='"', quoting=csv.QUOTE_MINIMAL, 
+                            quotechar='"', quoting=csv.QUOTE_NONNUMERIC, 
                             dtype=str, na_filter=False)
             
             if df.empty:
@@ -618,7 +622,8 @@ class GCNNoticeHandler:
         
         try:
             # Try to match each patterns
-            matches = {key: re.search(pattern, text, re.DOTALL) for key, pattern in patterns.items()}
+            matches = {key: re.search(pattern, text, re.DOTALL) if pattern else None 
+                    for key, pattern in patterns.items()}
             
             # In strict parsing mode, check if all patterns matched
             if self.strict_parsing:
@@ -1070,7 +1075,7 @@ class GCNNoticeHandler:
                 # Ensure thread_ts column is preserved in output
                 df.to_csv(
                     self.output_ascii, sep=' ', header=True, index=False,
-                    quoting=csv.QUOTE_MINIMAL, quotechar='"',
+                    quoting=csv.QUOTE_NONNUMERIC, quotechar='"',
                     columns=self.ascii_columns  # Explicitly specify column order
                 )
                 
