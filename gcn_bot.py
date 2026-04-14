@@ -696,18 +696,13 @@ class SlackToOIntegration:
                     "type": "input",
                     "block_id": "priority_block",
                     "element": {
-                        "type": "static_select",
+                        "type": "plain_text_input",
                         "action_id": "priority_input",
-                        "initial_option": {
-                            "text": {"type": "plain_text", "text": "High"},
-                            "value": "High"
-                        },
-                        "options": [
-                            {"text": {"type": "plain_text", "text": "Low"}, "value": "Low"},
-                            {"text": {"type": "plain_text", "text": "Medium"}, "value": "Medium"},
-                            {"text": {"type": "plain_text", "text": "High"}, "value": "High"},
-                            {"text": {"type": "plain_text", "text": "Urgent"}, "value": "Urgent"}
-                        ]
+                        "initial_value": "50",
+                        "placeholder": {
+                            "type": "plain_text",
+                            "text": "50"
+                        }
                     },
                     "label": {
                         "type": "plain_text",
@@ -730,7 +725,8 @@ class SlackToOIntegration:
                             {"text": {"type": "plain_text", "text": "1"}, "value": "1"},
                             {"text": {"type": "plain_text", "text": "2"}, "value": "2"},
                             {"text": {"type": "plain_text", "text": "3"}, "value": "3"},
-                            {"text": {"type": "plain_text", "text": "4"}, "value": "4"}
+                            {"text": {"type": "plain_text", "text": "4"}, "value": "4"},
+                            {"text": {"type": "plain_text", "text": "5"}, "value": "5"}
                         ]
                     },
                     "label": {
@@ -744,17 +740,13 @@ class SlackToOIntegration:
                     "type": "input",
                     "block_id": "gain_block",
                     "element": {
-                        "type": "static_select",
+                        "type": "plain_text_input",
                         "action_id": "gain_input",
-                        "initial_option": {
-                            "text": {"type": "plain_text", "text": "High"},
-                            "value": "High"
-                        },
-                        "options": [
-                            {"text": {"type": "plain_text", "text": "Low"}, "value": "Low"},
-                            {"text": {"type": "plain_text", "text": "Medium"}, "value": "Medium"},
-                            {"text": {"type": "plain_text", "text": "High"}, "value": "High"}
-                        ]
+                        "initial_value": "2750",
+                        "placeholder": {
+                            "type": "plain_text",
+                            "text": "2750"
+                        }
                     },
                     "label": {
                         "type": "plain_text",
@@ -770,12 +762,12 @@ class SlackToOIntegration:
                         "type": "radio_buttons",
                         "action_id": "abort_input",
                         "initial_option": {
-                            "text": {"type": "plain_text", "text": "No"},
-                            "value": "No"
+                            "text": {"type": "plain_text", "text": "True"},
+                            "value": "True"
                         },
                         "options": [
-                            {"text": {"type": "plain_text", "text": "Yes"}, "value": "Yes"},
-                            {"text": {"type": "plain_text", "text": "No"}, "value": "No"}
+                            {"text": {"type": "plain_text", "text": "True"}, "value": "True"},
+                            {"text": {"type": "plain_text", "text": "False"}, "value": "False"}
                         ]
                     },
                     "label": {
@@ -1078,8 +1070,9 @@ def _filter_notice_text(text, topic):
                 full_trigger_time = f"{combined_date_time} {trigger_time}"
             else:
                 # Use current date if no GRB_DATE found
-                today = datetime.now().strftime("%y/%m/%d")
+                today = datetime.now(tz=timezone.utc).strftime("%y/%m/%d")
                 full_trigger_time = f"{today} {trigger_time}"
+                logger.debug(f"Using current date for trigger time: {full_trigger_time}")
             
             # Add standardized trigger time
             standardized_trigger = _standardize_time_format(full_trigger_time)
@@ -1235,7 +1228,7 @@ def _format_json_notice(json_data, facility):
     }
     
     # Track notice date and trigger time for time difference calculation
-    notice_date = datetime.now().strftime("%a %d %b %y %H:%M:%S")
+    notice_date = datetime.now(tz=timezone.utc).strftime("%a %d %b %y %H:%M:%S")
     trigger_time = None
     
     # Basic Info section
@@ -2005,7 +1998,7 @@ def check_connection() -> None:
                                         "type": "section",
                                         "text": {
                                             "type": "mrkdwn",
-                                            "text": f"*Time:* {datetime.now().strftime('%Y-%m-%d %H:%M:%S UTC')}"
+                                            "text": f"*Time:* {datetime.now(tz=timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}"
                                         }
                                     }
                                 ]
@@ -2808,8 +2801,8 @@ def process_notice_and_send_message(topic, value, slack_client, slack_channel, t
                     ])
                 
                 # Add ToO button if GRB keywords are present
-                grb_keywords = ['GRB', 'Fermi', 'Swift', 'IceCube', 'HAWC', 'AMON']
-                if any(keyword.lower() in topic.lower() for keyword in grb_keywords):
+                # grb_keywords = ['GRB', 'Fermi', 'Swift', 'IceCube', 'HAWC', 'AMON']
+                # if any(keyword.lower() in topic.lower() for keyword in grb_keywords):
                     if too_integration:
                         try:
                             enhanced_blocks = too_integration.add_too_button_to_message(message_blocks, notice_data)

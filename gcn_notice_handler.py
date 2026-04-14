@@ -176,7 +176,7 @@ import os
 import csv
 import shutil
 import glob
-from datetime import datetime
+from datetime import datetime, timezone
 from threading import Lock
 from typing import Dict, Any, Optional, Union, List, Tuple
 import json
@@ -617,7 +617,7 @@ class GCNNoticeHandler:
             'error': None,
             'trigger_date': None,
             'trigger_num': None,
-            'notice_date': datetime.now()
+            'notice_date': datetime.now(tz=timezone.utc)
         }
         
         try:
@@ -772,7 +772,7 @@ class GCNNoticeHandler:
             'dec': None,
             'error': 0.0,
             'trigger_date': None,
-            'notice_date': datetime.now().replace(microsecond=0), # Set to current time since JSON format doesn't have a notice date
+            'notice_date': datetime.now(tzinfo=timezone.utc).replace(microsecond=0), # Set to current time since JSON format doesn't have a notice date
             'trigger_num': 'UNKNOWN'
         }
         
@@ -807,7 +807,7 @@ class GCNNoticeHandler:
             if 'trigger_time' in data:
                 try:
                     trigger_date = datetime.fromisoformat(data['trigger_time'].replace('Z', '+00:00'))
-                    parsed_data['trigger_date'] = trigger_date.replace(tzinfo=None)
+                    parsed_data['trigger_date'] = trigger_date.replace(tzinfo=timezone.utc)
                     logger.debug(f"Successfully parsed trigger date from {facility}: {parsed_data['trigger_date']}")
                 except (ValueError, TypeError) as e:
                     logger.warning(f"Could not parse trigger time from {facility}: {e}")
@@ -1199,7 +1199,7 @@ ERROR_RADIUS:   0.5 [deg]"""
     test_logger.info("\nTesting GRB name generation...")
 
     # Generate a name and test
-    test_date = datetime.now()
+    test_date = datetime.now(tz=timezone.utc)
     name1 = handler._generate_grb_name(test_date)
     test_logger.info(f"Generated name: {name1}")
 
