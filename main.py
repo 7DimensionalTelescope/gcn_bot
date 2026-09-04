@@ -34,13 +34,36 @@ from typing import Any, Callable, Optional
 # ---------------------------------------------------------------------------
 # Logging — configure before importing sub-modules so their loggers inherit
 # ---------------------------------------------------------------------------
+LOG_FORMAT = "%(asctime)s [%(levelname)-7s] %(name)-20s — %(message)s"
+LOG_DATEFMT = "%Y-%m-%d %H:%M:%S"
+
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s — %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
+    format=LOG_FORMAT,
+    datefmt=LOG_DATEFMT,
 )
-logging.getLogger("slack_bolt").setLevel(logging.WARNING)
+
+# Quieten noisy third-party loggers so the startup log shows only the bot's
+# own messages. numexpr in particular emits several INFO lines about core
+# counts the moment it is imported (transitively, via numpy/astropy).
+for _noisy in ("slack_bolt", "numexpr", "numexpr.utils"):
+    logging.getLogger(_noisy).setLevel(logging.WARNING)
+
 logger = logging.getLogger(__name__)
+
+
+def _log_banner(title: str, lines: "Optional[list]" = None) -> None:
+    """Emit a visually distinct section header (and optional body lines).
+
+    Groups startup output into readable blocks instead of a flat stream.
+    """
+    bar = "─" * 55
+    logger.info(bar)
+    logger.info(title)
+    if lines:
+        for line in lines:
+            logger.info(f"  • {line}")
+    logger.info(bar)
 
 
 class _DeferredThreadTs:
@@ -197,10 +220,15 @@ class GCNBot:
             connection_timeout=config.connection_timeout,
         )
 
-        logger.info(
-            f"GCNBot initialised — channel={config.slack_channel!r}, "
-            f"topics={len(all_topics)}, send={send_to_slack}, "
-            f"auto_too={config.turn_on_too_email_auto}"
+        _log_banner(
+            "GCNBot ready",
+            [
+                f"Slack channel : {config.slack_channel}",
+                f"Topics        : {len(all_topics)} subscribed",
+                f"Telescopes    : 7DT, RASA36 (CTIO) + LOAO",
+                f"Send to Slack : {send_to_slack}",
+                f"Auto-ToO email: {config.turn_on_too_email_auto}",
+            ],
         )
 
     # ------------------------------------------------------------------
@@ -1074,6 +1102,8 @@ def main() -> None:
     args = _parse_args()
 
     logging.getLogger().setLevel(getattr(logging, args.log_level))
+
+    _log_banner("GCN Alert Bot — starting up")
 
     from config import BotConfig
 

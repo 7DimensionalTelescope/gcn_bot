@@ -11,9 +11,12 @@
 
 import os
 import sys
+import logging
 import requests
 from requests.exceptions import RequestException, JSONDecodeError
 from urllib.parse import urljoin  # robust URL construction
+
+logger = logging.getLogger(__name__)
 
 
 def _tls_hint(exc):
@@ -82,9 +85,9 @@ class GWPortalClient:
         if not self.verify_tls:
             import urllib3
             urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-            print("GWPortalClient: WARNING - TLS certificate verification is DISABLED "
-                  "(GWPORTAL_INSECURE_SKIP_VERIFY). Emergency use only; unset it once "
-                  "the server certificate is renewed.", file=sys.stderr)
+            logger.warning("TLS certificate verification is DISABLED "
+                           "(GWPORTAL_INSECURE_SKIP_VERIFY). Emergency use only; unset it once "
+                           "the server certificate is renewed.")
 
         try:
             # Test connection by querying the /api/tiles/ endpoint.
@@ -92,12 +95,12 @@ class GWPortalClient:
             response = self.session.get(test_url, params={'page_size': 1},
                                         timeout=10, verify=self.verify_tls)
             response.raise_for_status()
-            print("GWPortalClient: API connection successful.", file=sys.stderr)
+            logger.info("GWPortal API connection successful")
         except RequestException as e:
-            print(f"GWPortalClient: API connection test failed. Error: {e}", file=sys.stderr)
+            logger.error(f"GWPortal API connection test failed: {e}")
             hint = _tls_hint(e)
             if hint:
-                print(f"GWPortalClient: {hint}", file=sys.stderr)
+                logger.error(hint)
             # Do not raise — allow the caller to degrade gracefully.
 
     def _make_request(self, method, endpoint, params=None, data=None):
