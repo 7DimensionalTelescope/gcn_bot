@@ -1,0 +1,107 @@
+# GCN Bot Settings — Template
+# ============================
+# Copy this file to settings.toml and fill in your credentials.
+# Lines starting with # are comments and are ignored.
+
+# ---------------------------------------------------------------------------
+# Connection
+# ---------------------------------------------------------------------------
+CONNECTION_TIMEOUT = 300  # GCN server connection timeout in seconds
+
+# ---------------------------------------------------------------------------
+# Slack
+# ---------------------------------------------------------------------------
+SLACK_TOKEN      = "xoxb-your-bot-token"
+SLACK_APP_TOKEN  = "xapp-your-app-token"
+SLACK_CHANNEL    = "C_YOUR_MAIN_CHANNEL"
+SLACK_CHANNEL_TEST = "C_YOUR_TEST_CHANNEL"  # optional; used by the test suite
+TOO_USER_GROUP   = "too-operators"          # Slack user group for ToO requests
+
+# ---------------------------------------------------------------------------
+# GCN broker credentials
+# ---------------------------------------------------------------------------
+GCN_ID     = "your-gcn-client-id"
+GCN_SECRET = "your-gcn-client-secret"
+
+# ---------------------------------------------------------------------------
+# Visibility
+# ---------------------------------------------------------------------------
+MIN_ALTITUDE = 30  # degrees above horizon
+MIN_MOON_SEP = 30  # degrees from moon
+
+# ---------------------------------------------------------------------------
+# Output files
+# ---------------------------------------------------------------------------
+OUTPUT_NOTICE_CSV   = "gcn_notices.csv"
+OUTPUT_ASCII        = "grb_targets.ascii"
+ASCII_MAX_EVENTS    = 10
+OUTPUT_CIRCULAR_CSV = "gcn_circular.csv"
+
+# ---------------------------------------------------------------------------
+# DB tile reference-image check
+# Queries the GWPortal database to report how many tiles covering the event
+# error region already have reference images (needed for image subtraction).
+# GWPORTAL_BASE_URL / GWPORTAL_API_KEY are only used when this is true; if left
+# blank they fall back to the like-named environment variables.
+# ---------------------------------------------------------------------------
+TURN_ON_DB_TILE_CHECK = false
+GWPORTAL_BASE_URL = "https://your-portal-host:port/"
+GWPORTAL_API_KEY  = "your-gwportal-api-key"
+
+# ---------------------------------------------------------------------------
+# ToO email
+# ---------------------------------------------------------------------------
+TURN_ON_TOO_EMAIL_SLACK = false  # manual ToO requests via Slack button
+TURN_ON_TOO_EMAIL_AUTO  = false  # fully automatic ToO on observable_now
+
+EMAIL_FROM     = "your-bot-email@example.com"
+EMAIL_PASSWORD = "your-email-app-password"
+EMAIL_TO       = "your-team@example.com"
+TOO_TEST_EMAIL = ""  # optional; overrides EMAIL_TO during tests only
+
+# ---------------------------------------------------------------------------
+# ToO observation parameters
+# ---------------------------------------------------------------------------
+[TOO_CONFIG]
+exptime    = 100
+count      = 3
+obsmode    = "Spec"
+specmode   = "specall"
+ntelescope = 1
+binning    = "1"
+gain       = "2750"
+priority   = "50"
+weight     = ""
+objtype    = ""
+comments   = ""
+abortobservation = false
+obs_starttime    = ""
+id               = ""
+is_observable    = ""
+
+# ---------------------------------------------------------------------------
+# GCN Kafka topics to subscribe to
+# Comment out any topic you do not want to monitor.
+# ---------------------------------------------------------------------------
+DISPLAY_TOPICS = [
+  # Neutrino / multi-messenger
+  "gcn.classic.text.AMON_NU_EM_COINC",
+  "gcn.classic.text.ICECUBE_CASCADE",
+  "gcn.classic.text.HAWC_BURST_MONITOR",
+  "gcn.classic.text.ICECUBE_ASTROTRACK_BRONZE",
+  "gcn.classic.text.ICECUBE_ASTROTRACK_GOLD",
+  # Fermi
+  "gcn.classic.text.FERMI_GBM_GND_POS",
+  # "gcn.classic.text.FERMI_GBM_FIN_POS",
+  "gcn.classic.text.FERMI_LAT_OFFLINE",
+  # Swift
+  "gcn.classic.text.SWIFT_BAT_GRB_POS_ACK",
+  "gcn.classic.text.SWIFT_UVOT_POS",
+  "gcn.classic.text.SWIFT_XRT_POSITION",
+  # Einstein Probe
+  "gcn.notices.einstein_probe.wxt.alert",
+  # SVOM
+  "gcn.notices.svom.voevent.grm",
+  "gcn.notices.svom.voevent.eclairs",
+  "gcn.notices.svom.voevent.mxt",
+]

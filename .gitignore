@@ -176,6 +176,7 @@ cython_debug/
 # Config file
 .config.py
 config.py
+settings.toml
 
 # Image
 *.png
