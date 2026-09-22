@@ -309,6 +309,15 @@ class VisibilityManager:
             logger.error(f"{label} plot generation failed for RA={ra}, DEC={dec}: {exc}")
             return None
 
+    @staticmethod
+    def _fmt_duration(hours: float) -> str:
+        """Format a duration as ``H h M m``, or just ``M m`` when under one hour."""
+        total_min = round(hours * 60)
+        h, m = divmod(total_min, 60)
+        if h == 0:
+            return f"{m} m"
+        return f"{h} h {m} m"
+
     def _normalise(self, raw: Any) -> Dict[str, Any]:
         """
         Map the supy ``analyze_visibility`` result dict to the standard format.
@@ -335,7 +344,7 @@ class VisibilityManager:
                     w   = tonight["window"]
                     end = w.get("end_time_utc", "")[:16].replace("T", " ")
                     rem = w.get("time_remaining_hours", 0)
-                    message = f"Observable until {end} UTC ({rem:.1f} h remaining)"
+                    message = f"Observable until {end} UTC ({self._fmt_duration(rem)} remaining)"
             else:
                 case    = "observable_later"
                 message = "Target will be observable later tonight"
@@ -343,7 +352,7 @@ class VisibilityManager:
                     w     = tonight["window"]
                     start = w.get("start_time_utc", "")[:16].replace("T", " ")
                     hrs   = w.get("time_until_start_hours", 0)
-                    message = f"Observable from {start} UTC (in {hrs:.1f} h)"
+                    message = f"Observable from {start} UTC (in {self._fmt_duration(hrs)})"
         elif next_opp is not None:
             days = int(next_opp.get("days_from_now", 2))
             if days <= 1:

@@ -260,12 +260,12 @@ class MessageFormatter:
                     remaining = vis.get("remaining_hours", 0)
                     end_t     = vis.get("observable_end")
                     end_s     = end_t.strftime("%H:%M") if hasattr(end_t, "strftime") else str(end_t or "Unknown")
-                    lines.append(f"> - 🌃 *Visibility:* 🟢 Observable until {end_s} CLT ({remaining:.1f}h remaining)")
+                    lines.append(f"> - 🌃 *Visibility:* 🟢 Observable until {end_s} CLT ({self._fmt_duration(remaining)} remaining)")
                 elif case == "observable_later":
                     hrs   = vis.get("hours_until_observable", 0)
                     start = vis.get("observable_start")
                     st_s  = start.strftime("%H:%M") if hasattr(start, "strftime") else str(start or "Unknown")
-                    lines.append(f"> - 🌃 *Visibility:* 🟠 Observable in {hrs:.1f}h (from {st_s} CLT)")
+                    lines.append(f"> - 🌃 *Visibility:* 🟠 Observable in {self._fmt_duration(hrs)} (from {st_s} CLT)")
                 elif case == "observable_tomorrow":
                     lines.append("> - 🌃 *Visibility:* 🔵 Observable Tomorrow Night")
                 else:
@@ -502,6 +502,15 @@ class MessageFormatter:
                 content = line[2:] if line.startswith("> ") else line[1:]
                 result[i] = f"> *{content}*"
         return "\n".join(result)
+
+    @staticmethod
+    def _fmt_duration(hours: float) -> str:
+        """Format a duration as ``H h M m``, or just ``M m`` when under one hour."""
+        total_min = round(hours * 60)
+        h, m = divmod(total_min, 60)
+        if h == 0:
+            return f"{m} m"
+        return f"{h} h {m} m"
 
     @staticmethod
     def _extract_time_field(line: str) -> str:
