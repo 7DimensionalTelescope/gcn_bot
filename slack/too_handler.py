@@ -21,7 +21,7 @@ constructor arguments so it can be tested with mocks independently.
 
 import json
 import logging
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from slack_sdk.errors import SlackApiError
 
@@ -52,12 +52,18 @@ class SlackToOHandler:
         user_group: str,
         too_config: Optional[Dict[str, Any]] = None,
         telescope: str = "7DT",
+        on_sent: Optional[Callable[[str, str, str], None]] = None,
     ) -> None:
         self._slack      = slack
         self._emailer    = emailer
         self.user_group  = user_group
         self.too_config  = too_config or {}
         self.telescope   = telescope
+        # Called (facility, trigger_num, telescope) after a successful manual
+        # send, so the ASCII ToO-sent marker is set and a later auto-ToO for the
+        # same event is suppressed. Kept as a callback so this handler stays
+        # decoupled from the notice handler.
+        self._on_sent    = on_sent
         # Bolt routing keys — unique per telescope so multiple handlers coexist
         self.action_id   = f"submit_too_request_{telescope.lower()}"
         self.callback_id = f"too_request_modal_{telescope.lower()}"
@@ -594,6 +600,16 @@ class SlackToOHandler:
                 msg_kwargs["thread_ts"] = thread_ts
             client.chat_postMessage(**msg_kwargs)
             logger.info(f"ToO form submitted by {user_id} for {merged.get('Name')}")
+
+            # Record the send so a later auto-ToO for this event is suppressed.
+            if self._on_sent is not None:
+                facility = str(merged.get("Facility", "")).strip()
+                trigger  = str(merged.get("Trigger_num", "")).strip()
+                if facility and trigger:
+                    try:
+                        self._on_sent(facility, trigger, self.telescope)
+                    except Exception as exc:
+                        logger.error(f"on_sent callback failed: {exc}")
         else:
             client.chat_postEphemeral(
                 channel=post_channel,

@@ -29,7 +29,10 @@ import logging
 import signal
 import sys
 import threading
-from typing import Any, Callable, Optional
+from datetime import datetime, timedelta, timezone
+from typing import Any, Callable, List, Optional
+
+from too.scheduler import DeferredEntry, DeferredToOScheduler
 
 # ---------------------------------------------------------------------------
 # Logging — configure before importing sub-modules so their loggers inherit
@@ -181,17 +184,60 @@ class GCNBot:
         )
 
         # --- ToO email ---
+        # Both telescopes auto-ToO for GRBs localized to 1..MAX_AUTO_TOO_TILES (5)
+        # tiles — the single-tile and multi-tile(<=5) cases share one config per
+        # telescope. 7DT uses its emailer defaults (100 s x 3, Spec); RASA36 uses
+        # the rapid config below.
         self.emailer = GCNToOEmailer(
             email_from=config.email_from,
             email_to=config.email_to,
             email_password=config.email_password,
             telescope="7DT",
+            auto_too_grb_only=config.too_auto_grb_only,
+            auto_too_max_tiles=config.auto_too_max_tiles,
+            observable_soon_hours=config.too_observable_soon_hours,
         )
         self.emailer_rasa36 = GCNToOEmailer(
             email_from=config.email_from,
             email_to=config.email_to_rasa36,
             email_password=config.email_password,
             telescope="RASA36",
+            auto_too_grb_only=config.too_auto_grb_only,
+            auto_too_max_tiles=config.auto_too_max_tiles,
+            observable_soon_hours=config.too_observable_soon_hours,
+        )
+        # Auto-ToO observation params (from settings.toml), split by tile case:
+        # the single-tile (n==1) and multi-tile (2..max) cases are handled
+        # separately, each with its own config per telescope. Selected at
+        # send/fire time by _auto_too_config(telescope, n_tiles).
+        self._auto_too_configs = {
+            "7DT": {
+                "single": config.too_config_7dt_auto_single,
+                "multi":  config.too_config_7dt_auto_multi,
+            },
+            "RASA36": {
+                "single": config.too_config_rasa36_auto_single,
+                "multi":  config.too_config_rasa36_auto_multi,
+            },
+        }
+        # Per-telescope × per-case enable flags (fully independent on/off).
+        self._auto_too_enabled_flags = {
+            "7DT": {
+                "single": config.turn_on_too_email_auto_7dt_single,
+                "multi":  config.turn_on_too_email_auto_7dt_multi,
+            },
+            "RASA36": {
+                "single": config.turn_on_too_email_auto_rasa36_single,
+                "multi":  config.turn_on_too_email_auto_rasa36_multi,
+            },
+        }
+
+        # --- Deferred ToO scheduler ---
+        # Fires "observable soon" ToOs once the target is actually up, after a
+        # final retraction/coordinate/tile re-check. Started in run().
+        self.deferred_scheduler = DeferredToOScheduler(
+            on_fire=self._fire_deferred_too,
+            check_interval=config.too_deferred_check_interval_sec,
         )
 
         # --- Slack ToO handlers (one per telescope) ---
@@ -201,6 +247,7 @@ class GCNBot:
             user_group=config.too_user_group,
             too_config=config.too_config,
             telescope="7DT",
+            on_sent=self.notice_handler.mark_too_sent,
         )
         self.too_handler_rasa36 = SlackToOHandler(
             slack=self.slack,
@@ -208,6 +255,7 @@ class GCNBot:
             user_group=config.too_user_group,
             too_config=config.too_config,
             telescope="RASA36",
+            on_sent=self.notice_handler.mark_too_sent,
         )
 
         # --- Kafka consumer ---
@@ -227,7 +275,10 @@ class GCNBot:
                 f"Topics        : {len(all_topics)} subscribed",
                 f"Telescopes    : 7DT, RASA36 (CTIO) + LOAO",
                 f"Send to Slack : {send_to_slack}",
-                f"Auto-ToO email: {config.turn_on_too_email_auto}",
+                f"Auto-ToO 7DT   : single={config.turn_on_too_email_auto_7dt_single} "
+                f"multi={config.turn_on_too_email_auto_7dt_multi}",
+                f"Auto-ToO RASA36: single={config.turn_on_too_email_auto_rasa36_single} "
+                f"multi={config.turn_on_too_email_auto_rasa36_multi}",
             ],
         )
 
@@ -525,9 +576,26 @@ class GCNBot:
         tile_result_rasa36: Optional[dict] = None,
     ) -> None:
         """Post a thread reply when an existing event is updated."""
-        # Save ASCII with the existing thread_ts so the row is refreshed
+        # Auto-ToO on refined coordinates: a position update may newly qualify
+        # (e.g. a wide GBM box shrinking to a single tile once Swift/EP refines
+        # it). Gated by turn_on_too_email_auto_on_update; was_too_sent inside
+        # _dispatch_auto_too prevents a second send if this event was already
+        # ToO'd. The event's thread already exists, so feed it straight into the
+        # deferred holder for immediate threading.
+        too_dispatched: List[str] = []
+        if self.config.turn_on_too_email_auto_on_update:
+            too_thread = _DeferredThreadTs()
+            too_thread.set(existing_thread_ts)
+            too_dispatched = self._dispatch_auto_too(
+                notice_data, visibility_result, tile_result, tile_result_rasa36, too_thread
+            )
+
+        # Save ASCII with the existing thread_ts (and any ToO-sent marker) so the
+        # row is refreshed.
         try:
-            self.notice_handler.save_to_ascii(notice_data, existing_thread_ts)
+            self.notice_handler.save_to_ascii(
+                notice_data, existing_thread_ts, too_sent=too_dispatched
+            )
         except Exception as exc:
             logger.error(f"ASCII save (update) failed: {exc}")
 
@@ -641,14 +709,19 @@ class GCNBot:
         # failure notice threads under the main message via `too_thread`, whose
         # thread_ts is filled in once the Slack post below returns.
         too_thread = _DeferredThreadTs()
-        self._dispatch_auto_too(
+        too_dispatched = self._dispatch_auto_too(
             notice_data, visibility_result, tile_result, tile_result_rasa36, too_thread
         )
 
-        # Save to ASCII first (without thread_ts) to get storage status
+        # Save to ASCII first (without thread_ts) to get storage status. The
+        # ToO-sent marker is folded in here — this write always runs (unlike the
+        # thread_ts update below, which is skipped when the Slack post fails), so
+        # the guard survives a Slack-failure re-entry of this path.
         ascii_status = False
         try:
-            ascii_status = self.notice_handler.save_to_ascii(notice_data)
+            ascii_status = self.notice_handler.save_to_ascii(
+                notice_data, too_sent=too_dispatched
+            )
         except Exception as exc:
             logger.error(f"ASCII save (new event) failed: {exc}")
 
@@ -800,39 +873,355 @@ class GCNBot:
         tile_result: Optional[dict],
         tile_result_rasa36: Optional[dict],
         too_thread: "_DeferredThreadTs",
-    ) -> None:
+    ) -> List[str]:
         """
         Evaluate auto-ToO criteria and dispatch the (async) emails for both
-        telescopes. Called at the very top of ``_handle_new_event`` so the send
-        overlaps the Slack rendering/uploads that follow.
+        telescopes. Called at the top of both ``_handle_new_event`` and
+        ``_handle_update`` (a refined position may newly qualify — e.g. Fermi
+        GBM's wide error box shrinking to a single tile once Swift/EP refines
+        it), so the send overlaps the Slack rendering/uploads that follow.
+
+        Returns the list of telescope labels actually dispatched, so the caller
+        can persist the ToO-sent marker in its own ``save_to_ascii`` write.
+
+        Duplicate-send guard: each telescope is skipped when
+        ``notice_handler.was_too_sent`` reports a prior send for this event, so
+        an event ToO'd on its first notice is never re-sent on later updates
+        (or on a Slack-failure re-entry of the new-event path).
 
         Gated on ``send_to_slack`` to preserve prior behaviour: in dev mode
-        without ``--send``, no automatic ToO emails go out. Success/failure
+        without ``--send``, no automatic ToO emails go out. Each telescope×case
+        combination has its own enable flag (checked inside
+        ``_dispatch_auto_too_one`` once the tile case is known). Success/failure
         notices thread under the main message once ``too_thread`` is set.
         """
-        if not (self.config.turn_on_too_email_auto and self.send_to_slack):
-            return
+        dispatched: List[str] = []
+        if not self.send_to_slack:
+            return dispatched
+        if self._dispatch_auto_too_one(
+            "7DT", self.emailer, tile_result,
+            notice_data, visibility_result, too_thread
+        ):
+            dispatched.append("7DT")
+        if self._dispatch_auto_too_one(
+            "RASA36", self.emailer_rasa36, tile_result_rasa36,
+            notice_data, visibility_result, too_thread
+        ):
+            dispatched.append("RASA36")
+        return dispatched
+
+    def _dispatch_auto_too_one(
+        self,
+        telescope: str,
+        emailer: "GCNToOEmailer",
+        tile_result: Optional[dict],
+        notice_data: dict,
+        visibility_result: Optional[dict],
+        too_thread: "_DeferredThreadTs",
+    ) -> bool:
+        """
+        Handle one telescope's auto-ToO decision.
+
+        Enable is per telescope × tile case (single vs multi); the case-specific
+        flag is checked once the tile count is known. The obs config is likewise
+        chosen by tile case via ``_auto_too_config``. Returns ``True`` only when
+        an *immediate* ("now") send was dispatched — the caller folds that into
+        the ASCII ToO-sent marker. An ``observable soon`` classification instead
+        schedules a deferred send (persisted in ASCII, fired once the target is
+        up, config re-selected then) and returns ``False``.
+        """
+        # Quick skip when neither tile case is enabled for this telescope.
+        flags = self._auto_too_enabled_flags.get(telescope, {})
+        if not (flags.get("single") or flags.get("multi")):
+            return False
+
+        facility    = notice_data.get("Facility", "")
+        trigger     = notice_data.get("Trigger_num", "")
         target_name = notice_data.get("Name", "Unknown")
+        key = (str(facility), str(trigger), telescope)
         try:
-            if self.emailer.evaluate_criteria(notice_data, visibility_result, tile_result):
-                self.emailer.send_too_email_async(
-                    notice_data,
-                    on_success=self._make_too_notice(too_thread, "7DT", target_name, True),
-                    on_failure=self._make_too_notice(too_thread, "7DT", target_name, False),
-                )
+            if self.notice_handler.was_too_sent(facility, trigger, telescope):
+                return False
+            case = emailer.classify_auto_too(notice_data, visibility_result, tile_result)
         except Exception as exc:
-            logger.error(f"Auto-ToO email error (7DT): {exc}", exc_info=True)
+            logger.error(f"Auto-ToO classify error ({telescope}): {exc}", exc_info=True)
+            return False
+
+        # Enforce the per-case enable flag now that the tile count is known.
+        n_tiles = (tile_result or {}).get("n_tiles")
+        if case is not None and not self._auto_too_enabled(telescope, n_tiles):
+            tile_case = "single" if n_tiles == 1 else "multi"
+            logger.info(
+                f"Auto-ToO suppressed ({telescope}): {tile_case}-tile case disabled"
+            )
+            return False
+
+        if case == "now":
+            # A now-send supersedes any pending deferred entry for this event.
+            if self.deferred_scheduler.is_pending(key):
+                self.deferred_scheduler.cancel(key)
+                self.notice_handler.clear_too_deferred(facility, trigger, telescope)
+            too_config = self._auto_too_config(telescope, n_tiles)
+            try:
+                emailer.send_too_email_async(
+                    notice_data,
+                    too_config=too_config,
+                    on_success=self._make_too_notice(too_thread, telescope, target_name, True),
+                    on_failure=self._make_too_notice(too_thread, telescope, target_name, False),
+                )
+                return True
+            except Exception as exc:
+                logger.error(f"Auto-ToO email error ({telescope}): {exc}", exc_info=True)
+            return False
+
+        if case == "soon":
+            if self.deferred_scheduler.is_pending(key):
+                return False  # already scheduled — leave the existing fire time
+            hrs = self._soon_hours(visibility_result)
+            if hrs is None:
+                return False
+            fire_at = datetime.now(timezone.utc) + timedelta(hours=hrs)
+            self.notice_handler.set_too_deferred(
+                facility, trigger, telescope, fire_at.isoformat()
+            )
+            # Config is re-selected at fire time from the latest tile count, so
+            # nothing case-specific needs to be baked into the entry.
+            self.deferred_scheduler.schedule(DeferredEntry(
+                facility=str(facility), trigger_num=str(trigger),
+                telescope=telescope, fire_at=fire_at,
+            ))
+            self._notify_too_scheduled(too_thread, telescope, target_name, fire_at)
+        return False
+
+    # ------------------------------------------------------------------
+    # Deferred ToO — fire-time re-check + send
+    # ------------------------------------------------------------------
+
+    def _telescope_ctx(self, telescope: str):
+        """Return (emailer, tile_manager) for a telescope."""
+        if telescope == "RASA36":
+            return self.emailer_rasa36, self.tiles_rasa36
+        if telescope == "7DT":
+            return self.emailer, self.tiles
+        return None, None
+
+    def _auto_too_config(self, telescope: str, n_tiles: Optional[int]) -> Optional[dict]:
+        """Pick the auto-ToO obs config for a telescope by tile case.
+
+        ``n_tiles == 1`` → the single-tile config; ``2..max`` → the multi-tile
+        config. The two cases are configured (and thus tunable) separately.
+        """
+        case = "single" if n_tiles == 1 else "multi"
+        return self._auto_too_configs.get(telescope, {}).get(case)
+
+    def _auto_too_enabled(self, telescope: str, n_tiles: Optional[int]) -> bool:
+        """Whether auto-ToO is enabled for this telescope × tile case.
+
+        ``n_tiles == 1`` → single-tile flag; ``2..max`` → multi-tile flag.
+        """
+        case = "single" if n_tiles == 1 else "multi"
+        return bool(self._auto_too_enabled_flags.get(telescope, {}).get(case))
+
+    @staticmethod
+    def _soon_hours(visibility_result: Optional[dict]) -> Optional[float]:
+        """Extract ``time_until_start_hours`` from a visibility result, or None."""
+        if not visibility_result:
+            return None
+        window = (
+            (visibility_result.get("details") or {})
+            .get("tonight", {})
+            .get("window", {})
+        )
+        hrs = window.get("time_until_start_hours")
         try:
-            if self.emailer_rasa36.evaluate_criteria(
-                notice_data, visibility_result, tile_result_rasa36
-            ):
-                self.emailer_rasa36.send_too_email_async(
-                    notice_data,
-                    on_success=self._make_too_notice(too_thread, "RASA36", target_name, True),
-                    on_failure=self._make_too_notice(too_thread, "RASA36", target_name, False),
-                )
+            return float(hrs) if hrs is not None else None
+        except (TypeError, ValueError):
+            return None
+
+    def _fire_deferred_too(self, entry: "DeferredEntry") -> None:
+        """
+        Fire (or re-evaluate) a deferred ToO — runs on the scheduler thread.
+
+        Final re-check on the *latest* information before sending:
+          1. ASCII row gone  → event retracted/false alarm → skip.
+          2. Already sent     → skip.
+          3. Recompute visibility + tiles on the row's latest coordinates and
+             re-apply the gates. ``now`` → send (obs config re-selected from the
+             latest tile count: single vs multi); ``soon`` → target rises a bit
+             later than first estimated, reschedule; anything else (now outside
+             the 1..max tile range, not observable) → skip.
+        """
+        facility, trigger, telescope = entry.facility, entry.trigger_num, entry.telescope
+        emailer, tiles = self._telescope_ctx(telescope)
+        if emailer is None:
+            logger.warning(f"Deferred ToO {entry.key}: unknown telescope — dropping")
+            return
+
+        row = self.notice_handler.find_existing_event(facility, trigger, return_full_data=True)
+        if not row:
+            logger.info(
+                f"Deferred ToO {entry.key}: event no longer in ASCII "
+                f"(retracted / trimmed) — skipping"
+            )
+            return
+        if self.notice_handler.was_too_sent(facility, trigger, telescope):
+            logger.info(f"Deferred ToO {entry.key}: already sent — clearing")
+            self.notice_handler.clear_too_deferred(facility, trigger, telescope)
+            return
+
+        name = str(row.get("Name", "")).strip().strip('"')
+        thread_ts = str(row.get("thread_ts", "")).strip() or None
+        try:
+            ra  = float(row.get("RA"))
+            dec = float(row.get("DEC"))
+        except (TypeError, ValueError):
+            logger.warning(f"Deferred ToO {entry.key}: unusable coordinates — skipping")
+            self.notice_handler.clear_too_deferred(facility, trigger, telescope)
+            return
+        error = row.get("Error")
+        notice_data = {
+            "Name": name, "RA": ra, "DEC": dec,
+            "Facility": facility, "Trigger_num": trigger, "Error": error,
+        }
+
+        visibility_result = None
+        try:
+            visibility_result = self.visibility.get_status(ra=ra, dec=dec)
         except Exception as exc:
-            logger.error(f"Auto-ToO email error (RASA36): {exc}", exc_info=True)
+            logger.error(f"Deferred ToO {entry.key}: visibility recompute failed: {exc}")
+        tile_result = None
+        try:
+            if error not in (None, "") and float(error) > 0:
+                tile_result = tiles.get_tile_info(ra=ra, dec=dec, error=float(error))
+        except Exception as exc:
+            logger.error(f"Deferred ToO {entry.key}: tile recompute failed: {exc}")
+
+        case = emailer.classify_auto_too(notice_data, visibility_result, tile_result)
+        n_tiles = (tile_result or {}).get("n_tiles")
+
+        # The tile case may have changed since scheduling (coords refined); if
+        # the now-current case is disabled for this telescope, don't send.
+        if case is not None and not self._auto_too_enabled(telescope, n_tiles):
+            tile_case = "single" if n_tiles == 1 else "multi"
+            logger.info(
+                f"Deferred ToO {entry.key}: {tile_case}-tile case now disabled — skipping"
+            )
+            self.notice_handler.clear_too_deferred(facility, trigger, telescope)
+            self._post_deferred_result(thread_ts, telescope, name, sent=None)
+            return
+
+        if case == "now":
+            too_config = self._auto_too_config(telescope, n_tiles)
+            ok = emailer.send_too_email(notice_data, too_config)
+            if ok:
+                self.notice_handler.mark_too_sent(facility, trigger, telescope)
+            # Clear the pending marker either way; a failed send is not retried
+            # (the operator is notified to submit manually).
+            self.notice_handler.clear_too_deferred(facility, trigger, telescope)
+            self._post_deferred_result(thread_ts, telescope, name, sent=ok)
+        elif case == "soon":
+            hrs = self._soon_hours(visibility_result) or 0.05
+            new_fire = datetime.now(timezone.utc) + timedelta(hours=hrs)
+            self.notice_handler.set_too_deferred(
+                facility, trigger, telescope, new_fire.isoformat()
+            )
+            self.deferred_scheduler.schedule(DeferredEntry(
+                facility=facility, trigger_num=trigger, telescope=telescope,
+                fire_at=new_fire, payload=entry.payload,
+            ))
+            logger.info(
+                f"Deferred ToO {entry.key}: target still rising — rescheduled to "
+                f"{new_fire.isoformat()}"
+            )
+        else:
+            logger.info(
+                f"Deferred ToO {entry.key}: no longer qualifies (case={case}) — skipping"
+            )
+            self.notice_handler.clear_too_deferred(facility, trigger, telescope)
+            self._post_deferred_result(thread_ts, telescope, name, sent=None)
+
+    def _reload_deferred_too(self) -> None:
+        """Re-schedule ToOs left pending in the ASCII file (called on startup).
+
+        A fire time already in the past (bot was down when the target rose)
+        schedules ~immediately so the fire-time re-check runs right away.
+        """
+        pending = self.notice_handler.get_pending_deferred()
+        if not pending:
+            return
+        now = datetime.now(timezone.utc)
+        for item in pending:
+            try:
+                fire_at = datetime.fromisoformat(item["fire_at"])
+                if fire_at.tzinfo is None:
+                    fire_at = fire_at.replace(tzinfo=timezone.utc)
+            except (ValueError, KeyError):
+                logger.warning(f"Deferred ToO reload: bad fire time for {item}")
+                continue
+            if fire_at < now:
+                fire_at = now + timedelta(seconds=5)
+            # Obs config is re-selected at fire time (by then-current tile count),
+            # so nothing case-specific is baked into the entry.
+            self.deferred_scheduler.schedule(DeferredEntry(
+                facility=item["facility"], trigger_num=item["trigger_num"],
+                telescope=item["telescope"], fire_at=fire_at,
+            ))
+        logger.info(f"Reloaded {self.deferred_scheduler.pending_count()} pending deferred ToO(s)")
+
+    def _notify_too_scheduled(
+        self, too_thread: "_DeferredThreadTs", telescope: str,
+        target_name: str, fire_at: datetime,
+    ) -> None:
+        """Post a '⏳ ToO scheduled' notice under the event thread (non-blocking).
+
+        Runs on a short-lived daemon thread so it can wait for ``too_thread``
+        (the main message may still be posting) without blocking the caller.
+        """
+        when = fire_at.strftime("%Y-%m-%d %H:%M UTC")
+        text = (
+            f":hourglass_flowing_sand: Automatic {telescope} ToO *scheduled* for "
+            f"*{target_name}* at {when} (when the target rises; a final "
+            f"retraction / visibility / tile check runs before it sends)."
+        )
+
+        def _task() -> None:
+            thread_ts = too_thread.get(timeout=5.0)
+            if thread_ts:
+                self.slack.send_thread_message(thread_ts=thread_ts, text=text)
+            else:
+                self.slack.send_message(blocks=[], text=text)
+
+        threading.Thread(target=_task, name="too-scheduled-notice", daemon=True).start()
+
+    def _post_deferred_result(
+        self, thread_ts: Optional[str], telescope: str,
+        target_name: str, sent: Optional[bool],
+    ) -> None:
+        """Post the outcome of a fired deferred ToO under the event thread.
+
+        ``sent`` is ``True`` (sent), ``False`` (send failed), or ``None``
+        (skipped at fire time — no longer qualifies / retracted).
+        """
+        if sent is True:
+            text = (
+                f":white_check_mark: Deferred {telescope} ToO email *sent* for "
+                f"*{target_name}* (target now observable)."
+            )
+        elif sent is False:
+            text = (
+                f":warning: Deferred {telescope} ToO email *failed to send* for "
+                f"*{target_name}*. Check the bot logs and submit manually if needed."
+            )
+        else:
+            text = (
+                f":no_entry_sign: Deferred {telescope} ToO for *{target_name}* "
+                f"*not sent* — at fire time it no longer qualified (retracted, no "
+                f"longer a single tile, or not observable)."
+            )
+        if thread_ts:
+            self.slack.send_thread_message(thread_ts=thread_ts, text=text)
+        else:
+            self.slack.send_message(blocks=[], text=text)
 
     def _make_too_notice(
         self,
@@ -1026,6 +1415,14 @@ class GCNBot:
             on_restored=self._on_connection_restored,
         )
 
+        # Start the deferred-ToO scheduler and re-arm any ToOs left pending in
+        # the ASCII file (e.g. the bot restarted while a target was still rising).
+        self.deferred_scheduler.start()
+        try:
+            self._reload_deferred_too()
+        except Exception as exc:
+            logger.error(f"Deferred ToO reload failed: {exc}", exc_info=True)
+
         # Handle OS signals — just flip the flag; shutdown() runs from the finally block
         signal.signal(signal.SIGTERM, lambda *_: setattr(self.consumer, "_running", False))
         signal.signal(signal.SIGINT,  lambda *_: setattr(self.consumer, "_running", False))
@@ -1046,6 +1443,10 @@ class GCNBot:
             return
         self._shutdown_called = True
         logger.info("Shutting down GCNBot…")
+        try:
+            self.deferred_scheduler.stop()
+        except Exception as exc:
+            logger.warning(f"Deferred scheduler stop error: {exc}")
         try:
             self.consumer.stop()
         except Exception as exc:

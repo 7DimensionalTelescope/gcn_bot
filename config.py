@@ -73,8 +73,32 @@ _DEFAULTS: Dict[str, Any] = {
 
     # ToO email — Slack-triggered
     "TURN_ON_TOO_EMAIL_SLACK": False,
-    # ToO email — fully automatic (observable_now criterion)
-    "TURN_ON_TOO_EMAIL_AUTO": False,
+    # ToO email — fully automatic, split by telescope AND tile case so each of
+    # the four combinations is enabled independently. "single" = localization on
+    # exactly 1 tile; "multi" = 2..AUTO_TOO_MAX_TILES tiles. See emailer.py.
+    "TURN_ON_TOO_EMAIL_AUTO_7DT_SINGLE": False,
+    "TURN_ON_TOO_EMAIL_AUTO_7DT_MULTI": False,
+    "TURN_ON_TOO_EMAIL_AUTO_RASA36_SINGLE": False,
+    "TURN_ON_TOO_EMAIL_AUTO_RASA36_MULTI": False,
+    # Auto-ToO on a coordinate *update* (not just the first notice): lets a
+    # refined position that newly qualifies — e.g. a wide Fermi GBM box shrinking
+    # to a single tile once Swift/EP refines it — still trigger a ToO. Applies to
+    # both telescopes' auto paths; the per-telescope switches above still gate
+    # which one may send, and the ASCII duplicate-send guard prevents re-sends.
+    "TURN_ON_TOO_EMAIL_AUTO_ON_UPDATE": False,
+    # Auto-ToO also fires when the target rises within this many hours (not just
+    # when it is observable right now), so the request can be queued ahead of the
+    # target rising. Used by the observable_soon criterion.
+    "TOO_OBSERVABLE_SOON_HOURS": 2.0,
+    # Auto-ToO tile gate: fire only when the localization covers 1..this many
+    # tiles (single-tile and multi-tile-up-to-N share one config per telescope).
+    "AUTO_TOO_MAX_TILES": 5,
+    # Auto-ToO restricts to GRB facilities (Swift/Fermi/CALET/EinsteinProbe/SVOM);
+    # when False, any facility with a small-enough localization may trigger.
+    "TOO_AUTO_GRB_ONLY": True,
+    # Deferred-ToO scheduler tick — how often (seconds) pending "observable soon"
+    # ToOs are checked for whether they are due to fire.
+    "TOO_DEFERRED_CHECK_INTERVAL_SEC": 30.0,
 
     # Email credentials
     "EMAIL_FROM": "",
@@ -95,6 +119,27 @@ _DEFAULTS: Dict[str, Any] = {
         "binning": "1",
         "gain": "2750",
         "priority": "50",
+    },
+
+    # Automatic-ToO observation parameters, split by tile case: the single-tile
+    # case (n_tiles == 1) and the multi-tile case (2..AUTO_TOO_MAX_TILES) are
+    # handled separately so each can be tuned independently. Unspecified keys
+    # fall through to the telescope's emailer defaults.
+    # RASA36: rapid ToO, 60 s × 55 frames, top priority.
+    "TOO_CONFIG_RASA36_AUTO_SINGLE": {
+        "singleExposure": 60, "imageCount": 55, "priority": "1", "rapidToO": "True",
+    },
+    "TOO_CONFIG_RASA36_AUTO_MULTI": {
+        "singleExposure": 60, "imageCount": 55, "priority": "1", "rapidToO": "True",
+    },
+    # 7DT: Spec mode, 100 s × 3 frames.
+    "TOO_CONFIG_7DT_AUTO_SINGLE": {
+        "singleExposure": 100, "imageCount": 3,
+        "obsmode": "Spec", "specmode": "specall", "priority": "50",
+    },
+    "TOO_CONFIG_7DT_AUTO_MULTI": {
+        "singleExposure": 100, "imageCount": 3,
+        "obsmode": "Spec", "specmode": "specall", "priority": "50",
     },
 
     # GCN Kafka topics to subscribe to
@@ -132,7 +177,7 @@ class BotConfig:
     All settings are accessible as lower-cased instance attributes, e.g.::
 
         config.slack_token
-        config.turn_on_too_email_auto   # bool — master auto-ToO on/off
+        config.turn_on_too_email_auto_7dt_single   # bool — per-telescope×case auto-ToO
         config.display_topics           # list[str]
     """
 
@@ -309,14 +354,79 @@ class BotConfig:
         return bool(self.__dict__.get("turn_on_too_email_slack", _DEFAULTS["TURN_ON_TOO_EMAIL_SLACK"]))
 
     @property
-    def turn_on_too_email_auto(self) -> bool:
-        """Master on/off switch for fully automatic ToO emails.
+    def turn_on_too_email_auto_7dt_single(self) -> bool:
+        """Enable automatic 7DT ToO for single-tile (n_tiles == 1) localizations."""
+        return bool(self.__dict__.get(
+            "turn_on_too_email_auto_7dt_single",
+            _DEFAULTS["TURN_ON_TOO_EMAIL_AUTO_7DT_SINGLE"],
+        ))
 
-        When ``False``, no automatic ToO email is sent regardless of whether
-        the observability criteria are met.  Slack-triggered ToO is unaffected
-        by this flag (controlled by ``turn_on_too_email_slack``).
+    @property
+    def turn_on_too_email_auto_7dt_multi(self) -> bool:
+        """Enable automatic 7DT ToO for multi-tile (2..max) localizations."""
+        return bool(self.__dict__.get(
+            "turn_on_too_email_auto_7dt_multi",
+            _DEFAULTS["TURN_ON_TOO_EMAIL_AUTO_7DT_MULTI"],
+        ))
+
+    @property
+    def turn_on_too_email_auto_rasa36_single(self) -> bool:
+        """Enable automatic RASA36 ToO for single-tile (n_tiles == 1) localizations."""
+        return bool(self.__dict__.get(
+            "turn_on_too_email_auto_rasa36_single",
+            _DEFAULTS["TURN_ON_TOO_EMAIL_AUTO_RASA36_SINGLE"],
+        ))
+
+    @property
+    def turn_on_too_email_auto_rasa36_multi(self) -> bool:
+        """Enable automatic RASA36 ToO for multi-tile (2..max) localizations."""
+        return bool(self.__dict__.get(
+            "turn_on_too_email_auto_rasa36_multi",
+            _DEFAULTS["TURN_ON_TOO_EMAIL_AUTO_RASA36_MULTI"],
+        ))
+
+    @property
+    def turn_on_too_email_auto_on_update(self) -> bool:
+        """Allow automatic ToO to fire on a coordinate *update*, not just the
+        first notice for an event.
+
+        Independent of the per-telescope master switches (which still decide
+        *which* telescope may auto-send). When ``False``, auto-ToO is only
+        evaluated on brand-new events.
         """
-        return bool(self.__dict__.get("turn_on_too_email_auto", _DEFAULTS["TURN_ON_TOO_EMAIL_AUTO"]))
+        return bool(self.__dict__.get(
+            "turn_on_too_email_auto_on_update",
+            _DEFAULTS["TURN_ON_TOO_EMAIL_AUTO_ON_UPDATE"],
+        ))
+
+    @property
+    def too_observable_soon_hours(self) -> float:
+        """Hours-ahead window for the auto-ToO ``observable_soon`` criterion."""
+        return float(self.__dict__.get(
+            "too_observable_soon_hours", _DEFAULTS["TOO_OBSERVABLE_SOON_HOURS"]
+        ))
+
+    @property
+    def auto_too_max_tiles(self) -> int:
+        """Max tile count for the auto-ToO tile gate (fires for 1..this)."""
+        return int(self.__dict__.get(
+            "auto_too_max_tiles", _DEFAULTS["AUTO_TOO_MAX_TILES"]
+        ))
+
+    @property
+    def too_auto_grb_only(self) -> bool:
+        """Restrict auto-ToO to GRB facilities (both telescopes)."""
+        return bool(self.__dict__.get(
+            "too_auto_grb_only", _DEFAULTS["TOO_AUTO_GRB_ONLY"]
+        ))
+
+    @property
+    def too_deferred_check_interval_sec(self) -> float:
+        """Deferred-ToO scheduler tick interval, in seconds."""
+        return float(self.__dict__.get(
+            "too_deferred_check_interval_sec",
+            _DEFAULTS["TOO_DEFERRED_CHECK_INTERVAL_SEC"],
+        ))
 
     @property
     def email_from(self) -> str:
@@ -343,12 +453,44 @@ class BotConfig:
         return dict(self.__dict__.get("too_config", _DEFAULTS["TOO_CONFIG"]))
 
     @property
+    def too_config_rasa36_auto_single(self) -> Dict[str, Any]:
+        return dict(self.__dict__.get(
+            "too_config_rasa36_auto_single", _DEFAULTS["TOO_CONFIG_RASA36_AUTO_SINGLE"]
+        ))
+
+    @property
+    def too_config_rasa36_auto_multi(self) -> Dict[str, Any]:
+        return dict(self.__dict__.get(
+            "too_config_rasa36_auto_multi", _DEFAULTS["TOO_CONFIG_RASA36_AUTO_MULTI"]
+        ))
+
+    @property
+    def too_config_7dt_auto_single(self) -> Dict[str, Any]:
+        return dict(self.__dict__.get(
+            "too_config_7dt_auto_single", _DEFAULTS["TOO_CONFIG_7DT_AUTO_SINGLE"]
+        ))
+
+    @property
+    def too_config_7dt_auto_multi(self) -> Dict[str, Any]:
+        return dict(self.__dict__.get(
+            "too_config_7dt_auto_multi", _DEFAULTS["TOO_CONFIG_7DT_AUTO_MULTI"]
+        ))
+
+    @property
     def display_topics(self) -> List[str]:
         return list(self.__dict__.get("display_topics", _DEFAULTS["DISPLAY_TOPICS"]))
 
     def __repr__(self) -> str:
+        auto = "".join(
+            "1" if f else "0" for f in (
+                self.turn_on_too_email_auto_7dt_single,
+                self.turn_on_too_email_auto_7dt_multi,
+                self.turn_on_too_email_auto_rasa36_single,
+                self.turn_on_too_email_auto_rasa36_multi,
+            )
+        )
         return (
             f"BotConfig(channel={self.slack_channel!r}, "
             f"topics={len(self.display_topics)}, "
-            f"auto_too={self.turn_on_too_email_auto})"
+            f"auto_too[7Ds,7Dm,R36s,R36m]={auto})"
         )

@@ -139,7 +139,25 @@ class GCNNoticeHandler:
         "GCN_ID", "Name", "RA", "DEC", "Error",
         "Discovery_UTC", "Primary_Facility", "Best_Facility", "All_Facilities",
         "Trigger_num", "Notice_date", "Last_Update", "Redshift", "Host_info", "thread_ts",
+        # Auto/manual ToO send markers (UTC timestamp when a ToO was dispatched,
+        # empty otherwise). One per telescope so their auto-ToO stays independent.
+        # Used to prevent duplicate ToO sends across the new-event and update
+        # paths (see was_too_sent / mark_too_sent). Backfilled by _load_ascii
+        # for pre-existing files.
+        "ToO_7DT", "ToO_RASA36",
+        # Deferred-ToO fire times (UTC ISO timestamp when a pending "observable
+        # soon" ToO should fire, empty otherwise). Persisted so a pending ToO
+        # survives a bot restart during the wait (reloaded into the scheduler on
+        # startup). One per telescope.
+        "ToO_Deferred_7DT", "ToO_Deferred_RASA36",
     ]
+
+    # Telescope label → ASCII column holding its ToO-sent marker.
+    _TOO_STATE_COLUMNS: Dict[str, str] = {"7DT": "ToO_7DT", "RASA36": "ToO_RASA36"}
+    # Telescope label → ASCII column holding its pending deferred-ToO fire time.
+    _TOO_DEFERRED_COLUMNS: Dict[str, str] = {
+        "7DT": "ToO_Deferred_7DT", "RASA36": "ToO_Deferred_RASA36",
+    }
 
     def __init__(
         self,
@@ -237,12 +255,20 @@ class GCNNoticeHandler:
         self,
         notice_data: Dict[str, Any],
         thread_ts: Optional[str] = None,
+        too_sent: Optional[List[str]] = None,
     ) -> bool:
         """Save or update *notice_data* in the ASCII event file.
 
         Returns ``True`` on success.  If a row with the same trigger number and
         facility family already exists it is updated in place; otherwise a new
         row is prepended.
+
+        Parameters
+        ----------
+        too_sent : list[str] | None
+            Telescope labels (``"7DT"`` / ``"RASA36"``) whose ToO-sent marker
+            should be stamped on this row. Folded into the same write so an
+            auto-ToO send costs no extra file write / backup.
         """
         try:
             with self.file_lock:
@@ -255,8 +281,13 @@ class GCNNoticeHandler:
 
                 if existing_idx is not None:
                     self._update_row(df, existing_idx, facility, notice_data, thread_ts)
+                    row_idx = existing_idx
                 else:
                     df = self._append_row(df, facility, notice_data, thread_ts)
+                    row_idx = 0  # _append_row prepends the new row
+
+                if too_sent:
+                    self._set_too_flags(df, row_idx, too_sent)
 
                 # Trim to max events
                 if len(df) > self.ascii_max_events:
@@ -283,6 +314,199 @@ class GCNNoticeHandler:
         except Exception as exc:
             logger.error(f"Critical error in save_to_ascii: {exc}", exc_info=True)
             return False
+
+    # ------------------------------------------------------------------
+    # ToO-sent state (duplicate-send guard)
+    # ------------------------------------------------------------------
+
+    def _set_too_flags(
+        self, df: pd.DataFrame, idx: int, telescopes: List[str]
+    ) -> None:
+        """Stamp the ToO-sent marker column(s) for *telescopes* on row *idx*."""
+        stamp = datetime.now(tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        for tel in telescopes:
+            col = self._TOO_STATE_COLUMNS.get(tel)
+            if col:
+                df.at[idx, col] = stamp
+
+    def was_too_sent(
+        self, facility: str, trigger_num: str, telescope: str
+    ) -> bool:
+        """Return ``True`` if a ToO for this event+telescope was already sent.
+
+        Looks the event up by ``(trigger_num, facility-family)`` — the same key
+        used for event dedup — and checks whether the telescope's marker column
+        is non-empty. Returns ``False`` when the row does not yet exist (a
+        brand-new event), so the first send always proceeds.
+        """
+        col = self._TOO_STATE_COLUMNS.get(telescope)
+        if not col:
+            logger.warning(f"was_too_sent: unknown telescope '{telescope}'")
+            return False
+        facility = str(facility).strip()
+        trigger_num = str(trigger_num).strip()
+        if not facility or not trigger_num:
+            return False
+        try:
+            with self.file_lock:
+                df = self._load_ascii()
+                idx = self._find_index(df, facility, trigger_num)
+                if idx is None:
+                    return False
+                return bool(str(df.at[idx, col]).strip())
+        except Exception as exc:
+            logger.error(f"was_too_sent failed: {exc}")
+            return False
+
+    def mark_too_sent(
+        self, facility: str, trigger_num: str, telescope: str
+    ) -> bool:
+        """Standalone write of a ToO-sent marker (for the manual Slack path).
+
+        The automatic path folds the marker into its ``save_to_ascii`` call via
+        ``too_sent=``; the manual path has no such write, so it uses this. Does
+        nothing (and warns) if no matching event row exists yet.
+        """
+        col = self._TOO_STATE_COLUMNS.get(telescope)
+        if not col:
+            logger.warning(f"mark_too_sent: unknown telescope '{telescope}'")
+            return False
+        facility = str(facility).strip()
+        trigger_num = str(trigger_num).strip()
+        if not facility or not trigger_num:
+            return False
+        try:
+            with self.file_lock:
+                df = self._load_ascii()
+                idx = self._find_index(df, facility, trigger_num)
+                if idx is None:
+                    logger.warning(
+                        f"mark_too_sent: no ASCII row for {facility} #{trigger_num}"
+                    )
+                    return False
+                self._set_too_flags(df, idx, [telescope])
+                self._write_df(df)
+                logger.info(
+                    f"Marked ToO sent ({telescope}) for {facility} #{trigger_num}"
+                )
+                return True
+        except Exception as exc:
+            logger.error(f"mark_too_sent failed: {exc}")
+            return False
+
+    def _write_df(self, df: pd.DataFrame) -> None:
+        """Backup + write the ASCII frame with the canonical column set."""
+        self._create_backup(self.output_ascii)
+        df.to_csv(
+            self.output_ascii,
+            sep=" ",
+            header=True,
+            index=False,
+            quoting=csv.QUOTE_NONNUMERIC,
+            quotechar='"',
+            columns=self.ASCII_COLUMNS,
+        )
+
+    def set_too_deferred(
+        self, facility: str, trigger_num: str, telescope: str, fire_at_iso: str
+    ) -> bool:
+        """Persist a pending deferred-ToO fire time (UTC ISO) on the event row.
+
+        Written so the pending send survives a restart during the wait; the
+        scheduler reloads it via :meth:`get_pending_deferred`.
+        """
+        col = self._TOO_DEFERRED_COLUMNS.get(telescope)
+        if not col:
+            logger.warning(f"set_too_deferred: unknown telescope '{telescope}'")
+            return False
+        facility = str(facility).strip()
+        trigger_num = str(trigger_num).strip()
+        if not facility or not trigger_num:
+            return False
+        try:
+            with self.file_lock:
+                df = self._load_ascii()
+                idx = self._find_index(df, facility, trigger_num)
+                if idx is None:
+                    logger.warning(
+                        f"set_too_deferred: no ASCII row for {facility} #{trigger_num}"
+                    )
+                    return False
+                df.at[idx, col] = str(fire_at_iso)
+                self._write_df(df)
+                logger.info(
+                    f"Deferred ToO persisted ({telescope}) for {facility} "
+                    f"#{trigger_num} @ {fire_at_iso}"
+                )
+                return True
+        except Exception as exc:
+            logger.error(f"set_too_deferred failed: {exc}")
+            return False
+
+    def clear_too_deferred(
+        self, facility: str, trigger_num: str, telescope: str
+    ) -> bool:
+        """Clear a pending deferred-ToO fire time (on fire, cancel, or supersede)."""
+        col = self._TOO_DEFERRED_COLUMNS.get(telescope)
+        if not col:
+            return False
+        facility = str(facility).strip()
+        trigger_num = str(trigger_num).strip()
+        if not facility or not trigger_num:
+            return False
+        try:
+            with self.file_lock:
+                df = self._load_ascii()
+                idx = self._find_index(df, facility, trigger_num)
+                if idx is None:
+                    return False
+                if str(df.at[idx, col]).strip():
+                    df.at[idx, col] = ""
+                    self._write_df(df)
+                    logger.info(
+                        f"Deferred ToO cleared ({telescope}) for {facility} #{trigger_num}"
+                    )
+                return True
+        except Exception as exc:
+            logger.error(f"clear_too_deferred failed: {exc}")
+            return False
+
+    def get_pending_deferred(self) -> List[Dict[str, Any]]:
+        """Return all rows with a pending deferred ToO (for scheduler reload).
+
+        Each item: ``{facility, trigger_num, telescope, fire_at, name, ra, dec,
+        error}``. ``facility`` is the row's Best/Primary facility — any facility
+        on the row matches the same event via ``_find_index`` at fire time.
+        """
+        out: List[Dict[str, Any]] = []
+        try:
+            with self.file_lock:
+                df = self._load_ascii()
+                for _, row in df.iterrows():
+                    trigger = str(row.get("Trigger_num", "")).strip().strip('"')
+                    if not trigger:
+                        continue
+                    facility = (
+                        str(row.get("Best_Facility", "")).strip()
+                        or str(row.get("Primary_Facility", "")).strip()
+                    )
+                    for telescope, col in self._TOO_DEFERRED_COLUMNS.items():
+                        fire_at = str(row.get(col, "")).strip()
+                        if not fire_at:
+                            continue
+                        out.append({
+                            "facility":    facility,
+                            "trigger_num": trigger,
+                            "telescope":   telescope,
+                            "fire_at":     fire_at,
+                            "name":        str(row.get("Name", "")).strip().strip('"'),
+                            "ra":          str(row.get("RA", "")).strip(),
+                            "dec":         str(row.get("DEC", "")).strip(),
+                            "error":       str(row.get("Error", "")).strip(),
+                        })
+        except Exception as exc:
+            logger.error(f"get_pending_deferred failed: {exc}")
+        return out
 
     def find_existing_event(
         self,

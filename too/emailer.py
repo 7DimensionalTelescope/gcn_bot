@@ -27,12 +27,12 @@ field labels and silently discards anything else. Labels in
 ``_build_body_rasa36`` must stay on that whitelist, and free text must pass
 through ``_sanitize_for_tcspy`` first. See that function for details.
 
-Auto-ToO master switch
-----------------------
-The caller (``GCNBot``) is responsible for checking
-``config.turn_on_too_email_auto`` before calling ``evaluate_criteria()``.
-This class is unaware of the config flag so that it remains testable in
-isolation.
+Auto-ToO enable switches
+------------------------
+The caller (``GCNBot``) owns the per-telescope×case enable flags
+(``TURN_ON_TOO_EMAIL_AUTO_{7DT,RASA36}_{SINGLE,MULTI}``) and checks them before
+acting on ``classify_auto_too()`` / ``evaluate_criteria()``. This class is
+unaware of those flags so that it remains testable in isolation.
 """
 
 import json
@@ -111,13 +111,35 @@ def _tcspy_bool(value: Any) -> str:
 
 # ---------------------------------------------------------------------------
 # Criterion functions
-# Each function receives (notice_data, visibility_result) and returns bool.
-# Add new criteria by appending (name, function) tuples to CRITERIA below.
+# Each function receives (notice_data, visibility_result, emailer) and returns
+# bool. The emailer instance is passed so a criterion can read per-instance
+# config (e.g. observable_soon_hours). Add new criteria by appending
+# (name, function) tuples to CRITERIA below.
 # ---------------------------------------------------------------------------
+
+# Facilities whose alerts are gamma-ray bursts (as opposed to the
+# neutrino / particle facilities AMON, IceCube*, HAWC). Used to gate
+# RASA36 auto-ToO, which fires only for GRB targets. Matches the facility
+# names assigned by GCNNoticeHandler.MONITORED_FACILITIES.
+_GRB_FACILITIES: frozenset = frozenset({
+    "SwiftBAT", "SwiftXRT", "SwiftUVOT",
+    "FermiGBM", "FermiLAT", "CALET",
+    "EinsteinProbe", "SVOM",
+})
+
+
+# Fallback for how many hours ahead of the target rising an auto-ToO may still
+# fire (so the request can be queued before the target is up). The live value
+# is per-instance (``GCNToOEmailer.observable_soon_hours``, driven by
+# ``TOO_OBSERVABLE_SOON_HOURS`` in settings.toml); this constant is only the
+# default when none is supplied.
+OBSERVABLE_SOON_HOURS: float = 2.0
+
 
 def _is_observable_now(
     notice_data: Dict[str, Any],
     visibility_result: Optional[Dict[str, Any]],
+    emailer: "GCNToOEmailer",
 ) -> bool:
     """Return True when the target is currently above the horizon and visible."""
     if not visibility_result:
@@ -125,15 +147,51 @@ def _is_observable_now(
     return visibility_result.get("case") == "observable_now"
 
 
+def _is_observable_soon(
+    notice_data: Dict[str, Any],
+    visibility_result: Optional[Dict[str, Any]],
+    emailer: "GCNToOEmailer",
+) -> bool:
+    """Return True when the target rises within ``emailer.observable_soon_hours``.
+
+    Covers the ``observable_later`` case (observable later tonight) when the
+    wait is short — ``observable_now`` is handled by :func:`_is_observable_now`.
+    The wait time comes from the supy window
+    (``details.tonight.window.time_until_start_hours``); if it is missing the
+    criterion is not satisfied.
+    """
+    if not visibility_result:
+        return False
+    if visibility_result.get("case") != "observable_later":
+        return False
+    window = (
+        (visibility_result.get("details") or {})
+        .get("tonight", {})
+        .get("window", {})
+    )
+    hrs = window.get("time_until_start_hours")
+    if hrs is None:
+        return False
+    try:
+        return 0.0 <= float(hrs) <= emailer.observable_soon_hours
+    except (TypeError, ValueError):
+        return False
+
+
 # ---------------------------------------------------------------------------
 # Public criteria list — order matters: first match wins
 # ---------------------------------------------------------------------------
 _CRITERIA: List[Tuple[str, Callable]] = [
-    ("observable_now", _is_observable_now),
+    ("observable_now",  _is_observable_now),
+    ("observable_soon", _is_observable_soon),  # rises within observable_soon_hours
     # Add new criteria here, e.g.:
-    # ("observable_soon", _is_observable_soon),
     # ("icecube_gold",    _is_icecube_gold),
 ]
+
+# Criteria whose match means "defer the ToO until the target is up" rather than
+# send immediately. Any other satisfied criterion sends now. Used by
+# classify_auto_too to return "soon" vs "now".
+_DEFERRED_CRITERION_NAMES: frozenset = frozenset({"observable_soon"})
 
 
 class GCNToOEmailer:
@@ -180,6 +238,9 @@ class GCNToOEmailer:
         min_altitude: float = 30.0,
         min_moon_sep: float = 30.0,
         telescope: str = "7DT",
+        auto_too_grb_only: bool = False,
+        auto_too_max_tiles: Optional[int] = None,
+        observable_soon_hours: float = OBSERVABLE_SOON_HOURS,
     ) -> None:
         self.email_from     = email_from
         self.email_to       = [email_to] if isinstance(email_to, str) else list(email_to)
@@ -189,6 +250,18 @@ class GCNToOEmailer:
         self.min_altitude   = min_altitude
         self.min_moon_sep   = min_moon_sep
         self.telescope      = telescope
+        # Auto-ToO gating (see classify_auto_too). GRB-only restricts to GRB
+        # facilities; the tile gate fires for a localization covering
+        # 1..auto_too_max_tiles tiles (both telescopes use 5 — single-tile and
+        # multi-tile-up-to-5 share one config per telescope).
+        self.auto_too_grb_only  = auto_too_grb_only
+        self.auto_too_max_tiles = (
+            auto_too_max_tiles if auto_too_max_tiles is not None
+            else self.MAX_AUTO_TOO_TILES
+        )
+        # Read by the observable_soon criterion — how many hours before the
+        # target rises an auto-ToO may still fire.
+        self.observable_soon_hours = observable_soon_hours
         logger.info(f"GCNToOEmailer initialised for telescope={telescope}")
 
     # ==================================================================
@@ -208,8 +281,8 @@ class GCNToOEmailer:
         Run the registered criteria in order and return ``True`` on first match.
 
         This is the single decision point for *automatic* ToO emails.
-        The caller should already have confirmed that
-        ``config.turn_on_too_email_auto`` is ``True`` before calling this.
+        The caller enforces the per-telescope×case enable flags separately (see
+        the module docstring); this method only evaluates the criteria/gates.
 
         Parameters
         ----------
@@ -234,27 +307,60 @@ class GCNToOEmailer:
 
             GCNToOEmailer.CRITERIA.append(("my_criterion", my_function))
 
-        where ``my_function(notice_data, visibility_result) -> bool``.
+        where ``my_function(notice_data, visibility_result, emailer) -> bool``
+        (the ``emailer`` arg gives access to per-instance config).
         """
-        # Hard gate: skip auto-ToO when the tile count exceeds the limit.
-        if tile_result is not None:
-            n_tiles = tile_result.get("n_tiles", 0)
-            if n_tiles > self.MAX_AUTO_TOO_TILES:
+        return self.classify_auto_too(notice_data, visibility_result, tile_result) is not None
+
+    def classify_auto_too(
+        self,
+        notice_data: Dict[str, Any],
+        visibility_result: Optional[Dict[str, Any]],
+        tile_result: Optional[Dict[str, Any]] = None,
+    ) -> Optional[str]:
+        """Classify the auto-ToO decision as ``"now"``, ``"soon"``, or ``None``.
+
+        * ``"now"``  — send immediately (target observable now).
+        * ``"soon"`` — defer until the target rises (``observable_soon``).
+        * ``None``   — no auto-ToO (a gate failed or no criterion matched).
+
+        Applies the same gates as :meth:`evaluate_criteria` (GRB-only, tile
+        count), then runs the criteria; a satisfied criterion in
+        ``_DEFERRED_CRITERION_NAMES`` yields ``"soon"``, any other yields
+        ``"now"`` (first match wins).
+        """
+        # GRB-only gate: RASA36 auto-ToO fires for GRBs, not neutrino/GW alerts.
+        if self.auto_too_grb_only:
+            facility = str(notice_data.get("Facility", "")).strip()
+            if facility not in _GRB_FACILITIES:
                 logger.info(
-                    f"Auto-ToO suppressed: {n_tiles} tiles required "
-                    f"(limit={self.MAX_AUTO_TOO_TILES})"
+                    f"Auto-ToO suppressed: facility '{facility}' is not a GRB source"
                 )
-                return False
+                return None
+
+        # Tile gate: fire for a localization covering 1..auto_too_max_tiles
+        # tiles (the single-tile and multi-tile-up-to-max cases share one config
+        # per telescope). A missing tile_result (no error radius → no tile
+        # computation) or a zero-tile result is not a confirmed localization and
+        # is suppressed.
+        n_tiles = tile_result.get("n_tiles") if tile_result else None
+        if n_tiles is None or not (1 <= n_tiles <= self.auto_too_max_tiles):
+            logger.info(
+                f"Auto-ToO suppressed: localization must cover 1-"
+                f"{self.auto_too_max_tiles} tiles (got {n_tiles})"
+            )
+            return None
 
         for name, fn in self.CRITERIA:
             try:
-                if fn(notice_data, visibility_result):
-                    logger.info(f"Auto-ToO criterion satisfied: '{name}'")
-                    return True
+                if fn(notice_data, visibility_result, self):
+                    case = "soon" if name in _DEFERRED_CRITERION_NAMES else "now"
+                    logger.info(f"Auto-ToO criterion satisfied: '{name}' → {case}")
+                    return case
             except Exception as exc:
                 logger.warning(f"Criterion '{name}' raised an error: {exc}")
         logger.debug("No auto-ToO criteria satisfied")
-        return False
+        return None
 
     # ==================================================================
     # Public: send email
@@ -579,7 +685,7 @@ AUTOMATIC ToO Request - GRB Alert
 - Image Count: {email_data['imageCount']}
 - Obsmode: Single
 - Filter: r
-- Objtype: GRB
+- Objtype: ToO
 - Ntelescope: 1
 
 **Detailed Settings**

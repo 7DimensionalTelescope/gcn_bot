@@ -52,36 +52,28 @@ GWPORTAL_API_KEY  = "your-gwportal-api-key"
 # ToO email
 # ---------------------------------------------------------------------------
 TURN_ON_TOO_EMAIL_SLACK = false  # manual ToO requests via Slack button
-TURN_ON_TOO_EMAIL_AUTO  = false  # fully automatic ToO on observable_now
+# Automatic ToO, enabled independently per telescope × tile case (single = 1 tile, multi = 2..AUTO_TOO_MAX_TILES)
+TURN_ON_TOO_EMAIL_AUTO_7DT_SINGLE    = false  # 7DT, single-tile GRB (Spec, 100s x 3)
+TURN_ON_TOO_EMAIL_AUTO_7DT_MULTI     = false  # 7DT, multi-tile GRB  (Spec, 100s x 3)
+TURN_ON_TOO_EMAIL_AUTO_RASA36_SINGLE = false  # RASA36, single-tile GRB (rapid, 60s x 55)
+TURN_ON_TOO_EMAIL_AUTO_RASA36_MULTI  = false  # RASA36, multi-tile GRB  (rapid, 60s x 55)
+TURN_ON_TOO_EMAIL_AUTO_ON_UPDATE = false  # also auto-ToO on refined coordinates (dup-guarded), not just first notice
+TOO_OBSERVABLE_SOON_HOURS = 2.0           # auto-ToO also fires if target rises within this many hours (not just observable now)
+AUTO_TOO_MAX_TILES = 5                    # auto-ToO tile gate: fire only for localizations covering 1..N tiles
+TOO_AUTO_GRB_ONLY = true                  # auto-ToO restricts to GRB facilities (excludes AMON/IceCube/HAWC)
+TOO_DEFERRED_CHECK_INTERVAL_SEC = 30      # how often (s) the deferred-ToO scheduler checks for due sends
 
-EMAIL_FROM     = "your-bot-email@example.com"
-EMAIL_PASSWORD = "your-email-app-password"
-EMAIL_TO       = "your-team@example.com"
-TOO_TEST_EMAIL = ""  # optional; overrides EMAIL_TO during tests only
-
-# ---------------------------------------------------------------------------
-# ToO observation parameters
-# ---------------------------------------------------------------------------
-[TOO_CONFIG]
-exptime    = 100
-count      = 3
-obsmode    = "Spec"
-specmode   = "specall"
-ntelescope = 1
-binning    = "1"
-gain       = "2750"
-priority   = "50"
-weight     = ""
-objtype    = ""
-comments   = ""
-abortobservation = false
-obs_starttime    = ""
-id               = ""
-is_observable    = ""
+EMAIL_FROM      = "your-bot-email@example.com"
+EMAIL_PASSWORD  = "your-email-app-password"
+EMAIL_TO        = "your-team@example.com"
+EMAIL_TO_RASA36 = "rasa36-team@example.com"  # RASA36 ToO recipient (separate observatory account)
+TOO_TEST_EMAIL  = ""  # optional; overrides EMAIL_TO during tests only
 
 # ---------------------------------------------------------------------------
 # GCN Kafka topics to subscribe to
 # Comment out any topic you do not want to monitor.
+# NOTE: top-level keys (like this array) must appear BEFORE any [TABLE] header
+# below, or TOML parses them as belonging to that table.
 # ---------------------------------------------------------------------------
 DISPLAY_TOPICS = [
   # Neutrino / multi-messenger
@@ -105,3 +97,58 @@ DISPLAY_TOPICS = [
   "gcn.notices.svom.voevent.eclairs",
   "gcn.notices.svom.voevent.mxt",
 ]
+
+# ---------------------------------------------------------------------------
+# ToO observation parameters
+# ---------------------------------------------------------------------------
+[TOO_CONFIG]
+exptime    = 100
+count      = 3
+obsmode    = "Spec"
+specmode   = "specall"
+ntelescope = 1
+binning    = "1"
+gain       = "2750"
+priority   = "50"
+weight     = ""
+objtype    = ""
+comments   = ""
+abortobservation = false
+obs_starttime    = ""
+id               = ""
+is_observable    = ""
+
+# ---------------------------------------------------------------------------
+# Automatic-ToO observation parameters, split by tile case:
+#   *_SINGLE  → single-tile localization (n_tiles == 1)
+#   *_MULTI   → multi-tile localization  (2 .. AUTO_TOO_MAX_TILES)
+# The two cases are handled separately so each can be tuned independently.
+# Unset keys fall through to the telescope's emailer defaults.
+# ---------------------------------------------------------------------------
+# RASA36 (used only when TURN_ON_TOO_EMAIL_AUTO_RASA36 = true) — rapid, 60 s × 55.
+[TOO_CONFIG_RASA36_AUTO_SINGLE]
+singleExposure = 60
+imageCount     = 55
+priority       = "1"
+rapidToO       = "True"
+
+[TOO_CONFIG_RASA36_AUTO_MULTI]
+singleExposure = 60
+imageCount     = 55
+priority       = "1"
+rapidToO       = "True"
+
+# 7DT (used only when TURN_ON_TOO_EMAIL_AUTO = true) — Spec mode, 100 s × 3.
+[TOO_CONFIG_7DT_AUTO_SINGLE]
+singleExposure = 100
+imageCount     = 3
+obsmode        = "Spec"
+specmode       = "specall"
+priority       = "50"
+
+[TOO_CONFIG_7DT_AUTO_MULTI]
+singleExposure = 100
+imageCount     = 3
+obsmode        = "Spec"
+specmode       = "specall"
+priority       = "50"
