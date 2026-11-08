@@ -130,7 +130,7 @@ is_observable    = ""
 # The two cases are handled separately so each can be tuned independently.
 # Unset keys fall through to the telescope's emailer defaults.
 # ---------------------------------------------------------------------------
-# RASA36 (used only when TURN_ON_TOO_EMAIL_AUTO_RASA36 = true) — rapid, 60 s × 55.
+# RASA36 (used only when TURN_ON_TOO_EMAIL_AUTO_RASA36_SINGLE / _MULTI = true) — rapid, 60 s × 55.
 [TOO_CONFIG_RASA36_AUTO_SINGLE]
 singleExposure = 60
 imageCount     = 55
@@ -143,7 +143,7 @@ imageCount     = 55
 priority       = "1"
 rapidToO       = "True"
 
-# 7DT (used only when TURN_ON_TOO_EMAIL_AUTO = true) — Spec mode, 100 s × 3.
+# 7DT (used only when TURN_ON_TOO_EMAIL_AUTO_7DT_SINGLE / _MULTI = true) — Spec mode, 100 s × 3.
 [TOO_CONFIG_7DT_AUTO_SINGLE]
 singleExposure = 100
 imageCount     = 3

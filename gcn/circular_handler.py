@@ -313,7 +313,7 @@ class GCNCircularHandler:
                         result["event_name"] = f"{prefix}{sep}{m.group(1)}"
                         break
                 if result["event_name"] is None:
-                    logger.warning(f"process_circular: could not extract event_name for circular {circ_id} — subject: {subject!r}")
+                    logger.info(f"process_circular: could not extract event_name for circular {circ_id} — subject: {subject!r}")
 
             # --- "EP Alert YYMMDD.ff" (MASTER-Net): the event is named by its time ---
             # ff = fraction of the day, 0.01 d (14.4 min) resolution; the event is
@@ -383,7 +383,7 @@ class GCNCircularHandler:
                     )
 
             if result["facility"] is None:
-                logger.warning(f"process_circular: could not identify facility for circular {circ_id} — subject: {subject!r}")
+                logger.info(f"process_circular: could not identify facility for circular {circ_id} — subject: {subject!r}")
 
             # --- Trigger number (facility-specific) ---
             if result["trigger_num"] is None:

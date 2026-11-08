@@ -574,7 +574,7 @@ class GCNBot:
                 visibility_result = self.visibility.get_status(ra=ra, dec=dec)
                 if visibility_result:
                     logger.info(
-                        f"7DT visibility for {name}: {visibility_result.get('case')}"
+                        f"7DT visibility for {facility} #{trigger_num}: {visibility_result.get('case')}"
                     )
             except Exception as exc:
                 logger.error(f"7DT visibility analysis failed: {exc}")
@@ -582,7 +582,7 @@ class GCNBot:
                 visibility_result_loao = self.visibility.get_status_loao(ra=ra, dec=dec)
                 if visibility_result_loao:
                     logger.info(
-                        f"LOAO visibility for {name}: {visibility_result_loao.get('case')}"
+                        f"LOAO visibility for {facility} #{trigger_num}: {visibility_result_loao.get('case')}"
                     )
             except Exception as exc:
                 logger.error(f"LOAO visibility analysis failed: {exc}")
@@ -596,10 +596,10 @@ class GCNBot:
                 if error is not None and float(error) > 0:
                     tile_result = self.tiles.get_tile_info(ra=ra, dec=dec, error=float(error))
                     if tile_result:
-                        logger.info(f"7DT tile coverage for {name}: {tile_result['n_tiles']} tile(s)")
+                        logger.info(f"7DT tile coverage for {facility} #{trigger_num}: {tile_result['n_tiles']} tile(s)")
                     tile_result_rasa36 = self.tiles_rasa36.get_tile_info(ra=ra, dec=dec, error=float(error))
                     if tile_result_rasa36:
-                        logger.info(f"RASA36 tile coverage for {name}: {tile_result_rasa36['n_tiles']} tile(s)")
+                        logger.info(f"RASA36 tile coverage for {facility} #{trigger_num}: {tile_result_rasa36['n_tiles']} tile(s)")
             except (ValueError, TypeError, Exception) as exc:
                 logger.error(f"Tile coverage analysis failed: {exc}")
 
