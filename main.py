@@ -1418,6 +1418,14 @@ class GCNBot:
             try:
                 self.too_handler.register_handlers(self.slack.app)
                 self.too_handler_rasa36.register_handlers(self.slack.app)
+
+                # "📄 GCN Notice" is a URL button: Slack opens the link itself, but
+                # still sends a block_actions event that Bolt would log as an
+                # unhandled request (WARNING + 404). Acknowledge it and do nothing.
+                @self.slack.app.action("notice_link")
+                def _ack_notice_link(ack):
+                    ack()
+
                 logger.info("Slack Bolt handlers registered (7DT + RASA36)")
             except Exception as exc:
                 logger.error(f"Failed to register Slack handlers: {exc}")
