@@ -54,6 +54,10 @@ _DEFAULTS: Dict[str, Any] = {
     # Days an event stays in the thread index — also how long late notices and
     # follow-up circulars can still find the event's Slack thread.
     "THREAD_INDEX_MAX_AGE_DAYS": 30.0,
+    # "EP Alert YYMMDD.ff" circulars name the event by time at 0.01-day
+    # (14.4 min) resolution, i.e. up to ±7.2 min off: match an EP event whose
+    # trigger time is within this many minutes (a second candidate → no match).
+    "CIRCULAR_EP_MATCH_MINUTES": 10.0,
     "ASCII_MAX_EVENTS": 10,
 
     # Circular storage
@@ -327,6 +331,13 @@ class BotConfig:
     def output_thread_index(self) -> str:
         raw = str(self.__dict__.get("output_thread_index", _DEFAULTS["OUTPUT_THREAD_INDEX"]))
         return self._resolve_path(raw)
+
+    @property
+    def circular_ep_match_minutes(self) -> float:
+        """Time tolerance (min) for matching "EP Alert YYMMDD.ff" circulars."""
+        return max(0.0, float(self.__dict__.get(
+            "circular_ep_match_minutes", _DEFAULTS["CIRCULAR_EP_MATCH_MINUTES"],
+        )))
 
     @property
     def thread_index_max_age_days(self) -> float:

@@ -417,6 +417,59 @@ class GCNNoticeHandler:
             entry = self._load_thread_index().get(self._thread_key(facility, trigger_num))
         return entry if entry and entry.get("thread_ts") else None
 
+    def find_ep_thread_by_time(
+        self, when: Any, tolerance_min: float = 10.0
+    ) -> Optional[Dict[str, Any]]:
+        """Thread of the Einstein Probe event whose trigger time is within
+        *tolerance_min* of *when* (UTC), from the ASCII file and the thread index.
+
+        For circulars that name the event only by time ("EP Alert 261106.58").
+        Returns ``{thread_ts, name, delta_min}``, or ``None`` when nothing — or
+        more than one event — is that close.
+        """
+        try:
+            t = pd.Timestamp(when)
+            t = t.tz_localize("UTC") if t.tzinfo is None else t.tz_convert("UTC")
+        except Exception:
+            return None
+        found: Dict[str, Dict[str, Any]] = {}   # thread_ts -> candidate
+
+        def consider(facility: Any, disc: Any, thread_ts: Any, name: Any) -> None:
+            thread_ts = str(thread_ts or "").strip().strip('"')
+            if not thread_ts or self._normalize_facility(str(facility)) != "EinsteinProbe":
+                return
+            d = pd.to_datetime(str(disc).strip().strip('"'), errors="coerce", utc=True)
+            if pd.isna(d):
+                return
+            delta = abs((d - t).total_seconds()) / 60.0
+            if delta <= tolerance_min:
+                found[thread_ts] = {"thread_ts": thread_ts,
+                                    "name": str(name or "").strip().strip('"'),
+                                    "delta_min": round(delta, 1)}
+
+        try:
+            with self.file_lock:
+                df = self._load_ascii() if os.path.exists(self.output_ascii) else pd.DataFrame()
+            for row in df.to_dict("records"):
+                consider(row.get("Primary_Facility"), row.get("Discovery_UTC"),
+                         row.get("thread_ts"), row.get("Name"))
+            if self.thread_index_path:
+                with self._thread_index_lock:
+                    data = self._load_thread_index()
+                for key, v in data.items():
+                    consider(key.partition("|")[0], v.get("discovery_utc"),
+                             v.get("thread_ts"), v.get("name"))
+        except Exception as exc:
+            logger.error(f"find_ep_thread_by_time failed: {exc}")
+            return None
+        if len(found) > 1:
+            logger.info(
+                f"EP time match at {t:%Y-%m-%d %H:%M} is ambiguous "
+                f"({', '.join(c['name'] for c in found.values())}) — not used"
+            )
+            return None
+        return next(iter(found.values()), None)
+
     @staticmethod
     def _name_key(name: Any) -> str:
         return str(name or "").strip().strip('"').lower().replace(" ", "")

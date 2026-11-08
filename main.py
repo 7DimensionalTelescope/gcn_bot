@@ -326,7 +326,8 @@ class GCNBot:
     def _thread_from_index(self, processed: dict, event_name: Optional[str]) -> "tuple[str, str]":
         """Look a circular's event up in the thread index; ``(thread_ts, via)`` or ``("", "")``.
 
-        Order: facility + trigger, then event name. A name hit is refused when the
+        Order: facility + trigger, event name, then (for "EP Alert YYMMDD.ff"
+        circulars) the EP event at that trigger time. A name hit is refused when the
         circular explicitly names a *different* trigger of the same facility
         family (the bot letters events in the order it sees them, so its "GRB
         261029C" need not be GCN's).
@@ -353,6 +354,13 @@ class GCNBot:
                         )
                     else:
                         return entry["thread_ts"], "thread index (name)"
+            ep_time = processed.get("ep_alert_time")
+            if ep_time:
+                hit = nh.find_ep_thread_by_time(
+                    ep_time, float(self.config.circular_ep_match_minutes)
+                )
+                if hit:
+                    return hit["thread_ts"], f"EP time match ({hit['name']}, Δ{hit['delta_min']} min)"
         except Exception as exc:
             logger.error(f"Thread-index lookup for circular failed: {exc}")
         return "", ""

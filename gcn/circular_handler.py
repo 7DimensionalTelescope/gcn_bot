@@ -32,7 +32,7 @@ import re
 import shutil
 import threading
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Union
 
 import pandas as pd
@@ -94,6 +94,19 @@ class GCNCircularHandler:
         "EinsteinProbe": r"Einstein\s*Probe[/\s\-]*(?:WXT|FXT)?\s+detect(?:ion|ed)\s+of\s+(?:a|an|the)(?:\s+\S+){0,3}\s*X-ray",
         "IceCube":       r"IceCube observation of a high-energy neutrino candidate",
     }
+
+    # "EP Alert 261106.58" — EP event named by date + fraction of the day.
+    _EP_ALERT_RE = re.compile(r"\bEP\s*Alert\s*(\d{6})\.(\d{2,3})\b", re.IGNORECASE)
+
+    # (subject regex, facility, trigger group or None) — checked on the subject
+    # before the generic facility scan; first match wins.
+    _SUBJECT_TRIGGER_PATTERNS = [
+        (r"\bEP\s*Alert\s*\d{6}\.\d{2,3}\b",                                  "EinsteinProbe", None),
+        (r"\bEP\s*#\s*(\d{8,})",                                              "EinsteinProbe", 1),
+        (r"\bEP[-\s/]?(?:[WF]XT[-\s]?)?trigger\s*(?:ID\s*)?[:#]?\s*(\d{8,})",   "EinsteinProbe", 1),
+        (r"\bSwift\s+(?:BAT\s+)?Trigger\s*[:#]?\s*(\d{5,})",                  "Swift",         1),
+        (r"\bFermi\s+(?:GBM\s+)?trigger\s+(?:No\.?\s*)?(\d{6,})",             "FermiGBM",      1),
+    ]
 
     def __init__(
         self,
@@ -291,19 +304,42 @@ class GCNCircularHandler:
                 for prefix, pattern in [
                     ("GRB",     r"(?:GRB|grb)\s*(\d{6}[A-Za-z])"),
                     ("EP",      r"(?:EP)\s*(\d{6}[A-Za-z])"),
-                    ("IceCube", r"(?:IceCube)\s*(\d{6}[A-Za-z])"),
+                    ("IceCube", r"IceCube[-\s]*(?:Alert\s*)?(\d{6}[A-Za-z])"),
                 ]:
                     m = re.search(pattern, subject, re.IGNORECASE)
                     if m:
-                        result["event_name"] = f"{prefix} {m.group(1)}"
+                        # IceCube events are named "IceCube-260930A" by GCN and the bot.
+                        sep = "-" if prefix == "IceCube" else " "
+                        result["event_name"] = f"{prefix}{sep}{m.group(1)}"
                         break
                 if result["event_name"] is None:
                     logger.warning(f"process_circular: could not extract event_name for circular {circ_id} — subject: {subject!r}")
+
+            # --- "EP Alert YYMMDD.ff" (MASTER-Net): the event is named by its time ---
+            # ff = fraction of the day, 0.01 d (14.4 min) resolution; the event is
+            # matched by trigger time later (GCNNoticeHandler.find_ep_thread_by_time).
+            m = self._EP_ALERT_RE.search(subject)
+            if m:
+                day = datetime.strptime(m.group(1), "%y%m%d")
+                when = day + timedelta(days=float("0." + m.group(2)))
+                result["ep_alert_time"] = when.strftime("%Y-%m-%d %H:%M:%S")
 
             # --- Facility ---
             # Use more of the body so follow-up circulars from optical telescopes
             # that reference the triggering instrument in passing can be identified.
             combined = subject + " " + body[:2000]
+
+            # A subject that names the trigger outright ("EP trigger 0170…",
+            # "EP#0170…", "Swift Trigger 1513439") decides the facility before the
+            # generic scan, which would otherwise pick the first instrument
+            # mentioned — often the follow-up one ("…: SVOM/C-GFT …" → SVOM).
+            for pat, fac, group in self._SUBJECT_TRIGGER_PATTERNS:
+                m = re.search(pat, subject, re.IGNORECASE)
+                if m:
+                    result["facility"] = fac
+                    if group:
+                        result["trigger_num"] = m.group(group)
+                    break
             facility_patterns = [
                 (r"Swift[\s/\-]?XRT",              "SwiftXRT"),
                 (r"Swift[\s/\-]?BAT",              "SwiftBAT"),
@@ -323,10 +359,11 @@ class GCNCircularHandler:
                 (r"ICECUBE",                       "IceCube"),
                 (r"AMON",                          "AMON"),
             ]
-            for pat, name in facility_patterns:
-                if re.search(pat, combined, re.IGNORECASE):
-                    result["facility"] = name
-                    break
+            if result["facility"] is None:
+                for pat, name in facility_patterns:
+                    if re.search(pat, combined, re.IGNORECASE):
+                        result["facility"] = name
+                        break
 
             # Fallback: infer facility from the GCN-provided eventId prefix when
             # the circular body belongs to a follow-up telescope (e.g. COLIBRÍ)
@@ -349,9 +386,10 @@ class GCNCircularHandler:
                 logger.warning(f"process_circular: could not identify facility for circular {circ_id} — subject: {subject!r}")
 
             # --- Trigger number (facility-specific) ---
-            result["trigger_num"] = self._extract_trigger_num(
-                combined, result["facility"]
-            )
+            if result["trigger_num"] is None:
+                result["trigger_num"] = self._extract_trigger_num(
+                    combined, result["facility"]
+                )
             # If not found in this circular's text, look it up via referenced
             # GCN circular IDs cited in the body (e.g. "GCN 44718").
             if result["trigger_num"] is None and result["facility"]:
@@ -482,6 +520,8 @@ class GCNCircularHandler:
                 r"WXT\s+trigger\s+(\d+)",
                 r"WXT\s+(?:source|ID)\s*[:#]?\s*(\d+)",
                 r"EP-WXT\s+trigger\s+ID\s*[:#]?\s*(\d+)",
+                r"\bEP\s*#\s*(\d{8,})",              # "EP#01709320865"
+                r"\bEP\s+trigger\s+(\d{8,})",         # "EP trigger 01709320985"
                 # Generic "EP trigger …" or "Einstein Probe … ID …"
                 r"(?:Einstein\s*Probe|EP)\b.{0,120}\bID\s*[:#]?\s*(\d+)",
             ]:
