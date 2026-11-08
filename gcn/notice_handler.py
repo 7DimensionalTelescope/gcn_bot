@@ -38,6 +38,8 @@ import voeventparse as vp
 
 import pandas as pd
 
+from gcn import linking
+
 logger = logging.getLogger(__name__)
 
 
@@ -156,6 +158,10 @@ class GCNNoticeHandler:
         # survives a bot restart during the wait (reloaded into the scheduler on
         # startup). One per telescope.
         "ToO_Deferred_7DT", "ToO_Deferred_RASA36",
+        # Tile IDs a dispatched ToO requested (comma-separated, empty when unknown,
+        # e.g. a manual send). A linked event's auto-ToO is skipped when it would
+        # request exactly the same tiles again (see GCNBot._group_too_block).
+        "ToO_Tiles_7DT", "ToO_Tiles_RASA36",
     ]
 
     # Telescope label → ASCII column holding its ToO-sent marker.
@@ -164,6 +170,8 @@ class GCNNoticeHandler:
     _TOO_DEFERRED_COLUMNS: Dict[str, str] = {
         "7DT": "ToO_Deferred_7DT", "RASA36": "ToO_Deferred_RASA36",
     }
+    # Telescope label → ASCII column holding the tile IDs its ToO requested.
+    _TOO_TILES_COLUMNS: Dict[str, str] = {"7DT": "ToO_Tiles_7DT", "RASA36": "ToO_Tiles_RASA36"}
 
     def __init__(
         self,
@@ -273,6 +281,7 @@ class GCNNoticeHandler:
         notice_data: Dict[str, Any],
         thread_ts: Optional[str] = None,
         too_sent: Optional[List[str]] = None,
+        too_tiles: Optional[Dict[str, List[str]]] = None,
     ) -> bool:
         """Save or update *notice_data* in the ASCII event file.
 
@@ -286,6 +295,8 @@ class GCNNoticeHandler:
             Telescope labels (``"7DT"`` / ``"RASA36"``) whose ToO-sent marker
             should be stamped on this row. Folded into the same write so an
             auto-ToO send costs no extra file write / backup.
+        too_tiles : dict[str, list[str]] | None
+            Tile IDs each of those ToOs requested (``ToO_Tiles_*`` columns).
         """
         try:
             with self.file_lock:
@@ -304,13 +315,18 @@ class GCNNoticeHandler:
                     row_idx = 0  # _append_row prepends the new row
 
                 if too_sent:
-                    self._set_too_flags(df, row_idx, too_sent)
+                    self._set_too_flags(df, row_idx, too_sent, too_tiles)
 
                 if thread_ts:
+                    row = df.loc[row_idx]
                     self.record_thread(
                         facility, trigger_num, thread_ts,
-                        str(df.at[row_idx, "Name"]).strip().strip('"'),
-                        str(df.at[row_idx, "Discovery_UTC"]).strip().strip('"'),
+                        str(row["Name"]).strip().strip('"'),
+                        str(row["Discovery_UTC"]).strip().strip('"'),
+                        notice_time=notice_data.get("Discovery_UTC"),
+                        ra=linking.to_float(row["RA"]),
+                        dec=linking.to_float(row["DEC"]),
+                        err=linking.to_float(row["Error"]),
                     )
 
                 # Trim to max events
@@ -369,12 +385,17 @@ class GCNNoticeHandler:
 
     def record_thread(
         self, facility: str, trigger_num: str, thread_ts: str, name: str = "",
-        discovery_utc: str = "",
+        discovery_utc: str = "", notice_time: Any = None, **fields: Any,
     ) -> None:
         """Remember which Slack thread an event lives in (survives ASCII trimming).
 
         ``discovery_utc`` (trigger time, UTC) lets a circular that names the
-        event only by time ("EP Alert 261106.58") find the thread later.
+        event only by time ("EP Alert 261106.58") find the thread later;
+        ``notice_time`` (this notice's own time, e.g. SVOM-MXT's) is kept in
+        ``times`` because MASTER-Net names some circulars after it.
+        ``fields`` (ra / dec / err) are stored for same-burst checks once the
+        ASCII row is gone. The entry is merged, so a same-burst link
+        (``same_as`` / ``link``) survives later records.
         """
         facility = str(facility).strip()
         trigger_num = str(trigger_num).strip()
@@ -384,23 +405,33 @@ class GCNNoticeHandler:
         try:
             with self._thread_index_lock:
                 data = self._load_thread_index()
-                entry = {"thread_ts": thread_ts, "name": name}
+                key = self._thread_key(facility, trigger_num)
+                entry = dict(data.get(key) or {})
+                entry.update({"thread_ts": thread_ts, "name": name})
+                times = set(entry.get("times") or [])
+                for t in (discovery_utc, notice_time):
+                    ts = linking.to_utc(t)
+                    if ts is not None:
+                        times.add(ts.strftime("%Y-%m-%d %H:%M:%S"))
                 discovery_utc = str(discovery_utc or "").strip()
                 if discovery_utc and discovery_utc.lower() != "nan":
                     entry["discovery_utc"] = discovery_utc
-                data[self._thread_key(facility, trigger_num)] = entry
-                # Prune by thread_ts epoch so the file cannot grow without bound.
-                cutoff = time.time() - self._thread_index_max_age
-                data = {
-                    k: v for k, v in data.items()
-                    if self._ts_epoch(v.get("thread_ts")) >= cutoff
-                }
-                tmp = f"{self.thread_index_path}.tmp"
-                with open(tmp, "w", encoding="utf-8") as fh:
-                    json.dump(data, fh, indent=1)
-                os.replace(tmp, self.thread_index_path)
+                if times:
+                    entry["times"] = sorted(times)
+                entry.update({k: v for k, v in fields.items() if v is not None})
+                data[key] = entry
+                self._save_thread_index(data)
         except Exception as exc:
             logger.error(f"record_thread failed: {exc}")
+
+    def _save_thread_index(self, data: Dict[str, Any]) -> None:
+        """Prune by thread_ts age, then write atomically (caller holds the lock)."""
+        cutoff = time.time() - self._thread_index_max_age
+        data = {k: v for k, v in data.items() if self._ts_epoch(v.get("thread_ts")) >= cutoff}
+        tmp = f"{self.thread_index_path}.tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(data, fh, indent=1)
+        os.replace(tmp, self.thread_index_path)
 
     @staticmethod
     def _ts_epoch(thread_ts: Any) -> float:
@@ -420,51 +451,66 @@ class GCNNoticeHandler:
     def find_ep_thread_by_time(
         self, when: Any, tolerance_min: float = 10.0
     ) -> Optional[Dict[str, Any]]:
-        """Thread of the Einstein Probe event whose trigger time is within
-        *tolerance_min* of *when* (UTC), from the ASCII file and the thread index.
+        """Einstein Probe event triggered within *tolerance_min* of *when* —
+        for "EP Alert YYMMDD.ff" circulars. See :meth:`find_thread_by_time`."""
+        return self.find_thread_by_time(when, tolerance_min, {"EinsteinProbe"})
 
-        For circulars that name the event only by time ("EP Alert 261106.58").
-        Returns ``{thread_ts, name, delta_min}``, or ``None`` when nothing — or
-        more than one event — is that close.
+    def find_thread_by_time(
+        self, when: Any, tolerance_min: float = 10.0,
+        families: Optional[Any] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Thread of the event (of *families*, all if ``None``) whose trigger —
+        or any later notice — time is within *tolerance_min* of *when* (UTC),
+        from the ASCII file and the thread index.
+
+        For circulars that name the event only by time ("EP Alert 261106.58",
+        "SVOM GRB261108.05"). Linked same-burst events count as one candidate
+        (their canonical thread). Returns ``{thread_ts, name, delta_min}``, or
+        ``None`` when nothing — or more than one unrelated event — is that close.
         """
-        try:
-            t = pd.Timestamp(when)
-            t = t.tz_localize("UTC") if t.tzinfo is None else t.tz_convert("UTC")
-        except Exception:
+        t = linking.to_utc(when)
+        if t is None:
             return None
-        found: Dict[str, Dict[str, Any]] = {}   # thread_ts -> candidate
-
-        def consider(facility: Any, disc: Any, thread_ts: Any, name: Any) -> None:
-            thread_ts = str(thread_ts or "").strip().strip('"')
-            if not thread_ts or self._normalize_facility(str(facility)) != "EinsteinProbe":
-                return
-            d = pd.to_datetime(str(disc).strip().strip('"'), errors="coerce", utc=True)
-            if pd.isna(d):
-                return
-            delta = abs((d - t).total_seconds()) / 60.0
-            if delta <= tolerance_min:
-                found[thread_ts] = {"thread_ts": thread_ts,
-                                    "name": str(name or "").strip().strip('"'),
-                                    "delta_min": round(delta, 1)}
-
+        found: Dict[str, Dict[str, Any]] = {}   # canonical thread_ts -> candidate
         try:
             with self.file_lock:
                 df = self._load_ascii() if os.path.exists(self.output_ascii) else pd.DataFrame()
-            for row in df.to_dict("records"):
-                consider(row.get("Primary_Facility"), row.get("Discovery_UTC"),
-                         row.get("thread_ts"), row.get("Name"))
+            data: Dict[str, Any] = {}
             if self.thread_index_path:
                 with self._thread_index_lock:
                     data = self._load_thread_index()
-                for key, v in data.items():
-                    consider(key.partition("|")[0], v.get("discovery_utc"),
-                             v.get("thread_ts"), v.get("name"))
+
+            def consider(key: str, times: List[Any], thread_ts: Any, name: Any) -> None:
+                thread_ts = str(thread_ts or "").strip().strip('"')
+                family = key.partition("|")[0]
+                if not thread_ts or (families is not None and family not in families):
+                    return
+                deltas = [abs((d - t).total_seconds()) / 60.0
+                          for d in (linking.to_utc(x) for x in times) if d is not None]
+                if not deltas or min(deltas) > tolerance_min:
+                    return
+                root = self._group_root(key, data)
+                if root != key and data.get(root, {}).get("thread_ts"):
+                    thread_ts, name = data[root]["thread_ts"], data[root].get("name", name)
+                prev = found.get(thread_ts)
+                delta = round(min(deltas), 1)
+                if prev is None or delta < prev["delta_min"]:
+                    found[thread_ts] = {"thread_ts": thread_ts,
+                                        "name": str(name or "").strip().strip('"'),
+                                        "delta_min": delta}
+
+            for row in df.to_dict("records"):
+                key = self._thread_key(self._row_family_facility(row), row.get("Trigger_num", ""))
+                consider(key, [row.get("Discovery_UTC")], row.get("thread_ts"), row.get("Name"))
+            for key, v in data.items():
+                consider(key, [v.get("discovery_utc"), *(v.get("times") or [])],
+                         v.get("thread_ts"), v.get("name"))
         except Exception as exc:
-            logger.error(f"find_ep_thread_by_time failed: {exc}")
+            logger.error(f"find_thread_by_time failed: {exc}")
             return None
         if len(found) > 1:
             logger.info(
-                f"EP time match at {t:%Y-%m-%d %H:%M} is ambiguous "
+                f"Time match at {t:%Y-%m-%d %H:%M} is ambiguous "
                 f"({', '.join(c['name'] for c in found.values())}) — not used"
             )
             return None
@@ -478,8 +524,9 @@ class GCNNoticeHandler:
         """Return the index entry whose event name matches *name*, plus its ``key``.
 
         Same comparison as :meth:`find_event_by_name` (case- and space-
-        insensitive). ``None`` when nothing — or more than one entry — matches,
-        so an ambiguous name never picks a thread.
+        insensitive). Entries of one same-burst group share a name and resolve
+        to the group's canonical entry. ``None`` when nothing — or more than one
+        unrelated event — matches, so an ambiguous name never picks a thread.
         """
         target = self._name_key(name)
         if not (self.thread_index_path and target):
@@ -490,6 +537,11 @@ class GCNNoticeHandler:
             {**v, "key": k} for k, v in data.items()
             if v.get("thread_ts") and self._name_key(v.get("name")) == target
         ]
+        roots = {self._group_root(h["key"], data) for h in hits}
+        if len(hits) > 1 and len(roots) == 1:
+            root = roots.pop()
+            if data.get(root, {}).get("thread_ts"):
+                return {**data[root], "key": root}
         if len(hits) > 1:
             logger.info(f"Thread index: name {name!r} is ambiguous ({len(hits)} events) — not used")
             return None
@@ -500,14 +552,19 @@ class GCNNoticeHandler:
     # ------------------------------------------------------------------
 
     def _set_too_flags(
-        self, df: pd.DataFrame, idx: int, telescopes: List[str]
+        self, df: pd.DataFrame, idx: int, telescopes: List[str],
+        tiles: Optional[Dict[str, List[str]]] = None,
     ) -> None:
-        """Stamp the ToO-sent marker column(s) for *telescopes* on row *idx*."""
+        """Stamp the ToO-sent marker column(s) for *telescopes* on row *idx*,
+        plus the requested tile IDs when known."""
         stamp = datetime.now(tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         for tel in telescopes:
             col = self._TOO_STATE_COLUMNS.get(tel)
             if col:
                 df.at[idx, col] = stamp
+            ids = (tiles or {}).get(tel)
+            if ids and tel in self._TOO_TILES_COLUMNS:
+                df.at[idx, self._TOO_TILES_COLUMNS[tel]] = ",".join(str(i) for i in ids)
 
     def too_sent_at(
         self, facility: str, trigger_num: str, telescope: str
@@ -545,7 +602,8 @@ class GCNNoticeHandler:
         return bool(self.too_sent_at(facility, trigger_num, telescope))
 
     def mark_too_sent(
-        self, facility: str, trigger_num: str, telescope: str
+        self, facility: str, trigger_num: str, telescope: str,
+        tiles: Optional[List[str]] = None,
     ) -> bool:
         """Standalone write of a ToO-sent marker (for the manual Slack path).
 
@@ -570,7 +628,8 @@ class GCNNoticeHandler:
                         f"mark_too_sent: no ASCII row for {facility} #{trigger_num}"
                     )
                     return False
-                self._set_too_flags(df, idx, [telescope])
+                self._set_too_flags(df, idx, [telescope],
+                                    {telescope: tiles} if tiles else None)
                 self._write_df(df)
                 logger.info(
                     f"Marked ToO sent ({telescope}) for {facility} #{trigger_num}"
@@ -758,54 +817,16 @@ class GCNNoticeHandler:
             if df.empty:
                 return None
             target = event_id.strip().lower().replace(" ", "")
-            for _, row in df.iterrows():
-                row_name = str(row.get("Name", "")).strip().strip('"').lower().replace(" ", "")
-                if row_name == target:
-                    return row.to_dict()
-            return None
+            hits = [row.to_dict() for _, row in df.iterrows()
+                    if self._name_key(row.get("Name")) == target]
+            if len(hits) > 1:
+                # Linked same-burst events share a name: the canonical event is
+                # the one whose thread came first.
+                hits.sort(key=lambda r: self._ts_epoch(str(r.get("thread_ts", "")).strip() or "inf"))
+            return hits[0] if hits else None
         except Exception as exc:
             logger.error(f"Error in find_event_by_name: {exc}")
             return None
-
-    def update_ascii_event_name(self, old_name: str, new_name: str) -> bool:
-        """Replace the ``Name`` field for the row whose Name matches *old_name*.
-
-        Useful for upgrading a provisional event name to the official GCN
-        ``eventId`` once the first facility circular arrives.
-
-        Returns ``True`` on success, ``False`` if the row was not found.
-        """
-        try:
-            with self.file_lock:
-                df = self._load_ascii()
-                if df.empty:
-                    return False
-                target = old_name.strip().lower()
-                found  = False
-                for idx, row in df.iterrows():
-                    row_name = str(row.get("Name", "")).strip().strip('"').lower()
-                    if row_name == target:
-                        df.at[idx, "Name"] = new_name
-                        found = True
-                        break
-                if not found:
-                    return False
-                self._create_backup(self.output_ascii)
-                import csv as _csv
-                df.to_csv(
-                    self.output_ascii,
-                    sep=" ",
-                    header=True,
-                    index=False,
-                    quoting=_csv.QUOTE_NONNUMERIC,
-                    quotechar='"',
-                    columns=self.ASCII_COLUMNS,
-                )
-                logger.info(f"ASCII Name updated: '{old_name}' → '{new_name}'")
-                return True
-        except Exception as exc:
-            logger.error(f"Error updating ASCII event name: {exc}", exc_info=True)
-            return False
 
     def compare_event_data(
         self,
@@ -868,116 +889,240 @@ class GCNNoticeHandler:
             logger.error(f"Error comparing event data: {exc}")
         return differences
 
-    def find_related_events(
-        self,
-        notice_data: Dict[str, Any],
-        leniency_factor: float = 1.2,
-        time_window_hours: float = 24.0,
-    ) -> List[Dict[str, Any]]:
-        """Return rows from the ASCII file that are spatially and temporally
-        coincident with *notice_data*.
-
-        Two events are considered related when their error circles overlap:
-            angular_separation(c1, c2) < (r1 + r2) * leniency_factor
-        and their trigger times are within *time_window_hours* of each other.
-
-        The row belonging to *notice_data* itself (matched by GCN_ID) is always
-        excluded so an event is never reported as related to itself.
-        """
-        ra_raw  = notice_data.get("RA")
-        dec_raw = notice_data.get("DEC")
-        err_raw = notice_data.get("Error")
-        t_raw   = notice_data.get("Discovery_UTC")
-        gcn_id  = str(notice_data.get("GCN_ID", "")).strip()
-
-        if ra_raw in ("", None) or dec_raw in ("", None):
-            return []
-
-        try:
-            ra    = float(ra_raw)
-            dec   = float(dec_raw)
-            error = float(err_raw) if err_raw not in ("", None) else 0.0
-        except (ValueError, TypeError):
-            return []
-
-        t: Optional[datetime] = None
-        if isinstance(t_raw, datetime):
-            t = t_raw
-        elif t_raw:
-            try:
-                t = datetime.fromisoformat(str(t_raw))
-            except (ValueError, TypeError):
-                pass
-
-        related: List[Dict[str, Any]] = []
-        try:
-            if not os.path.exists(self.output_ascii):
-                return []
-
-            with self.file_lock:
-                df = pd.read_csv(
-                    self.output_ascii,
-                    sep=r"\s+",
-                    quotechar='"',
-                    quoting=csv.QUOTE_NONNUMERIC,
-                    dtype=str,
-                    na_filter=False,
-                )
-
-            if df.empty:
-                return []
-
-            for _, row in df.iterrows():
-                row_id = str(row.get("GCN_ID", "")).strip().strip('"')
-                if row_id == gcn_id:
-                    continue
-
-                try:
-                    row_ra  = float(str(row.get("RA",  "")).strip().strip('"'))
-                    row_dec = float(str(row.get("DEC", "")).strip().strip('"'))
-                except (ValueError, TypeError):
-                    continue
-
-                row_err_s = str(row.get("Error", "")).strip().strip('"')
-                try:
-                    row_err = float(row_err_s) if row_err_s else 0.0
-                except (ValueError, TypeError):
-                    row_err = 0.0
-
-                sep = self._angular_separation(ra, dec, row_ra, row_dec)
-                if sep > (error + row_err) * leniency_factor:
-                    continue
-
-                if t is not None:
-                    row_t_s = str(row.get("Discovery_UTC", "")).strip().strip('"')
-                    try:
-                        row_t = datetime.fromisoformat(row_t_s)
-                        if abs((t - row_t).total_seconds()) > time_window_hours * 3600:
-                            continue
-                    except (ValueError, TypeError):
-                        pass  # can't parse row time → don't reject on time criterion
-
-                related.append(row.to_dict())
-
-        except Exception as exc:
-            logger.error(f"Error in find_related_events: {exc}", exc_info=True)
-
-        if related:
-            logger.info(
-                f"Cross-match: {len(related)} related event(s) found for {gcn_id} "
-                f"(leniency={leniency_factor}, window={time_window_hours}h)"
-            )
-        return related
+    # ------------------------------------------------------------------
+    # Same-burst groups (cross-facility links, kept in the thread index)
+    # ------------------------------------------------------------------
+    # One burst seen by several facility families (Fermi GBM + SVOM, …). Each
+    # member keeps its own ASCII row and Slack thread; non-canonical members
+    # carry ``same_as: <canonical key>`` in their thread-index entry. The
+    # canonical member is the one whose Slack thread came first — circulars
+    # collect there. Criteria: gcn/linking.py.
 
     @staticmethod
-    def _angular_separation(ra1: float, dec1: float, ra2: float, dec2: float) -> float:
-        """Great-circle angular separation in degrees (haversine formula)."""
-        r1, d1, r2, d2 = map(math.radians, [ra1, dec1, ra2, dec2])
-        a = (
-            math.sin((d2 - d1) / 2) ** 2
-            + math.cos(d1) * math.cos(d2) * math.sin((r2 - r1) / 2) ** 2
-        )
-        return math.degrees(2 * math.asin(math.sqrt(min(a, 1.0))))
+    def _row_family_facility(row: Any) -> str:
+        return str(row.get("Primary_Facility", "") or row.get("Best_Facility", "")).strip().strip('"')
+
+    def _group_root(self, key: str, data: Dict[str, Any]) -> str:
+        root = (data.get(key) or {}).get("same_as") or key
+        return root if root in data else key
+
+    def group_root(self, key: str) -> str:
+        with self._thread_index_lock:
+            return self._group_root(key, self._load_thread_index())
+
+    def group_keys(self, key: str) -> List[str]:
+        """*key*'s group, canonical key first (just ``[key]`` when unlinked)."""
+        with self._thread_index_lock:
+            data = self._load_thread_index()
+        root = self._group_root(key, data)
+        keys = [root] + [k for k, v in data.items() if k != root and v.get("same_as") == root]
+        return keys if key in keys else [key]
+
+    def key_for_thread(self, thread_ts: str) -> Optional[str]:
+        """Thread-index key of the event that owns *thread_ts*."""
+        thread_ts = str(thread_ts or "").strip()
+        if not thread_ts:
+            return None
+        with self._thread_index_lock:
+            data = self._load_thread_index()
+        return next((k for k, v in data.items() if v.get("thread_ts") == thread_ts), None)
+
+    def link_events(self, key: str, other_key: str, evidence: Dict[str, Any]) -> Optional[str]:
+        """Merge *key*'s and *other_key*'s groups; returns the canonical key.
+
+        Canonical = the member whose thread came first. *evidence* (rule, Δt, …)
+        is stored as ``link`` on whichever of the two is not canonical. ``None``
+        when either event is not in the thread index (no thread yet).
+        """
+        try:
+            with self._thread_index_lock:
+                data = self._load_thread_index()
+                if key not in data or other_key not in data:
+                    return None
+                ra, rb = self._group_root(key, data), self._group_root(other_key, data)
+                if ra == rb:
+                    return ra
+                root, other = sorted((ra, rb), key=lambda k: self._ts_epoch(data[k].get("thread_ts")))
+                for k, v in data.items():
+                    if k == other or v.get("same_as") == other:
+                        v["same_as"] = root
+                data[root].pop("same_as", None)
+                joined, partner = (key, other_key) if key != root else (other_key, key)
+                data[joined]["link"] = {
+                    **evidence, "with": partner,
+                    "at": datetime.now(tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                }
+                self._save_thread_index(data)
+            logger.info(f"Same-burst link: {key} + {other_key} → canonical {root}")
+            return root
+        except Exception as exc:
+            logger.error(f"link_events failed: {exc}")
+            return None
+
+    def update_link_info(self, key: str, **info: Any) -> None:
+        """Merge *info* into *key*'s ``link`` record (e.g. ``confirmed_by``)."""
+        try:
+            with self._thread_index_lock:
+                data = self._load_thread_index()
+                if key in data:
+                    data[key]["link"] = {**(data[key].get("link") or {}), **info}
+                    self._save_thread_index(data)
+        except Exception as exc:
+            logger.error(f"update_link_info failed: {exc}")
+
+    def group_members(self, key: str) -> List[Dict[str, Any]]:
+        """Every member of *key*'s group (itself included), canonical first.
+
+        Values come from the ASCII row when it still exists, else from the
+        thread index: ``{key, family, trigger, facility, name, thread_ts, ra,
+        dec, err, t, canonical, too, too_tiles}``.
+        """
+        keys = self.group_keys(key)
+        with self.file_lock:
+            df = self._load_ascii()
+        with self._thread_index_lock:
+            data = self._load_thread_index()
+        out: List[Dict[str, Any]] = []
+        for k in keys:
+            fam, _, trig = k.partition("|")
+            v = data.get(k) or {}
+            idx = self._find_index(df, fam, trig)
+            row = df.loc[idx] if idx is not None else None
+
+            def pick(col: str, entry_key: str) -> Any:
+                val = linking.to_float(row[col]) if row is not None else None
+                return val if val is not None else v.get(entry_key)
+
+            out.append({
+                "key": k, "family": fam, "trigger": trig,
+                "facility": (self._row_family_facility(row) if row is not None else "") or fam,
+                "name": str(row["Name"]).strip().strip('"') if row is not None else v.get("name", ""),
+                "thread_ts": (str(row["thread_ts"]).strip() if row is not None else "") or v.get("thread_ts", ""),
+                "ra": pick("RA", "ra"), "dec": pick("DEC", "dec"), "err": pick("Error", "err"),
+                "t": linking.to_utc(row["Discovery_UTC"]) if row is not None else linking.to_utc(v.get("discovery_utc")),
+                "canonical": k == keys[0],
+                "too": {tel: (str(row[col]).strip() if row is not None else "")
+                        for tel, col in self._TOO_STATE_COLUMNS.items()},
+                "too_tiles": {tel: ([x for x in str(row[col]).split(",") if x.strip()] if row is not None else [])
+                              for tel, col in self._TOO_TILES_COLUMNS.items()},
+            })
+        return out
+
+    def find_same_event(
+        self, notice_data: Dict[str, Any], params: "linking.LinkParams"
+    ) -> Optional[Dict[str, Any]]:
+        """Existing event (another facility family) that *notice_data* is the
+        same burst as, by the rules in gcn/linking.py.
+
+        Candidates: ASCII rows with a Slack thread, plus thread-index entries
+        trimmed out of the ASCII file. The time rule beats the position rule,
+        then the smallest |Δt| wins. Returns ``{key, root, thread_ts, name,
+        matched_facility, matched_trigger, matched_name, matched_thread_ts,
+        rule, dt_s, sep_deg, tol_deg}`` — ``thread_ts`` / ``name`` are the
+        group's canonical event — or ``None``.
+        """
+        facility = str(notice_data.get("Facility", "")).strip()
+        family = self._normalize_facility(facility)
+        if family not in params.families:
+            return None
+        new = {"family": family, "t": linking.to_utc(notice_data.get("Discovery_UTC")),
+               "ra": linking.to_float(notice_data.get("RA")),
+               "dec": linking.to_float(notice_data.get("DEC")),
+               "err": linking.to_float(notice_data.get("Error"))}
+        own_key = self._thread_key(facility, notice_data.get("Trigger_num", ""))
+        try:
+            with self.file_lock:
+                df = self._load_ascii() if os.path.exists(self.output_ascii) else pd.DataFrame()
+            data: Dict[str, Any] = {}
+            if self.thread_index_path:
+                with self._thread_index_lock:
+                    data = self._load_thread_index()
+        except Exception as exc:
+            logger.error(f"find_same_event: could not load events: {exc}")
+            return None
+
+        cands: Dict[str, Dict[str, Any]] = {}
+        for row in df.to_dict("records"):
+            thread_ts = str(row.get("thread_ts", "")).strip().strip('"')
+            fac = self._row_family_facility(row)
+            if not thread_ts or not fac:
+                continue
+            key = self._thread_key(fac, row.get("Trigger_num", ""))
+            cands[key] = {"family": key.partition("|")[0], "facility": fac,
+                          "t": linking.to_utc(row.get("Discovery_UTC")),
+                          "ra": linking.to_float(row.get("RA")), "dec": linking.to_float(row.get("DEC")),
+                          "err": linking.to_float(row.get("Error")),
+                          "thread_ts": thread_ts, "name": str(row.get("Name", "")).strip().strip('"')}
+        for key, v in data.items():
+            if key in cands or not v.get("thread_ts"):
+                continue
+            cands[key] = {"family": key.partition("|")[0], "facility": key.partition("|")[0],
+                          "t": linking.to_utc(v.get("discovery_utc")),
+                          "ra": v.get("ra"), "dec": v.get("dec"), "err": v.get("err"),
+                          "thread_ts": v["thread_ts"], "name": v.get("name", "")}
+
+        hits = []
+        for key, c in cands.items():
+            if key == own_key:
+                continue
+            res = linking.evaluate(new, c, params)
+            if res is None:
+                continue
+            label = (f"{facility} #{notice_data.get('Trigger_num')} vs {c['facility']} "
+                     f"#{key.partition('|')[2]} ({c['name']}): Δt {res['dt_s']:+.0f} s, "
+                     f"sep {res['sep_deg']:.2f}° (allowed {res['tol_deg']:.2f}°)")
+            if res["rule"] is None:
+                logger.info(f"Same-burst near miss — {label}: trigger times coincide but "
+                            "positions disagree — not linked")
+                continue
+            hits.append(((res["rule"] != "time", abs(res["dt_s"])), key, c, res, label))
+        if not hits:
+            return None
+        hits.sort(key=lambda h: h[0])
+        _, key, c, res, label = hits[0]
+        root = self._group_root(key, data)
+        root_c = cands.get(root) or c
+        logger.info(f"Same burst — {label} → {res['rule']} rule; canonical {root_c['name']} ({root})")
+        return {"key": key, "root": root,
+                "thread_ts": root_c["thread_ts"], "name": root_c["name"],
+                "matched_facility": c["facility"], "matched_trigger": key.partition("|")[2],
+                "matched_name": c["name"], "matched_thread_ts": c["thread_ts"],
+                "matched_err": c.get("err"), **res}
+
+    def rename_event(self, facility: str, trigger_num: str, new_name: str) -> Optional[str]:
+        """Set one event's Name in the ASCII row and the thread index.
+
+        Keyed by facility family + trigger — linked same-burst events share a
+        name, so a name does not identify a row.
+        Returns the previous name (``None`` if the event is unknown).
+        """
+        new_name = str(new_name).strip()
+        trigger_num = str(trigger_num).strip()
+        old: Optional[str] = None
+        try:
+            with self.file_lock:
+                df = self._load_ascii()
+                idx = self._find_index(df, facility, trigger_num)
+                if idx is not None:
+                    old = str(df.at[idx, "Name"]).strip().strip('"')
+                    if old != new_name:
+                        df.at[idx, "Name"] = new_name
+                        self._write_df(df)
+            if self.thread_index_path:
+                with self._thread_index_lock:
+                    data = self._load_thread_index()
+                    key = self._thread_key(facility, trigger_num)
+                    if key in data:
+                        old = old if old is not None else data[key].get("name", "")
+                        if data[key].get("name") != new_name:
+                            data[key]["name"] = new_name
+                            self._save_thread_index(data)
+        except Exception as exc:
+            logger.error(f"rename_event failed: {exc}")
+            return None
+        if old is not None and old != new_name:
+            logger.info(f"Renamed {facility} #{trigger_num}: {old!r} → {new_name!r}")
+        return old
 
     # ==================================================================
     # Private: facility resolution
@@ -991,23 +1136,7 @@ class GCNNoticeHandler:
 
     def _normalize_facility(self, facility: str) -> str:
         """Collapse instrument variants to the parent mission name."""
-        if not facility:
-            return ""
-        fac = facility.strip()
-        if any(n.lower() in fac.lower() for n in
-               ["Swift", "SwiftBAT", "SwiftXRT", "SwiftUVOT"]):
-            return "Swift"
-        if any(x in fac for x in ["Fermi", "GBM", "LAT"]):
-            return "Fermi"
-        if "GECAM" in fac:
-            return "GECAM"
-        if "SVOM" in fac:
-            return "SVOM"
-        if "Einstein" in fac or "EP" in fac:
-            return "EinsteinProbe"
-        if "IceCube" in fac or "ICECUBE" in fac:
-            return "IceCube"
-        return fac
+        return linking.family_of(facility)
 
     # ==================================================================
     # Private: parsing
@@ -1368,10 +1497,19 @@ class GCNNoticeHandler:
 
         existing_facs = {f.strip() for f in str(df.at[idx, "All_Facilities"]).split(",") if f.strip()}
         existing_facs.add(facility)
+        # Discovery_UTC is the event's trigger time: never move it later. A later
+        # instrument's notice (SVOM-MXT) carries its own, later observation time,
+        # which would break trigger-time matching (same-burst links, EP alerts).
+        old_t = linking.to_utc(df.at[idx, "Discovery_UTC"])
+        new_t = linking.to_utc(notice_data.get("Discovery_UTC"))
+        keep_disc = df.at[idx, "Discovery_UTC"] if (
+            old_t is not None and (new_t is None or old_t <= new_t)) else None
 
         for col, val in notice_data.items():
             if col in df.columns and val is not None and str(val).strip():
                 df.at[idx, col] = val
+        if keep_disc is not None:
+            df.at[idx, "Discovery_UTC"] = keep_disc
 
         df.at[idx, "All_Facilities"] = ",".join(sorted(existing_facs))
         df.at[idx, "Last_Update"] = notice_data.get("Notice_date", "")

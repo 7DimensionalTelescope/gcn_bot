@@ -49,6 +49,10 @@ class SlackToOHandler:
         timestamp of a ToO already sent for this event+telescope (``""`` if
         none). When set, the modal opens with a warning so an operator does not
         unknowingly send a second request (e.g. after the automatic one).
+    link_note_provider : callable | None
+        ``provider(facility, trigger_num, telescope) -> str`` returning warning
+        lines (mrkdwn) about linked same-burst events — a ToO already sent via
+        another facility's event, or a better localization in its thread.
     defaults_provider : callable | None
         ``provider(notice_data) -> dict | None`` returning the observation
         config the *automatic* ToO would use for this event. The RASA36 form is
@@ -66,6 +70,7 @@ class SlackToOHandler:
         on_sent: Optional[Callable[[str, str, str], None]] = None,
         defaults_provider: Optional[Callable[[Dict[str, Any]], Optional[Dict[str, Any]]]] = None,
         sent_at_provider: Optional[Callable[[str, str, str], str]] = None,
+        link_note_provider: Optional[Callable[[str, str, str], str]] = None,
     ) -> None:
         self._slack      = slack
         self._emailer    = emailer
@@ -79,6 +84,7 @@ class SlackToOHandler:
         self._on_sent    = on_sent
         self._defaults_provider = defaults_provider
         self._sent_at_provider = sent_at_provider
+        self._link_note_provider = link_note_provider
         # Bolt routing keys — unique per telescope so multiple handlers coexist
         self.action_id   = f"submit_too_request_{telescope.lower()}"
         self.callback_id = f"too_request_modal_{telescope.lower()}"
@@ -534,11 +540,19 @@ class SlackToOHandler:
         Not blocking: a second request can be legitimate (changed parameters),
         so the operator is only told, and the form still submits.
         """
-        if self._sent_at_provider is None:
-            return
         facility = str(notice_data.get("Facility", "")).strip()
         trigger  = str(notice_data.get("Trigger_num", "")).strip()
         if not (facility and trigger):
+            return
+        if self._link_note_provider is not None:
+            try:
+                note = self._link_note_provider(facility, trigger, self.telescope)
+            except Exception as exc:
+                logger.warning(f"ToO linked-event lookup failed: {exc}")
+                note = ""
+            if note:
+                modal["blocks"].insert(0, {"type": "section", "text": {"type": "mrkdwn", "text": note}})
+        if self._sent_at_provider is None:
             return
         try:
             sent_at = self._sent_at_provider(facility, trigger, self.telescope)

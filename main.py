@@ -33,6 +33,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, List, Optional
 
+from gcn import linking
 from slack.too_slot import ToOSlot
 from too.scheduler import DeferredEntry, DeferredToOScheduler
 
@@ -145,6 +146,8 @@ class GCNBot:
             ascii_max_events=config.ascii_max_events,
             file_lock=self.notice_handler.file_lock,  # same ASCII file → same lock
         )
+        # Same-burst linking across facility families (criteria: gcn/linking.py)
+        self.link_params = linking.LinkParams.from_config(config)
 
         # --- Visibility ---
         self.visibility = VisibilityManager(
@@ -239,6 +242,7 @@ class GCNBot:
             telescope="7DT",
             on_sent=self.notice_handler.mark_too_sent,
             sent_at_provider=self.notice_handler.too_sent_at,
+            link_note_provider=self._too_link_note,
         )
         self.too_handler_rasa36 = SlackToOHandler(
             slack=self.slack,
@@ -248,6 +252,7 @@ class GCNBot:
             telescope="RASA36",
             on_sent=self.notice_handler.mark_too_sent,
             sent_at_provider=self.notice_handler.too_sent_at,
+            link_note_provider=self._too_link_note,
             defaults_provider=self._rasa36_form_config,
         )
 
@@ -272,6 +277,8 @@ class GCNBot:
                 f"multi={config.turn_on_too_email_auto_7dt_multi}",
                 f"Auto-ToO RASA36: single={config.turn_on_too_email_auto_rasa36_single} "
                 f"multi={config.turn_on_too_email_auto_rasa36_multi}",
+                f"Same-burst link: {config.same_event_link} "
+                f"(±{self.link_params.time_window_sec:g} s, {self.link_params.pos_sigma:g}σ)",
             ],
         )
 
@@ -330,8 +337,8 @@ class GCNBot:
     def _thread_from_index(self, processed: dict, event_name: Optional[str]) -> "tuple[str, str]":
         """Look a circular's event up in the thread index; ``(thread_ts, via)`` or ``("", "")``.
 
-        Order: facility + trigger, event name, then (for "EP Alert YYMMDD.ff"
-        circulars) the EP event at that trigger time. A name hit is refused when the
+        Order: facility + trigger, event name, then (for "EP Alert YYMMDD.ff" /
+        "SVOM GRB YYMMDD.ff" circulars) the event at that trigger time. A name hit is refused when the
         circular explicitly names a *different* trigger of the same facility
         family (the bot letters events in the order it sees them, so its "GRB
         261029C" need not be GCN's).
@@ -365,6 +372,15 @@ class GCNBot:
                 )
                 if hit:
                     return hit["thread_ts"], f"EP time match ({hit['name']}, Δ{hit['delta_min']} min)"
+            grb_time = processed.get("grb_alert_time")
+            if grb_time:
+                family = processed.get("grb_alert_family")
+                hit = nh.find_thread_by_time(
+                    grb_time, float(self.config.circular_ep_match_minutes),
+                    {family} if family else set(self.link_params.families),
+                )
+                if hit:
+                    return hit["thread_ts"], f"GRB time match ({hit['name']}, Δ{hit['delta_min']} min)"
         except Exception as exc:
             logger.error(f"Thread-index lookup for circular failed: {exc}")
         return "", ""
@@ -410,7 +426,6 @@ class GCNBot:
 
         # ---- Find the matching ASCII event (two passes) ----
         ascii_event: Optional[dict] = None
-        name_corrected: Optional[tuple] = None  # (old_name, new_name) if a rename occurred
 
         # Event name: GCN's official eventId, else the name parsed from the subject.
         event_name = event_id or processed.get("event_name")
@@ -425,27 +440,12 @@ class GCNBot:
         # Pass 2 — match by facility + trigger_num
         if ascii_event is None and facility and trigger_num:
             try:
+                # A provisional name that differs from GCN's eventId (e.g. the
+                # bot's "EP 260527b" vs the official "EP260527a" after a letter
+                # was reused) is corrected below, by _official_renames.
                 ascii_event = self.notice_handler.find_existing_event(
                     facility, trigger_num, return_full_data=True
                 )
-                # When GCN reuses an event name after a false-trigger retraction,
-                # our ASCII may have a provisional name (e.g. "EP 260527b") while
-                # the official eventId is "EP260527a".  Update the ASCII Name now
-                # and remember the correction for the Slack notification below.
-                if ascii_event is not None and event_id:
-                    stored_name = str(ascii_event.get("Name", "")).strip().strip('"')
-                    if stored_name.lower().replace(" ", "") != event_id.lower().replace(" ", ""):
-                        try:
-                            self.notice_handler.update_ascii_event_name(stored_name, event_id)
-                            ascii_event = dict(ascii_event)
-                            ascii_event["Name"] = event_id
-                            name_corrected = (stored_name, event_id)
-                            logger.info(
-                                f"Updated ASCII Name '{stored_name}' → '{event_id}' "
-                                f"(trigger match, circular {circular_id})"
-                            )
-                        except Exception as exc:
-                            logger.error(f"update_ascii_event_name failed: {exc}")
             except Exception as exc:
                 logger.error(f"find_existing_event failed: {exc}")
 
@@ -473,13 +473,29 @@ class GCNBot:
             return
         logger.info(f"Circular {circular_id}: matched thread {thread_ts} via {via}")
 
-        # ---- Post rename notification first (if name was corrected via trigger match) ----
-        if name_corrected and self.send_to_slack:
-            old_n, new_n = name_corrected
-            self.slack.send_thread_message(
-                thread_ts=thread_ts,
-                text=f":pencil: Event renamed: *{old_n}* → *{new_n}* (official GCN event ID)",
-            )
+        # ---- One burst, several facilities: link what the circular names, give
+        # the group GCN's name, and post to the canonical (first) thread ----
+        nh = self.notice_handler
+        anchor = nh.key_for_thread(thread_ts)
+        joined: List[dict] = []
+        confirmed: List[dict] = []
+        if self.config.same_event_link:
+            try:
+                joined, confirmed = self._link_from_circular(processed)
+            except Exception as exc:
+                logger.error(f"Circular {circular_id}: same-burst linking failed: {exc}", exc_info=True)
+        try:
+            renamed = self._official_renames(anchor, event_id, via, {j["key"] for j in joined})
+            if anchor:
+                root = nh.group_root(anchor)
+                canon_ts = (nh.lookup_thread(*root.split("|", 1)) or {}).get("thread_ts", "")
+                if canon_ts and canon_ts != thread_ts:
+                    logger.info(f"Circular {circular_id}: {anchor} is linked to {root} — "
+                                f"posting to its thread {canon_ts}")
+                    thread_ts = canon_ts
+            self._post_circular_link_notes(circular_id, thread_ts, joined, confirmed, renamed)
+        except Exception as exc:   # never let this block the circular post itself
+            logger.error(f"Circular {circular_id}: rename / link notes failed: {exc}", exc_info=True)
 
         # ---- Build and send the circular thread message ----
         circular_url = f"https://gcn.nasa.gov/circulars/{circular_id}"
@@ -492,17 +508,10 @@ class GCNBot:
         elif is_false:
             text = f":warning: *False trigger* — {link}"
         elif is_first and event_page:
-            # Update ASCII Name to the official event_id if it was provisional
-            # (only needed if Pass 1 matched with a space difference; Pass 2 renames
-            # are already handled above by name_corrected).
-            if event_id and ascii_event is not None:
-                old_name = str(ascii_event.get("Name", "")).strip().strip('"')
-                if old_name.lower().replace(" ", "") != event_id.lower().replace(" ", ""):
-                    try:
-                        self.notice_handler.update_ascii_event_name(old_name, event_id)
-                    except Exception as exc:
-                        logger.error(f"update_ascii_event_name failed: {exc}")
-            text = f":bell: First circular: {link}\nEvent page: <{event_page}|{event_page}>"
+            # Named per facility: a linked burst's canonical thread gets one per facility.
+            family = linking.family_of(facility)
+            label = f"First {family} circular" if family else "First circular"
+            text = f":bell: {label}: {link}\nEvent page: <{event_page}|{event_page}>"
         else:
             text = f":memo: {link}"
 
@@ -511,6 +520,150 @@ class GCNBot:
             logger.info(f"Circular {circular_id} posted to thread {thread_ts}")
         else:
             logger.error(f"Failed to post circular {circular_id} to Slack thread {thread_ts}")
+
+    def _link_from_circular(self, processed: dict) -> "tuple[List[dict], List[dict]]":
+        """Link the events a circular explicitly names — trigger IDs in its text
+        or the triggers of circulars it cites.
+
+        Only explicitly named events are paired, never the event the circular
+        was matched to by *name*: the bot letters events in its own order, so its
+        "GRB 261010A" can be a different GBM trigger than GCN's. Two named events
+        of different families join one group unless their triggers are more than
+        ``circular_max_dt_hours`` apart or their positions contradict (circulars
+        also cite *other* bursts — 35–95 h apart in the Sep–Nov 2026 history).
+        Returns ``(joined, confirmed)``: members newly linked, and members whose
+        notice-time link this circular confirms.
+        """
+        nh, p = self.notice_handler, self.link_params
+        cid = processed.get("circular_id")
+        named = {}
+        for item in processed.get("mentioned") or []:
+            fam, _, trig = item["key"].partition("|")
+            if fam in p.families and nh.lookup_thread(fam, trig) is not None:
+                named.setdefault(item["key"], item["via"])
+        if len(named) < 2:
+            return [], []
+        info = {k: next((m for m in nh.group_members(k) if m["key"] == k), None) for k in named}
+        joined: List[dict] = []
+        keys = list(named)
+        for i, a_key in enumerate(keys):
+            for b_key in keys[i + 1:]:
+                a, b = info[a_key], info[b_key]
+                if a is None or b is None or a["family"] == b["family"]:
+                    continue
+                if nh.group_root(a_key) == nh.group_root(b_key):
+                    continue
+                veto = self._circular_link_veto(a, b)
+                if veto:
+                    logger.info(f"Circular {cid} names {a_key} and {b_key} — not linked: {veto}")
+                    continue
+                dt = (b["t"] - a["t"]).total_seconds()
+                root = nh.link_events(b_key, a_key, {"rule": "circular", "circular": cid,
+                                                     "via": f"{named[a_key]} + {named[b_key]}",
+                                                     "dt_s": round(dt, 1)})
+                if root:
+                    # report the member(s) that were not already in the canonical group
+                    for k, m in ((a_key, a), (b_key, b)):
+                        if k != root and not any(j["key"] == k for j in joined):
+                            joined.append(m)
+        # A circular naming both an earlier-linked member and its canonical event
+        # confirms that (notice-time) link.
+        confirmed: List[dict] = []
+        joined_keys = {j["key"] for j in joined}
+        for key in keys:
+            m = info[key]
+            root = nh.group_root(key)
+            if m is None or key == root or root not in named or key in joined_keys:
+                continue
+            link = (nh.lookup_thread(m["family"], m["trigger"]) or {}).get("link") or {}
+            if link.get("rule") in ("time", "position") and not link.get("confirmed_by"):
+                nh.update_link_info(key, confirmed_by=cid)
+                confirmed.append(m)
+        return joined, confirmed
+
+    def _circular_link_veto(self, a: dict, b: dict) -> Optional[str]:
+        """Why two events a circular names together are *not* the same burst."""
+        if a.get("t") is None or b.get("t") is None:
+            return "trigger time unknown"
+        dt = abs((b["t"] - a["t"]).total_seconds())
+        if dt > self.link_params.circular_max_dt_hours * 3600:
+            return f"triggers {dt / 3600:.1f} h apart (> {self.link_params.circular_max_dt_hours:g} h)"
+        pos = linking.position_check(a, b, self.link_params)
+        if pos and not pos[0]:
+            return f"positions disagree ({pos[1]:.1f}° > {pos[2]:.1f}° allowed)"
+        return None
+
+    def _official_renames(
+        self, anchor: Optional[str], event_id: Optional[str], via: str, joined_keys: set,
+    ) -> dict:
+        """Give GCN's eventId to the burst's events that carry another name.
+
+        Applies to events this circular just linked, and to the whole group when
+        the circular matched an ASCII row whose own name differs from GCN's (the
+        provisional-name correction — a matched row that already carries the
+        name may be a different event GCN lettered the same, so it renames
+        nothing beyond what was just linked). Same prefix only (an "EP …" name
+        stays). Returns ``{key: old_name}`` for visible renames
+        (whitespace/case-only fixes are silent).
+        """
+        if not (anchor and event_id):
+            return {}
+        nh = self.notice_handler
+        target = str(event_id).strip()
+        anchor_name = (nh.lookup_thread(*anchor.split("|", 1)) or {}).get("name", "")
+        whole_group = via == "ASCII" and anchor_name.strip() != target
+        renamed: dict = {}
+        for m in nh.group_members(anchor):
+            if not whole_group and m["key"] not in joined_keys:
+                continue
+            if linking.name_prefix(m["name"]) != linking.name_prefix(target):
+                continue
+            old = (nh.lookup_thread(m["family"], m["trigger"]) or {}).get("name") or m["name"]
+            if old == target and m["name"] == target:
+                continue
+            nh.rename_event(m["family"], m["trigger"], target)
+            if nh._name_key(old) != nh._name_key(target):
+                renamed[m["key"]] = old
+                logger.info(f"Renamed {m['key']} '{old}' → '{target}' (official GCN event ID)")
+        return renamed
+
+    def _post_circular_link_notes(
+        self, circular_id: Any, canon_ts: str, joined: List[dict], confirmed: List[dict], renamed: dict,
+    ) -> None:
+        """Slack notes for renames and circular-made / confirmed links."""
+        if not self.send_to_slack:
+            return
+        nh = self.notice_handler
+        joined_keys = {j["key"] for j in joined}
+        canon_key = nh.key_for_thread(canon_ts) if canon_ts else None
+        canon_name = ""
+        if canon_key:
+            canon_name = (nh.lookup_thread(*canon_key.split("|", 1)) or {}).get("name", "")
+        canon_url = self.slack.get_permalink(canon_ts) if (canon_ts and (joined or confirmed)) else ""
+        for key, old in renamed.items():
+            if key in joined_keys:
+                continue
+            ts = (nh.lookup_thread(*key.split("|", 1)) or {}).get("thread_ts")
+            new = (nh.lookup_thread(*key.split("|", 1)) or {}).get("name", "")
+            if ts:
+                self.slack.send_thread_message(
+                    thread_ts=ts, text=f":pencil: Event renamed: *{old}* → *{new}* (official GCN event ID)")
+        for m in joined:
+            m_ts = m.get("thread_ts")
+            if m_ts:
+                self.slack.send_thread_message(thread_ts=m_ts, text=self.formatter.same_burst_joined(
+                    canon_name, canon_url, circular_id, renamed.get(m["key"])))
+            if canon_ts:
+                m_url = self.slack.get_permalink(m_ts) if m_ts else ""
+                self.slack.send_thread_message(thread_ts=canon_ts, text=self.formatter.same_burst_joined_canonical(
+                    {**m, "name": canon_name or m["name"]}, m_url, circular_id))
+            logger.info(f"Circular {circular_id}: linked {m['key']} to {canon_key}")
+        for m in confirmed:
+            if m.get("thread_ts"):
+                self.slack.send_thread_message(
+                    thread_ts=m["thread_ts"],
+                    text=(f":white_check_mark: Same burst as {canon_name} — confirmed by "
+                          f"<https://gcn.nasa.gov/circulars/{circular_id}|GCN {circular_id}>."))
 
     # ------------------------------------------------------------------
     # Internal: notice pipeline
@@ -616,6 +769,15 @@ class GCNBot:
             except Exception as exc:
                 logger.error(f"Error looking up existing event: {exc}")
 
+        # 2b. A new event may be a burst another facility already reported
+        # (Fermi GBM + SVOM 2 s apart): link it, and reuse that event's name.
+        link: Optional[dict] = None
+        if not is_update and self.config.same_event_link:
+            try:
+                link = self.notice_handler.find_same_event(notice_data, self.link_params)
+            except Exception as exc:
+                logger.error(f"Same-burst lookup failed: {exc}")
+
         # 3. Visibility — 7DT (Chile) and LOAO (Arizona)
         visibility_result      = None
         visibility_result_loao = None
@@ -657,6 +819,12 @@ class GCNBot:
         csv_status   = False
         ascii_status = False
 
+        if link and not notice_data.get("Name") and (
+            linking.name_prefix(link["name"])
+            == linking.facility_prefix(linking.family_of(facility))
+        ):
+            # Same burst, same name — no new letter (EP ↔ GRB names stay apart).
+            notice_data["Name"] = link["name"]
         self.notice_handler.assign_name(notice_data)
 
         if self.config.turn_on_notice:
@@ -682,6 +850,7 @@ class GCNBot:
             csv_status, visibility_result, visibility_result_loao, ra, dec,
             tile_result=tile_result,
             tile_result_rasa36=tile_result_rasa36,
+            link=link,
         )
 
     # ------------------------------------------------------------------
@@ -720,7 +889,8 @@ class GCNBot:
         # row is refreshed.
         try:
             self.notice_handler.save_to_ascii(
-                notice_data, existing_thread_ts, too_sent=too_dispatched
+                notice_data, existing_thread_ts, too_sent=too_dispatched,
+                too_tiles=self._dispatched_tiles(too_dispatched, tile_result, tile_result_rasa36),
             )
         except Exception as exc:
             logger.error(f"ASCII save (update) failed: {exc}")
@@ -826,8 +996,14 @@ class GCNBot:
         dec: Optional[float],
         tile_result: Optional[dict] = None,
         tile_result_rasa36: Optional[dict] = None,
+        link: Optional[dict] = None,
     ) -> None:
-        """Post the initial Slack message for a brand-new event."""
+        """Post the initial Slack message for a brand-new event.
+
+        *link* (from ``find_same_event``) marks the event as a burst another
+        facility already reported: its auto-ToO is group-guarded, the message
+        carries a SAME_BURST_AS line, and both threads get a cross-link.
+        """
         # Dispatch the auto-ToO email FIRST, before any Slack work. The send is
         # async, so the email now fires in parallel with plot rendering/uploads
         # (which follow) instead of waiting ~5-15s behind them. Its inputs
@@ -838,7 +1014,8 @@ class GCNBot:
         # ahead of the plot uploads).
         too_slot = ToOSlot(self.slack, self.too_slot_store)
         too_dispatched = self._dispatch_auto_too(
-            notice_data, visibility_result, tile_result, tile_result_rasa36, too_slot
+            notice_data, visibility_result, tile_result, tile_result_rasa36, too_slot,
+            link=link,
         )
 
         # Save to ASCII first (without thread_ts) to get storage status. The
@@ -848,10 +1025,18 @@ class GCNBot:
         ascii_status = False
         try:
             ascii_status = self.notice_handler.save_to_ascii(
-                notice_data, too_sent=too_dispatched
+                notice_data, too_sent=too_dispatched,
+                too_tiles=self._dispatched_tiles(too_dispatched, tile_result, tile_result_rasa36),
             )
         except Exception as exc:
             logger.error(f"ASCII save (new event) failed: {exc}")
+
+        # Same burst as an existing event: is this the best localization so far?
+        link_best, link_best_member, canon_url = False, None, ""
+        if link:
+            link_best, link_best_member = self._best_in_group(notice_data, link["root"])
+            if self.send_to_slack:
+                canon_url = self.slack.get_permalink(link["thread_ts"])
 
         # Format main message.
         # format_notice returns (dict_or_None, lc_url, notice_url); extract blocks list.
@@ -862,6 +1047,8 @@ class GCNBot:
             ascii_status=ascii_status,
             notice_data=notice_data,
             test_mode=self.include_test_topics,
+            same_burst=(self.formatter.same_burst_header(link, link_best, canon_url)
+                        if link else None),
         )
         if raw_result is None:
             logger.error("Message formatter returned None — aborting")
@@ -934,6 +1121,13 @@ class GCNBot:
         except Exception as exc:
             logger.error(f"Failed to update ASCII with thread_ts: {exc}")
 
+        # Same burst: record the link, then cross-link both threads (above the plots).
+        if link:
+            self._post_same_burst_link(
+                notice_data, new_thread_ts, link, link_best, link_best_member, canon_url,
+                tile_result, tile_result_rasa36, visibility_result,
+            )
+
         # Upload visibility plots to thread (7DT+RASA36 share same site; then LOAO)
         target = notice_data.get("Name", "Target")
         if ra is not None and dec is not None:
@@ -989,9 +1183,6 @@ class GCNBot:
         # NOTE: auto-ToO email is dispatched earlier (top of this method) so it
         # runs in parallel with the Slack work above, not serialized behind it.
 
-        # Cross-match: notify both threads when a related event is found
-        self._post_crossmatch_notifications(notice_data, new_thread_ts)
-
     # ------------------------------------------------------------------
     # Internal: helpers
     # ------------------------------------------------------------------
@@ -1003,6 +1194,7 @@ class GCNBot:
         tile_result: Optional[dict],
         tile_result_rasa36: Optional[dict],
         too_slot: "ToOSlot",
+        link: Optional[dict] = None,
     ) -> List[str]:
         """
         Evaluate auto-ToO criteria and dispatch the (async) emails for both
@@ -1019,6 +1211,11 @@ class GCNBot:
         an event ToO'd on its first notice is never re-sent on later updates
         (or on a Slack-failure re-entry of the new-event path).
 
+        Same-burst guard: within a group of linked events only the best-localized
+        one may auto-ToO, and not when a linked event already requested exactly
+        the same tiles (see ``_group_too_block``; *link* names the group a brand-
+        new event is about to join).
+
         Gated on ``send_to_slack`` to preserve prior behaviour: in dev mode
         without ``--send``, no automatic ToO emails go out. Each telescope×case
         combination has its own enable flag (checked inside
@@ -1030,12 +1227,12 @@ class GCNBot:
             return dispatched
         if self._dispatch_auto_too_one(
             "7DT", self.emailer, tile_result,
-            notice_data, visibility_result, too_slot
+            notice_data, visibility_result, too_slot, link=link,
         ):
             dispatched.append("7DT")
         if self._dispatch_auto_too_one(
             "RASA36", self.emailer_rasa36, tile_result_rasa36,
-            notice_data, visibility_result, too_slot
+            notice_data, visibility_result, too_slot, link=link,
         ):
             dispatched.append("RASA36")
         return dispatched
@@ -1048,6 +1245,7 @@ class GCNBot:
         notice_data: dict,
         visibility_result: Optional[dict],
         too_slot: "ToOSlot",
+        link: Optional[dict] = None,
     ) -> bool:
         """
         Handle one telescope's auto-ToO decision.
@@ -1084,6 +1282,17 @@ class GCNBot:
                 f"Auto-ToO suppressed ({telescope}): {tile_case}-tile case disabled"
             )
             return False
+
+        # Same burst seen by another facility: only its best localization ToOs,
+        # and never the same tiles twice.
+        if case is not None:
+            blocked = self._group_too_block(telescope, notice_data, tile_result, link)
+            if blocked:
+                reason, visible = blocked
+                logger.info(f"Auto-ToO suppressed ({telescope}): {reason}")
+                if visible:
+                    too_slot.add_line(telescope, f":link: not sent — {reason}")
+                return False
 
         if case == "now":
             # A now-send supersedes any pending deferred entry for this event.
@@ -1282,11 +1491,24 @@ class GCNBot:
             self._post_deferred_result(thread_ts, telescope, sent=None)
             return
 
+        # A linked facility may have localized the burst better (or already
+        # requested these tiles) while this ToO was waiting.
+        if case is not None:
+            blocked = self._group_too_block(telescope, notice_data, tile_result, None)
+            if blocked:
+                reason, _ = blocked
+                logger.info(f"Deferred ToO {entry.key}: {reason} — skipping")
+                self.notice_handler.clear_too_deferred(facility, trigger, telescope)
+                self._post_deferred_result(thread_ts, telescope, sent=None, reason=reason)
+                return
+
         if case == "now":
             too_config = self._auto_too_config(telescope, n_tiles)
             ok = emailer.send_too_email(notice_data, too_config)
             if ok:
-                self.notice_handler.mark_too_sent(facility, trigger, telescope)
+                self.notice_handler.mark_too_sent(
+                    facility, trigger, telescope, tiles=(tile_result or {}).get("tile_ids"),
+                )
             # Clear the pending marker either way; a failed send is not retried
             # (the operator is notified to submit manually).
             self.notice_handler.clear_too_deferred(facility, trigger, telescope)
@@ -1451,74 +1673,152 @@ class GCNBot:
         except Exception as exc:
             logger.error(f"Failed to upload {observatory} visibility plot: {exc}")
 
-    def _post_crossmatch_notifications(
-        self,
-        notice_data: dict,
-        new_thread_ts: str,
-    ) -> None:
-        """Post coincidence warnings to the new event's thread and each related event's thread."""
+    # ------------------------------------------------------------------
+    # Same-burst links (one burst seen by several facility families)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _dispatched_tiles(
+        dispatched: List[str], tile_result: Optional[dict], tile_result_rasa36: Optional[dict],
+    ) -> dict:
+        """Tile IDs each dispatched auto-ToO requested (stored as ToO_Tiles_*)."""
+        results = {"7DT": tile_result, "RASA36": tile_result_rasa36}
+        return {t: [str(i) for i in ((results.get(t) or {}).get("tile_ids") or [])] for t in dispatched}
+
+    def _sigma(self, err: Any, facility: str) -> float:
+        return linking.sigma(linking.to_float(err), linking.family_of(facility), self.link_params)
+
+    def _group_siblings(self, notice_data: dict, link: Optional[dict]) -> List[dict]:
+        """The other members of the event's same-burst group (for a brand-new
+        event: of the group *link* says it is joining)."""
+        nh = self.notice_handler
+        key = nh._thread_key(notice_data.get("Facility", ""), notice_data.get("Trigger_num", ""))
+        return [m for m in nh.group_members(link["root"] if link else key) if m["key"] != key]
+
+    def _best_in_group(self, notice_data: dict, root_key: str) -> "tuple[bool, Optional[dict]]":
+        """(is *notice_data* the burst's best localization so far?, best existing member)."""
+        mine = self._sigma(notice_data.get("Error"), notice_data.get("Facility", ""))
+        members = [m for m in self.notice_handler.group_members(root_key) if m.get("err") is not None]
+        best = min(members, key=lambda m: self._sigma(m["err"], m["family"]), default=None)
+        if best is None:
+            return True, None
+        return mine <= self._sigma(best["err"], best["family"]), best
+
+    def _group_too_block(
+        self, telescope: str, notice_data: dict, tile_result: Optional[dict], link: Optional[dict],
+    ) -> "Optional[tuple[str, bool]]":
+        """Why a linked event must not auto-ToO on *telescope* — ``(reason,
+        show_in_slot)`` — or ``None`` when it may.
+
+        1. A linked event has a smaller localization sigma: the burst is where
+           that one says, so this coarser one never sends (not shown — the
+           better event decides for itself, in its own thread).
+        2. A linked event already sent a ToO for exactly these tiles: a second
+           request would only duplicate it (shown). A different tile set — a
+           real refinement — still sends.
+        """
         try:
-            related = self.notice_handler.find_related_events(
-                notice_data,
-                leniency_factor=self.config.crossmatch_leniency_factor,
-                time_window_hours=self.config.crossmatch_time_window_hours,
+            siblings = self._group_siblings(notice_data, link)
+        except Exception as exc:
+            logger.error(f"Same-burst ToO guard lookup failed: {exc}")
+            return None
+        if not siblings:
+            return None
+        mine = self._sigma(notice_data.get("Error"), notice_data.get("Facility", ""))
+        better = [m for m in siblings
+                  if m.get("err") is not None and self._sigma(m["err"], m["family"]) < mine]
+        if better:
+            b = min(better, key=lambda m: self._sigma(m["err"], m["family"]))
+            return (f"superseded — {b['name']} ({b['facility']} #{b['trigger']}) has a better "
+                    f"localization (err {self.formatter.fmt_err(b['err'])})", False)
+        my_tiles = sorted(str(t) for t in ((tile_result or {}).get("tile_ids") or []))
+        if not my_tiles:
+            return None
+        for m in siblings:
+            sent_at = m["too"].get(telescope)
+            if not sent_at:
+                continue
+            prev = sorted(m["too_tiles"].get(telescope) or []) or self._member_tiles(telescope, m)
+            if prev == my_tiles:
+                when = sent_at.replace("T", " ").replace("Z", " UTC")
+                return (f"{m['name']} ({m['facility']} #{m['trigger']}) already requested the same "
+                        f"tile{'s' if len(my_tiles) > 1 else ''} ({', '.join(my_tiles)}) at {when}", True)
+        return None
+
+    def _member_tiles(self, telescope: str, member: dict) -> List[str]:
+        """Tiles at a linked event's position — used when its ToO stored none (manual send)."""
+        _, tiles = self._telescope_ctx(telescope)
+        if tiles is None or member.get("ra") is None or member.get("dec") is None or not member.get("err"):
+            return []
+        try:
+            info = tiles.get_tile_info(ra=member["ra"], dec=member["dec"], error=float(member["err"]))
+        except Exception as exc:
+            logger.warning(f"Tile lookup for linked event {member['key']} failed: {exc}")
+            return []
+        return sorted(str(t) for t in ((info or {}).get("tile_ids") or []))
+
+    def _post_same_burst_link(
+        self, notice_data: dict, new_thread_ts: str, link: dict, best: bool,
+        best_member: Optional[dict], canon_url: str,
+        tile_result: Optional[dict], tile_result_rasa36: Optional[dict],
+        visibility_result: Optional[dict],
+    ) -> None:
+        """Record a notice-time same-burst link and cross-link both threads."""
+        nh = self.notice_handler
+        own_key = nh._thread_key(notice_data.get("Facility", ""), notice_data.get("Trigger_num", ""))
+        if nh.lookup_thread(link["matched_facility"], link["matched_trigger"]) is None:
+            nh.record_thread(link["matched_facility"], link["matched_trigger"],
+                             link["matched_thread_ts"], link["matched_name"])
+        evidence = {k: (round(link[k], 3) if isinstance(link[k], float) else link[k])
+                    for k in ("rule", "dt_s", "sep_deg", "tol_deg")}
+        root = nh.link_events(own_key, link["key"], evidence)
+        if root is None:
+            logger.warning(f"Same-burst link {own_key} → {link['key']} could not be recorded")
+            return
+        if not self.send_to_slack:
+            return
+        try:
+            self.slack.send_thread_message(
+                thread_ts=new_thread_ts,
+                text=self.formatter.same_burst_new_thread(link, canon_url, best, best_member),
             )
         except Exception as exc:
-            logger.error(f"Cross-match lookup failed: {exc}")
-            return
-
-        if not related:
-            return
-
-        new_name     = notice_data.get("Name") or notice_data.get("GCN_ID", "this event")
-        new_facility = notice_data.get("Facility", "")
-        new_norm_fac = self.notice_handler._normalize_facility(new_facility)
-
-        # Only quote events from a different facility; same-facility updates go through
-        # the thread-update path and should never generate cross-match notifications.
-        related = [
-            rel for rel in related
-            if self.notice_handler._normalize_facility(
-                str(rel.get("Primary_Facility", "")).strip().strip('"')
-            ) != new_norm_fac
-        ]
-        if not related:
-            return
-
-        new_url = self.slack.get_permalink(new_thread_ts) if self.send_to_slack else ""
-
-        for rel in related:
-            rel_name = (
-                str(rel.get("Name", "")).strip().strip('"')
-                or str(rel.get("GCN_ID", "")).strip().strip('"')
+            logger.error(f"Failed to post same-burst note to new thread: {exc}")
+        try:
+            new_url = self.slack.get_permalink(new_thread_ts)
+            self.slack.send_thread_message(
+                thread_ts=link["thread_ts"],
+                text=self.formatter.same_burst_quote(
+                    notice_data, link, new_url, best, tile_result, tile_result_rasa36, visibility_result,
+                ),
             )
-            rel_fac  = str(rel.get("Primary_Facility", "")).strip().strip('"')
-            rel_ts   = str(rel.get("thread_ts", "")).strip().strip('"')
+        except Exception as exc:
+            logger.error(f"Failed to post same-burst note to canonical thread: {exc}")
+        logger.info(f"Same-burst threads cross-linked: {own_key} ({new_thread_ts}) ↔ {root} ({link['thread_ts']})")
 
-            if self.send_to_slack:
-                rel_url = self.slack.get_permalink(rel_ts) if rel_ts else ""
-                rel_ref = f"<{rel_url}|{rel_name}>" if rel_url else f"*{rel_name}*"
-                msg_new = (
-                    f":telescope: This event may be spatially and temporally coincident with "
-                    f"{rel_ref} ({rel_fac}). Please verify via Circular."
-                )
-                try:
-                    self.slack.send_thread_message(thread_ts=new_thread_ts, text=msg_new)
-                    logger.info(f"Cross-match note → new thread {new_thread_ts} (related={rel_name})")
-                except Exception as exc:
-                    logger.error(f"Failed to post cross-match note to new thread: {exc}")
-
-                if rel_ts:
-                    new_ref = f"<{new_url}|{new_name}>" if new_url else f"*{new_name}*"
-                    msg_rel = (
-                        f":telescope: A new notice ({new_ref}, {new_facility}) may be spatially "
-                        f"and temporally coincident with this event. Please verify via Circular."
-                    )
-                    try:
-                        self.slack.send_thread_message(thread_ts=rel_ts, text=msg_rel)
-                        logger.info(f"Cross-match note → related thread {rel_ts} (new={new_name})")
-                    except Exception as exc:
-                        logger.error(f"Failed to post cross-match note to related thread: {exc}")
+    def _too_link_note(self, facility: str, trigger: str, telescope: str) -> str:
+        """Warning lines for the manual ToO modal of a linked event ("" if none)."""
+        nh = self.notice_handler
+        key = nh._thread_key(facility, trigger)
+        members = nh.group_members(key)
+        me = next((m for m in members if m["key"] == key), None)
+        others = [m for m in members if m["key"] != key]
+        if me is None or not others:
+            return ""
+        lines = []
+        for m in others:
+            if m["too"].get(telescope):
+                lines.append(f":link: A {telescope} ToO was already sent for this burst via linked "
+                             f"*{m['name']}* ({m['facility']} #{m['trigger']}) at "
+                             f"{m['too'][telescope].replace('T', ' ')}.")
+        mine = self._sigma(me.get("err"), me["family"])
+        better = [m for m in others if m.get("err") is not None and self._sigma(m["err"], m["family"]) < mine]
+        if better:
+            b = min(better, key=lambda m: self._sigma(m["err"], m["family"]))
+            lines.append(f":dart: Linked {b['facility']} #{b['trigger']} has a better localization "
+                         f"(err {self.formatter.fmt_err(b['err'])} vs {self.formatter.fmt_err(me.get('err'))}) "
+                         "— the button in its thread uses that position.")
+        return "\n".join(lines)
 
     # ------------------------------------------------------------------
     # Connection callbacks (passed to GCNConsumer.start_connection_monitor)

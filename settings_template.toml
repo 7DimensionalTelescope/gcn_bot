@@ -37,7 +37,7 @@ OUTPUT_ASCII        = "grb_targets.ascii"
 OUTPUT_TOO_SLOTS    = "too_slots.json"   # Auto-ToO status message state (Slack ts + lines per event thread)
 OUTPUT_THREAD_INDEX    = "thread_index.json"   # event → Slack thread_ts; survives ASCII trimming so late notices still thread
 THREAD_INDEX_MAX_AGE_DAYS = 30   # days an event's Slack thread stays findable for late notices and follow-up circulars
-CIRCULAR_EP_MATCH_MINUTES = 10  # "EP Alert YYMMDD.ff" circulars: match the EP event triggered within this many minutes (0.01 d = 14.4 min resolution)
+CIRCULAR_EP_MATCH_MINUTES = 10  # "EP Alert YYMMDD.ff" / "SVOM GRB YYMMDD.ff" circulars: match the event triggered within this many minutes (0.01 d = 14.4 min resolution; observed ≤ 6.8 min)
 ASCII_MAX_EVENTS    = 10
 OUTPUT_CIRCULAR_CSV = "gcn_circular.csv"
 
@@ -51,6 +51,21 @@ OUTPUT_CIRCULAR_CSV = "gcn_circular.csv"
 TURN_ON_DB_TILE_CHECK = false
 GWPORTAL_BASE_URL = "https://your-portal-host:port/"
 GWPORTAL_API_KEY  = "your-gwportal-api-key"
+
+# ---------------------------------------------------------------------------
+# Same-burst linking (one burst seen by several facilities, e.g. Fermi GBM + SVOM)
+# ---------------------------------------------------------------------------
+# Values were fixed on the bot's Sep–Nov 2026 history: 8/8 genuine pairs, 0 false
+# (see gcn/linking.py). Linked events share a name and cross-link their threads.
+SAME_EVENT_LINK = true
+SAME_EVENT_TIME_WINDOW_SEC = 300.0        # rule A: triggers this close (genuine ≤ 143 s, unrelated ≥ 398 s)
+SAME_EVENT_POS_SIGMA = 3.0                # …and positions within 3 × combined sigma (hardest genuine case needs 2.03)
+SAME_EVENT_SYS_DEG = { Fermi = 5.0 }      # systematic added per family; GBM notice errors are stat-only
+SAME_EVENT_ERR_FLOOR_DEG = 0.05           # minimum error (some notices report 0)
+SAME_EVENT_PRECISE_DEG = 0.5              # rule B: both errors ≤ this …
+SAME_EVENT_POS_WINDOW_HOURS = 24.0        # … and triggers within this many hours (EP after a GRB)
+SAME_EVENT_CIRCULAR_MAX_DT_HOURS = 6.0    # a circular naming two events links them only within this (genuine ≤ 1.2 h)
+SAME_EVENT_FAMILIES = ["Fermi", "SVOM", "Swift", "EinsteinProbe", "CALET"]
 
 # ---------------------------------------------------------------------------
 # ToO email

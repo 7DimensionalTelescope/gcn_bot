@@ -54,9 +54,10 @@ _DEFAULTS: Dict[str, Any] = {
     # Days an event stays in the thread index — also how long late notices and
     # follow-up circulars can still find the event's Slack thread.
     "THREAD_INDEX_MAX_AGE_DAYS": 30.0,
-    # "EP Alert YYMMDD.ff" circulars name the event by time at 0.01-day
-    # (14.4 min) resolution, i.e. up to ±7.2 min off: match an EP event whose
-    # trigger time is within this many minutes (a second candidate → no match).
+    # "EP Alert YYMMDD.ff" / "SVOM GRB YYMMDD.ff" circulars name the event by time
+    # at 0.01-day (14.4 min) resolution, i.e. up to ±7.2 min off (observed
+    # ≤ 6.8 min): match the event whose trigger (or later notice) time is within
+    # this many minutes (a second, unlinked candidate → no match).
     "CIRCULAR_EP_MATCH_MINUTES": 10.0,
     "ASCII_MAX_EVENTS": 10,
 
@@ -66,11 +67,21 @@ _DEFAULTS: Dict[str, Any] = {
     # Logging
     "LOG_FILE": "",  # empty = stdout only
 
-    # Cross-matching — spatial/temporal coincidence detection
-    # Overlap threshold: separation < (r1 + r2) * LENIENCY_FACTOR
-    "CROSSMATCH_LENIENCY_FACTOR": 1.2,
-    # Maximum trigger-time difference (hours) to consider two notices related
-    "CROSSMATCH_TIME_WINDOW_HOURS": 24.0,
+    # Same-burst linking across facility families (gcn/linking.py has the
+    # evidence for each value). A new notice is the same burst as an existing
+    # event of another family when trigger times are within the window and
+    # positions agree within POS_SIGMA × combined sigma (rule A), or both are
+    # localized to ≤ PRECISE_DEG and agree within POS_WINDOW_HOURS (rule B).
+    "SAME_EVENT_LINK": True,
+    "SAME_EVENT_TIME_WINDOW_SEC": 300.0,
+    "SAME_EVENT_POS_SIGMA": 3.0,
+    "SAME_EVENT_SYS_DEG": {"Fermi": 5.0},      # systematic added per family (GBM errors are stat-only)
+    "SAME_EVENT_ERR_FLOOR_DEG": 0.05,
+    "SAME_EVENT_PRECISE_DEG": 0.5,
+    "SAME_EVENT_POS_WINDOW_HOURS": 24.0,
+    # A circular naming two events links them only if their triggers are this close
+    "SAME_EVENT_CIRCULAR_MAX_DT_HOURS": 6.0,
+    "SAME_EVENT_FAMILIES": ["Fermi", "SVOM", "Swift", "EinsteinProbe", "CALET"],
 
     # DB tile reference-image check
     "TURN_ON_DB_TILE_CHECK": False,
@@ -335,7 +346,7 @@ class BotConfig:
 
     @property
     def circular_ep_match_minutes(self) -> float:
-        """Time tolerance (min) for matching "EP Alert YYMMDD.ff" circulars."""
+        """Time tolerance (min) for "EP Alert YYMMDD.ff" / "SVOM GRB YYMMDD.ff" circulars."""
         return max(0.0, float(self.__dict__.get(
             "circular_ep_match_minutes", _DEFAULTS["CIRCULAR_EP_MATCH_MINUTES"],
         )))
@@ -369,13 +380,44 @@ class BotConfig:
         blank in settings.toml."""
         return str(self.__dict__.get("gwportal_api_key", "") or os.getenv("GWPORTAL_API_KEY", ""))
 
-    @property
-    def crossmatch_leniency_factor(self) -> float:
-        return float(self.__dict__.get("crossmatch_leniency_factor", _DEFAULTS["CROSSMATCH_LENIENCY_FACTOR"]))
+    def _get(self, key: str) -> Any:
+        return self.__dict__.get(key.lower(), _DEFAULTS[key])
 
     @property
-    def crossmatch_time_window_hours(self) -> float:
-        return float(self.__dict__.get("crossmatch_time_window_hours", _DEFAULTS["CROSSMATCH_TIME_WINDOW_HOURS"]))
+    def same_event_link(self) -> bool:
+        return bool(self._get("SAME_EVENT_LINK"))
+
+    @property
+    def same_event_time_window_sec(self) -> float:
+        return max(0.0, float(self._get("SAME_EVENT_TIME_WINDOW_SEC")))
+
+    @property
+    def same_event_pos_sigma(self) -> float:
+        return max(0.0, float(self._get("SAME_EVENT_POS_SIGMA")))
+
+    @property
+    def same_event_sys_deg(self) -> Dict[str, float]:
+        return {str(k): float(v) for k, v in dict(self._get("SAME_EVENT_SYS_DEG")).items()}
+
+    @property
+    def same_event_err_floor_deg(self) -> float:
+        return max(0.0, float(self._get("SAME_EVENT_ERR_FLOOR_DEG")))
+
+    @property
+    def same_event_precise_deg(self) -> float:
+        return max(0.0, float(self._get("SAME_EVENT_PRECISE_DEG")))
+
+    @property
+    def same_event_pos_window_hours(self) -> float:
+        return max(0.0, float(self._get("SAME_EVENT_POS_WINDOW_HOURS")))
+
+    @property
+    def same_event_circular_max_dt_hours(self) -> float:
+        return max(0.0, float(self._get("SAME_EVENT_CIRCULAR_MAX_DT_HOURS")))
+
+    @property
+    def same_event_families(self) -> List[str]:
+        return [str(f) for f in self._get("SAME_EVENT_FAMILIES")]
 
     @property
     def output_circular_csv(self) -> str:

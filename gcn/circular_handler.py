@@ -37,6 +37,8 @@ from typing import Any, Dict, List, Optional, Union
 
 import pandas as pd
 
+from gcn import linking
+
 logger = logging.getLogger(__name__)
 
 
@@ -97,6 +99,22 @@ class GCNCircularHandler:
 
     # "EP Alert 261106.58" — EP event named by date + fraction of the day.
     _EP_ALERT_RE = re.compile(r"\bEP\s*Alert\s*(\d{6})\.(\d{2,3})\b", re.IGNORECASE)
+    # "SVOM GRB261108.05" / "MAXI GRB261012.23" — MASTER-Net names other alerts
+    # the same way; a tracked mission prefix restricts the match to its events.
+    _GRB_TIME_RE = re.compile(
+        r"\b(?:(Swift|Fermi|SVOM|EP|GECAM|CALET|MAXI)\s*)?GRB\s*(\d{6})\.(\d{2,3})\b", re.IGNORECASE)
+
+    # Trigger IDs a circular may name, by facility family — used to link
+    # same-burst events across facilities. A token only counts when it is a
+    # known event in the thread index, so the loose patterns are harmless.
+    _MENTION_PATTERNS = [
+        ("SVOM",          re.compile(r"\b(sb\d{8})\b", re.IGNORECASE)),
+        ("Fermi",         re.compile(r"(?<![\d.])(\d{9})(?:\.\d+)?(?!\d)")),
+        ("EinsteinProbe", re.compile(r"(?<!\d)(0\d{10})(?!\d)")),
+        ("Swift",         re.compile(r"trigger\s*(?:=|#|No\.?|ID)?\s*:?\s*(\d{6,7})\b", re.IGNORECASE)),
+    ]
+    # "GCN 46185", "GCN #46185", "GCN Circ. 46185", "GCNC 46185"
+    _CITE_RE = re.compile(r"\bGCN\s*(?:Circ(?:ular)?s?\.?|C)?\s*(?:No\.?|#)?\s*(\d{4,6})\b", re.IGNORECASE)
 
     # (subject regex, facility, trigger group or None) — checked on the subject
     # before the generic facility scan; first match wins.
@@ -106,6 +124,9 @@ class GCNCircularHandler:
         (r"\bEP[-\s/]?(?:[WF]XT[-\s]?)?trigger\s*(?:ID\s*)?[:#]?\s*(\d{8,})",   "EinsteinProbe", 1),
         (r"\bSwift\s+(?:BAT\s+)?Trigger\s*[:#]?\s*(\d{5,})",                  "Swift",         1),
         (r"\bFermi\s+(?:GBM\s+)?trigger\s+(?:No\.?\s*)?(\d{6,})",             "FermiGBM",      1),
+        # SVOM's own first circular often cites Fermi/GBM, which the generic scan
+        # (Fermi before SVOM) would pick — GRB 261108A, GCN 46186.
+        (r"\bSVOM\s+detection\s+of\s+a\s+burst\b",                          "SVOM",          None),
     ]
 
     def __init__(
@@ -323,6 +344,14 @@ class GCNCircularHandler:
                 day = datetime.strptime(m.group(1), "%y%m%d")
                 when = day + timedelta(days=float("0." + m.group(2)))
                 result["ep_alert_time"] = when.strftime("%Y-%m-%d %H:%M:%S")
+            else:
+                m = self._GRB_TIME_RE.search(subject)
+                if m:
+                    day = datetime.strptime(m.group(2), "%y%m%d")
+                    when = day + timedelta(days=float("0." + m.group(3)))
+                    family = linking.family_of(m.group(1)) if m.group(1) else ""
+                    result["grb_alert_time"] = when.strftime("%Y-%m-%d %H:%M:%S")
+                    result["grb_alert_family"] = family if family in linking.GRB_FAMILIES else ""
 
             # --- Facility ---
             # Use more of the body so follow-up circulars from optical telescopes
@@ -396,6 +425,9 @@ class GCNCircularHandler:
                 result["trigger_num"] = self._resolve_trigger_from_csv_references(
                     body, result["facility"]
                 )
+
+            # --- Every known-format trigger ID it names / cites (same-burst links) ---
+            result["mentioned"] = self._mentioned_events(subject, body, circ_id)
 
             # --- False trigger (check subject first, then body) ---
             result["false_trigger"] = self._detect_false_trigger(subject, body)
@@ -585,7 +617,7 @@ class GCNCircularHandler:
         """
         if not body or not facility or not os.path.exists(self.output_csv):
             return None
-        cited_ids = re.findall(r"GCN\s+(?:Circ(?:ular)?\.?\s+)?(\d+)", body, re.IGNORECASE)
+        cited_ids = self._CITE_RE.findall(body)
         if not cited_ids:
             return None
         try:
@@ -607,6 +639,32 @@ class GCNCircularHandler:
         except Exception as exc:
             logger.debug(f"_resolve_trigger_from_csv_references failed: {exc}")
         return None
+
+    def _mentioned_events(
+        self, subject: str, body: str, circ_id: Any
+    ) -> List[Dict[str, str]]:
+        """``[{key: "<family>|<trigger>", via}]`` for every trigger ID the
+        circular names (``via="text"``) or cites through another circular
+        (``via="GCN 46185"``, looked up in the circular CSV)."""
+        found: Dict[str, str] = {}
+        text = f"{subject}\n{body}"
+        for family, rx in self._MENTION_PATTERNS:
+            for m in rx.finditer(text):
+                trig = m.group(1).lower() if family == "SVOM" else m.group(1)
+                found.setdefault(f"{family}|{trig}", "text")
+        cited = [c for c in dict.fromkeys(self._CITE_RE.findall(body or "")) if c != str(circ_id)]
+        if cited and os.path.exists(self.output_csv):
+            try:
+                df = pd.read_csv(self.output_csv, dtype=str, na_filter=False)
+                for cid in cited:
+                    for _, row in df[df["circular_id"] == cid].iterrows():
+                        family = linking.family_of(row.get("facility", ""))
+                        trig = str(row.get("trigger_num", "")).strip()
+                        if family and trig and trig.lower() != "nan":
+                            found.setdefault(f"{family}|{trig}", f"GCN {cid}")
+            except Exception as exc:
+                logger.debug(f"_mentioned_events: citation lookup failed: {exc}")
+        return [{"key": k, "via": v} for k, v in found.items()]
 
     def _detect_false_trigger(self, subject: str, body: str) -> bool:
         """Return True if the circular reports a false trigger.
@@ -751,7 +809,6 @@ class GCNCircularHandler:
         return upd.fillna(pd.to_datetime(df["Notice_date"], errors="coerce", utc=True))
 
     def _update_ascii(self, data: Dict[str, Any]) -> None:
-        import csv as _csv
         try:
             if os.path.exists(self.output_ascii):
                 df = pd.read_csv(
@@ -765,10 +822,7 @@ class GCNCircularHandler:
             else:
                 df = pd.DataFrame(columns=self.ASCII_COLUMNS)
 
-            for col in self.ASCII_COLUMNS:
-                if col not in df.columns:
-                    df[col] = ""
-            df = df[self.ASCII_COLUMNS].fillna("")
+            df = self._with_columns(df)
 
             # Convert error to degrees
             error_deg = data.get("error")
@@ -787,19 +841,39 @@ class GCNCircularHandler:
             event_name = data.get("event_name") or event_id
             facility   = data["facility"]
 
-            # Two-pass search:
-            # Pass 1 — match by official event_id / event_name in the Name column
+            # Find the row. Linked same-burst events (Fermi GBM + SVOM) keep one
+            # row each and share a name, so a trigger the circular names wins over
+            # the name; among same-name rows the canonical (earliest thread) wins.
             existing_idx: Optional[int] = None
-            if event_id:
+            trigger = str(data.get("trigger_num") or "").strip()
+            family = linking.family_of(facility)
+
+            # Pass 1 — Trigger_num + facility family
+            if trigger and family:
                 for idx, row in df.iterrows():
-                    row_name = str(row.get("Name", "")).strip().strip('"')
-                    if row_name.lower() == event_id.lower():
+                    if str(row.get("Trigger_num", "")).strip().strip('"') != trigger:
+                        continue
+                    facs = {linking.family_of(f) for f in str(row.get("All_Facilities", "")).split(",")}
+                    if family in facs:
                         existing_idx = idx
                         break
+                if existing_idx is not None and event_id:
+                    if str(df.at[existing_idx, "Name"]).strip().strip('"').lower() != event_id.lower():
+                        df.at[existing_idx, "Name"] = event_id  # clean value, no embedded quotes
+                        logger.info(
+                            f"Updated ASCII Name from provisional to '{event_id}' "
+                            f"(matched by trigger {trigger})"
+                        )
 
-            # Pass 2 — match by Trigger_num + facility (case-insensitive substring)
-            if existing_idx is None and data.get("trigger_num"):
-                trigger = str(data["trigger_num"])
+            # Pass 2 — official event_id / event_name in the Name column
+            if existing_idx is None and event_id:
+                hits = [idx for idx, row in df.iterrows()
+                        if str(row.get("Name", "")).strip().strip('"').lower() == event_id.lower()]
+                if hits:
+                    existing_idx = min(hits, key=lambda i: self._ts_epoch(df.at[i, "thread_ts"]))
+
+            # Pass 3 — Trigger_num + facility (case-insensitive substring)
+            if existing_idx is None and trigger:
                 fac_lc  = facility.lower()
                 for idx, row in df.iterrows():
                     row_trigger = str(row.get("Trigger_num", "")).strip().strip('"')
@@ -835,7 +909,9 @@ class GCNCircularHandler:
                         df.at[existing_idx, "RA"]  = f"{data['ra']:.3f}"
                         df.at[existing_idx, "DEC"] = f"{data['dec']:.3f}"
                         df.at[existing_idx, "Error"] = f"{error_deg:.3f}" if error_deg is not None else "N/A"
-                    if data.get("trigger_num"):
+                    # Never rewrite an existing trigger: (family, trigger) is the
+                    # row's identity for every later notice and ToO marker.
+                    if data.get("trigger_num") and not str(df.at[existing_idx, "Trigger_num"]).strip():
                         df.at[existing_idx, "Trigger_num"] = data["trigger_num"]
 
                 # Append circular ID to GCN_ID list
@@ -857,7 +933,7 @@ class GCNCircularHandler:
             else:
                 # Add new row only when we have all required fields
                 if data.get("ra") is not None and data.get("dec") is not None and data.get("trigger_num"):
-                    new_row = {col: "" for col in self.ASCII_COLUMNS}
+                    new_row = {col: "" for col in df.columns}
                     new_row.update({
                         "GCN_ID":           str(data["circular_id"]),
                         "Name":             event_name or "",  # clean value, no embedded quotes
@@ -891,22 +967,13 @@ class GCNCircularHandler:
 
             # Backup + write (same format as notice_handler: space-separated, QUOTE_NONNUMERIC)
             self._create_backup(self.output_ascii)
-            df[self.ASCII_COLUMNS].to_csv(
-                self.output_ascii,
-                sep=" ",
-                header=True,
-                index=False,
-                quoting=_csv.QUOTE_NONNUMERIC,
-                quotechar='"',
-                columns=self.ASCII_COLUMNS,
-            )
+            self._write_ascii(df)
             logger.info("ASCII database updated from circular")
 
         except Exception as exc:
             logger.error(f"Error updating ASCII from circular: {exc}", exc_info=True)
 
     def _remove_false_trigger(self, data: Dict[str, Any]) -> None:
-        import csv as _csv
         if not os.path.exists(self.output_ascii):
             return
         try:
@@ -918,10 +985,7 @@ class GCNCircularHandler:
                 dtype=str,
                 na_filter=False,
             )
-            for col in self.ASCII_COLUMNS:
-                if col not in df.columns:
-                    df[col] = ""
-            df = df[self.ASCII_COLUMNS].fillna("")
+            df = self._with_columns(df)
 
             trigger  = str(data.get("trigger_num", ""))
             facility = str(data.get("facility", ""))
@@ -937,18 +1001,42 @@ class GCNCircularHandler:
 
             if rows_to_remove:
                 df = df.drop(index=rows_to_remove)
-                df[self.ASCII_COLUMNS].to_csv(
-                    self.output_ascii,
-                    sep=" ",
-                    header=True,
-                    index=False,
-                    quoting=_csv.QUOTE_NONNUMERIC,
-                    quotechar='"',
-                    columns=self.ASCII_COLUMNS,
-                )
+                self._write_ascii(df)
                 logger.info(f"Removed false trigger {facility}_{trigger} from ASCII")
         except Exception as exc:
             logger.error(f"Error removing false trigger: {exc}", exc_info=True)
+
+    @staticmethod
+    def _ts_epoch(thread_ts: Any) -> float:
+        try:
+            return float(str(thread_ts).strip().strip('"'))
+        except ValueError:
+            return float("inf")
+
+    def _with_columns(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Base columns first, then every other column already in the file.
+
+        The ASCII file is shared with GCNNoticeHandler, which owns extra columns
+        (ToO_7DT / ToO_RASA36 / ToO_Deferred_* / ToO_Tiles_*); a circular write
+        must carry them through untouched — dropping them wiped the ToO
+        duplicate-send guard and pending deferred ToOs of every row.
+        """
+        for col in self.ASCII_COLUMNS:
+            if col not in df.columns:
+                df[col] = ""
+        extra = [c for c in df.columns if c not in self.ASCII_COLUMNS]
+        return df[self.ASCII_COLUMNS + extra].fillna("")
+
+    def _write_ascii(self, df: pd.DataFrame) -> None:
+        import csv as _csv
+        df.to_csv(
+            self.output_ascii,
+            sep=" ",
+            header=True,
+            index=False,
+            quoting=_csv.QUOTE_NONNUMERIC,
+            quotechar='"',
+        )
 
     def _should_upgrade(
         self,

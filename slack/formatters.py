@@ -46,6 +46,7 @@ class MessageFormatter:
         notice_data: Optional[Dict[str, Any]] = None,
         test_mode: bool = False,
         custom_facility: Optional[str] = None,
+        same_burst: Optional[str] = None,
     ) -> Tuple[Optional[Dict[str, Any]], Optional[str], Optional[str]]:
         """
         Format a raw GCN notice into a Slack message.
@@ -65,6 +66,9 @@ class MessageFormatter:
             When True, test notices are not skipped.
         custom_facility : str | None
             Override the auto-detected facility name.
+        same_burst : str | None
+            ``SAME_BURST_AS`` line (see :meth:`same_burst_header`) placed under
+            the GRB name when the event is linked to another facility's event.
 
         Returns
         -------
@@ -112,6 +116,8 @@ class MessageFormatter:
             # Inject probable GRB name into [BASIC INFO] section
             if notice_data and notice_data.get("Name"):
                 formatted_text = self._inject_grb_name(formatted_text, notice_data["Name"])
+            if same_burst:
+                formatted_text = self._inject_after_name(formatted_text, same_burst)
 
             blocks: List[Dict[str, Any]] = [
                 {
@@ -925,6 +931,13 @@ class MessageFormatter:
     # Private: GRB name injection
     # ------------------------------------------------------------------
 
+    def _inject_after_name(self, text: str, line: str) -> str:
+        """Insert *line* right below the GRB_NAME line (top of the text if none)."""
+        m = re.search(r"^> \*GRB_NAME\(Probably\):.*\n", text, re.MULTILINE)
+        if m:
+            return text[:m.end()] + line + "\n" + text[m.end():]
+        return line + "\n" + text
+
     def _inject_grb_name(self, text: str, name: str) -> str:
         """Insert a GRB_NAME line into the [BASIC INFO] block."""
         pattern = r"(\*\[BASIC INFO\]\*\n(?:>.*\n)*?)"
@@ -933,3 +946,112 @@ class MessageFormatter:
             grb_line = f"> *GRB_NAME(Probably):      {name}*\n"
             text = text.replace(m.group(1), m.group(1) + grb_line, 1)
         return text
+
+    # ------------------------------------------------------------------
+    # Same-burst links (one burst seen by several facilities)
+    # ------------------------------------------------------------------
+
+    _VIS_EMOJI = {"observable_now": "🟢", "observable_later": "🟠", "observable_tomorrow": "🔵"}
+
+    @staticmethod
+    def fmt_err(deg: Any) -> str:
+        """Localization radius in the most readable unit (12.5° / 4.8′ / 30″)."""
+        try:
+            d = float(deg)
+        except (TypeError, ValueError):
+            return "?"
+        if d >= 1:
+            return f"{d:.1f}°"
+        if d * 60 >= 1:
+            return f"{d * 60:.1f}′"
+        return f"{d * 3600:.0f}″"
+
+    @staticmethod
+    def _rel_time(dt_s: float) -> str:
+        """``"2 s later"`` / ``"69 min earlier"`` for a signed time offset."""
+        if abs(dt_s) < 0.5:
+            return "in the same second"
+        word = "later" if dt_s > 0 else "earlier"
+        if abs(dt_s) >= 120:
+            return f"{abs(dt_s) / 60:.0f} min {word}"
+        return f"{abs(dt_s):.0f} s {word}"
+
+    @staticmethod
+    def _link_evidence(link: Dict[str, Any]) -> str:
+        if link.get("rule") == "time":
+            return (f"trigger times {abs(link['dt_s']):.0f} s apart; positions consistent "
+                    f"({link['sep_deg']:.1f}° apart, ≤ {link['tol_deg']:.1f}° allowed)")
+        if link.get("rule") == "position":
+            return (f"positions agree to {link['sep_deg'] * 60:.1f}′ "
+                    f"(≤ {link['tol_deg'] * 60:.1f}′), triggers {abs(link['dt_s']) / 60:.0f} min apart")
+        return f"confirmed by GCN {link.get('circular')}"
+
+    def same_burst_header(self, link: Dict[str, Any], best: bool, url: str = "") -> str:
+        """``SAME_BURST_AS`` line for the [BASIC INFO] block of the new event."""
+        line = (f"> *SAME_BURST_AS:*      {link['name']} — "
+                f"{link['matched_facility']} #{link['matched_trigger']} "
+                f"(triggered {self._rel_time(-link['dt_s'])})")
+        if url:
+            line += f" → <{url}|{'circulars & follow-up' if best else 'better localization'}>"
+        return line
+
+    def same_burst_new_thread(
+        self, link: Dict[str, Any], canon_url: str, best: bool, best_member: Optional[Dict[str, Any]] = None,
+    ) -> str:
+        """First reply in the new event's thread: why it is linked, where to read on."""
+        where = f"<{canon_url}|the {link['name']} thread>" if canon_url else f"the {link['name']} thread"
+        text = (f":link: *Same burst as {link['name']}* ({link['matched_facility']} "
+                f"#{link['matched_trigger']}) — {self._link_evidence(link)}.\n"
+                f"GCN circulars and follow-up are collected in {where}.")
+        if not best and best_member:
+            text += (f"\n:dart: {best_member['facility']} #{best_member['trigger']} has the better "
+                     f"localization (err {self.fmt_err(best_member.get('err'))}) — use its thread for ToO.")
+        return text
+
+    def same_burst_quote(
+        self, notice_data: Dict[str, Any], link: Dict[str, Any], new_url: str, best: bool,
+        tile_result: Optional[Dict[str, Any]] = None,
+        tile_result_rasa36: Optional[Dict[str, Any]] = None,
+        visibility_result: Optional[Dict[str, Any]] = None,
+    ) -> str:
+        """Reply in the canonical thread quoting the linked notice."""
+        fac, trig = notice_data.get("Facility", ""), notice_data.get("Trigger_num", "")
+        name = notice_data.get("Name", "")
+        ref = f"<{new_url}|{name} ({fac})>" if new_url else f"*{name} ({fac})*"
+        dt = f", triggered {self._rel_time(link['dt_s'])}"
+        parts = [f"RA {notice_data.get('RA')}, Dec {notice_data.get('DEC')}, "
+                 f"err {self.fmt_err(notice_data.get('Error'))}"]
+        for label, tr in (("7DT", tile_result), ("RASA36", tile_result_rasa36)):
+            if tr is not None:
+                n = tr.get("n_tiles", 0)
+                parts.append(f"{label} {n} tile{'s' if n != 1 else ''}")
+        if visibility_result:
+            emoji = self._VIS_EMOJI.get(visibility_result.get("case"), "🔴")
+            parts.append(f"{emoji} {visibility_result.get('message', '')}".strip())
+        lines = [f":link: *{fac} also detected this burst* (#{trig}{dt}) → {ref}",
+                 "> " + " · ".join(parts)]
+        lines.append("> Best localization of this burst so far — use that thread for ToO."
+                     if best else "> Coarser than this burst's best localization — no action needed.")
+        return "\n".join(lines)
+
+    def same_burst_joined(
+        self, canon_name: str, canon_url: str, circular_id: Any, renamed_from: Optional[str] = None,
+    ) -> str:
+        """Reply in a thread that a circular has just linked to *canon_name*."""
+        where = f"<{canon_url}|the {canon_name} thread>" if canon_url else f"the {canon_name} thread"
+        text = (f":link: *Same burst as {canon_name}* — confirmed by "
+                f"<https://gcn.nasa.gov/circulars/{circular_id}|GCN {circular_id}>. "
+                f"GCN circulars and follow-up are collected in {where}.")
+        if renamed_from:
+            text = f":pencil: Event renamed: *{renamed_from}* → *{canon_name}*\n" + text
+        return text
+
+    def same_burst_joined_canonical(
+        self, member: Dict[str, Any], member_url: str, circular_id: Any,
+    ) -> str:
+        """Reply in the canonical thread when a circular links another facility's event."""
+        ref = f"<{member_url}|{member['name']} ({member['facility']})>" if member_url \
+            else f"*{member['name']} ({member['facility']})*"
+        return (f":link: {member['facility']} #{member['trigger']} is the same burst — confirmed by "
+                f"<https://gcn.nasa.gov/circulars/{circular_id}|GCN {circular_id}> → {ref}\n"
+                f"> RA {member.get('ra')}, Dec {member.get('dec')}, err {self.fmt_err(member.get('err'))}")
