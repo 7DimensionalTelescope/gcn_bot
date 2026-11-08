@@ -504,12 +504,8 @@ class GCNToOEmailer:
     # Private helpers
     # ==================================================================
 
-    def _prepare_email_content(
-        self,
-        notice_data: Dict[str, Any],
-        too_config: Optional[Dict[str, Any]],
-    ) -> Dict[str, Any]:
-        """Build the observation request dictionary."""
+    def _default_config(self) -> Dict[str, Any]:
+        """Telescope defaults for any observation parameter not overridden."""
         if self.telescope == "RASA36":
             default: Dict[str, Any] = {
                 "singleExposure":    60,
@@ -538,7 +534,26 @@ class GCNToOEmailer:
                 "selectedFilters":   ["g", "r", "i"],
                 "selectedTelNumber": 1,
             }
-        cfg = {**default, **(too_config or {})}
+        return default
+
+    def default_form_config(
+        self, too_config: Optional[Dict[str, Any]] = None
+    ) -> Dict[str, Any]:
+        """Effective observation config: telescope defaults overlaid by *too_config*.
+
+        This is exactly what an email is built from, so the Slack ToO form uses
+        it to pre-fill its fields — the manual form then always starts from the
+        same values as the automatic request.
+        """
+        return {**self._default_config(), **(too_config or {})}
+
+    def _prepare_email_content(
+        self,
+        notice_data: Dict[str, Any],
+        too_config: Optional[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        """Build the observation request dictionary."""
+        cfg = self.default_form_config(too_config)
 
         target_name = notice_data.get("Name", "New_GRB_Event")
         total_exp   = cfg["singleExposure"] * cfg["imageCount"]

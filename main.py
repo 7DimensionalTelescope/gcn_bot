@@ -238,6 +238,7 @@ class GCNBot:
             too_config=config.too_config,
             telescope="RASA36",
             on_sent=self.notice_handler.mark_too_sent,
+            defaults_provider=self._rasa36_form_config,
         )
 
         # --- Kafka consumer ---
@@ -1010,6 +1011,24 @@ class GCNBot:
         """
         case = "single" if n_tiles == 1 else "multi"
         return self._auto_too_configs.get(telescope, {}).get(case)
+
+    def _rasa36_form_config(self, notice_data: dict) -> Optional[dict]:
+        """Auto-ToO config the RASA36 Slack form is pre-filled from.
+
+        Mirrors the automatic path: the single- vs multi-tile config is chosen
+        from the event's RASA36 tile count (computed from the button payload's
+        RA/DEC/Error; unknown → same fallback as ``_auto_too_config``).
+        """
+        n_tiles = None
+        try:
+            ra, dec = float(notice_data["RA"]), float(notice_data["DEC"])
+            error = float(notice_data.get("Error"))
+            if error > 0:
+                result = self.tiles_rasa36.get_tile_info(ra=ra, dec=dec, error=error)
+                n_tiles = (result or {}).get("n_tiles")
+        except (KeyError, TypeError, ValueError) as exc:
+            logger.debug(f"RASA36 form: tile count unavailable ({exc})")
+        return self._auto_too_config("RASA36", n_tiles)
 
     def _auto_too_enabled(self, telescope: str, n_tiles: Optional[int]) -> bool:
         """Whether auto-ToO is enabled for this telescope × tile case.

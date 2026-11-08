@@ -42,7 +42,12 @@ class SlackToOHandler:
         Handle of the Slack user-group whose members are authorised
         (e.g. ``"too-operators"`` or ``"7dt"``).
     too_config : dict | None
-        Default observation parameters to pre-populate the modal.
+        Default observation parameters to pre-populate the modal (7DT).
+    defaults_provider : callable | None
+        ``provider(notice_data) -> dict | None`` returning the observation
+        config the *automatic* ToO would use for this event. The RASA36 form is
+        pre-filled from it (overlaid on the emailer's own defaults) so the
+        manual and automatic requests start from identical values.
     """
 
     def __init__(
@@ -53,6 +58,7 @@ class SlackToOHandler:
         too_config: Optional[Dict[str, Any]] = None,
         telescope: str = "7DT",
         on_sent: Optional[Callable[[str, str, str], None]] = None,
+        defaults_provider: Optional[Callable[[Dict[str, Any]], Optional[Dict[str, Any]]]] = None,
     ) -> None:
         self._slack      = slack
         self._emailer    = emailer
@@ -64,6 +70,7 @@ class SlackToOHandler:
         # same event is suppressed. Kept as a callback so this handler stays
         # decoupled from the notice handler.
         self._on_sent    = on_sent
+        self._defaults_provider = defaults_provider
         # Bolt routing keys — unique per telescope so multiple handlers coexist
         self.action_id   = f"submit_too_request_{telescope.lower()}"
         self.callback_id = f"too_request_modal_{telescope.lower()}"
@@ -101,10 +108,11 @@ class SlackToOHandler:
                 "Name":        str(notice_data.get("Name", "")),
                 "RA":          str(notice_data.get("RA", "")),
                 "DEC":         str(notice_data.get("DEC", "")),
+                "Error":       str(notice_data.get("Error", "")),
                 "Facility":    str(notice_data.get("Facility", "")),
                 "Trigger_num": str(notice_data.get("Trigger_num", "")),
             }
-            payload = {k: v for k, v in payload.items() if v and v != "nan"}
+            payload = {k: v for k, v in payload.items() if v and v not in ("nan", "N/A", "None")}
             json_str = json.dumps(payload, ensure_ascii=True)
 
             # Slack button value limit is 2000 characters
@@ -161,11 +169,25 @@ class SlackToOHandler:
         # Read defaults from too_config
         cfg = self.too_config
         if self.telescope == "RASA36":
-            init_exposure = str(cfg.get("exptime", cfg.get("singleExposure", 60)))
-            init_count    = str(cfg.get("count",   cfg.get("imageCount", 5)))
-            init_priority = str(cfg.get("priority", "50"))
-            init_gain     = str(cfg.get("gain", "25"))
-            init_binning  = str(cfg.get("binning", "1"))
+            # Follow the automatic RASA36 ToO: emailer defaults overlaid by the
+            # auto config for this event (not the generic TOO_CONFIG, which is
+            # 7DT-oriented: 100 s x 3, priority 10, gain 2750).
+            auto_cfg = None
+            if self._defaults_provider is not None:
+                try:
+                    auto_cfg = self._defaults_provider(notice_data)
+                except Exception as exc:
+                    logger.warning(f"RASA36 form defaults provider failed: {exc}")
+            cfg = self._emailer.default_form_config(auto_cfg)
+            init_exposure = str(cfg.get("singleExposure"))
+            init_count    = str(cfg.get("imageCount"))
+            init_priority = str(cfg.get("priority"))
+            init_gain     = str(cfg.get("gain"))
+            init_binning  = str(cfg.get("binning"))
+            init_rapid    = "True" if any(
+                str(cfg.get(k, "")).strip().lower() in ("true", "yes", "1")
+                for k in ("rapidToO", "abortObservation")
+            ) else "False"
         else:
             init_exposure = str(cfg.get("exptime", cfg.get("singleExposure", 100)))
             init_count    = str(cfg.get("count",   cfg.get("imageCount", 3)))
@@ -180,6 +202,7 @@ class SlackToOHandler:
                 trigger_id, user_email, notice_data,
                 target, ra, dec,
                 init_exposure, init_count, init_priority, init_gain, init_binning,
+                init_rapid,
             )
 
         modal = {
@@ -322,6 +345,7 @@ class SlackToOHandler:
         init_priority: str,
         init_gain: str,
         init_binning: str,
+        init_rapid: str = "False",
     ) -> bool:
         """Open the RASA36 ToO modal — no obsmode/spec/filter selectors."""
         modal = {
@@ -349,9 +373,9 @@ class SlackToOHandler:
                 self._input_block("dec_block",       "dec_input",       "Declination (DEC) *",    dec,   "-25.5678 (degrees)"),
                 {"type": "divider"},
                 self._input_block("exposure_block", "exposure_input", "Single Exposure Time (seconds) *", init_exposure, "60"),
-                self._input_block("count_block",    "count_input",    "Number of Images *",               init_count,    "5"),
+                self._input_block("count_block",    "count_input",    "Number of Images *",               init_count,    "55"),
                 {"type": "divider"},
-                self._input_block("priority_block", "priority_input", "Priority *", init_priority, "50"),
+                self._input_block("priority_block", "priority_input", "Priority *", init_priority, "1"),
                 {
                     "type": "input",
                     "block_id": "binning_block",
@@ -372,7 +396,7 @@ class SlackToOHandler:
                     "element": {
                         "type": "radio_buttons",
                         "action_id": "abort_input",
-                        "initial_option": {"text": {"type": "plain_text", "text": "False"}, "value": "False"},
+                        "initial_option": {"text": {"type": "plain_text", "text": init_rapid}, "value": init_rapid},
                         "options": [
                             {"text": {"type": "plain_text", "text": "True"},  "value": "True"},
                             {"text": {"type": "plain_text", "text": "False"}, "value": "False"},
@@ -559,7 +583,9 @@ class SlackToOHandler:
                 "imageCount":        int(form_data.get("imageCount", 5)),
                 "obsmode":           "Single",
                 "selectedFilters":   ["r"],
-                "abortObservation":  form_data.get("abortObservation", "False"),
+                # RASA36 has a dedicated Rapid ToO flag (the form's radio); the
+                # abort field is a 7DT concept.
+                "rapidToO":          form_data.get("abortObservation", "False"),
                 "priority":          form_data.get("priority", "50"),
                 "gain":              form_data.get("gain", "25"),
                 "binning":           form_data.get("binning", "1"),
