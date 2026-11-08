@@ -29,6 +29,7 @@ import logging
 import signal
 import sys
 import threading
+import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, List, Optional
 
@@ -126,6 +127,9 @@ class GCNBot:
         self.too_slot_store = ToOSlotStore(config.output_too_slots)
         self._too_slots: dict = {}
         self._too_slots_lock = threading.Lock()
+        # telescope -> SMTP pre-warm lease taken for the notice being processed
+        # (main thread only; see _prewarm_auto_too / _process_notice_message)
+        self._notice_leases: dict = {}
 
         # --- Notice / Circular storage ---
         self.notice_handler = GCNNoticeHandler(
@@ -180,7 +184,7 @@ class GCNBot:
             auto_too_grb_only=config.too_auto_grb_only,
             auto_too_max_tiles=config.auto_too_max_tiles,
             observable_soon_hours=config.too_observable_soon_hours,
-            smtp_keepalive_sec=config.smtp_keepalive_sec,
+            smtp_prewarm=config.smtp_prewarm,
         )
         self.emailer_rasa36 = GCNToOEmailer(
             email_from=config.email_from,
@@ -190,7 +194,7 @@ class GCNBot:
             auto_too_grb_only=config.too_auto_grb_only,
             auto_too_max_tiles=config.auto_too_max_tiles,
             observable_soon_hours=config.too_observable_soon_hours,
-            smtp_keepalive_sec=config.smtp_keepalive_sec,
+            smtp_prewarm=config.smtp_prewarm,
         )
         # Auto-ToO observation params (from settings.toml), split by tile case:
         # the single-tile (n==1) and multi-tile (2..max) cases are handled
@@ -513,6 +517,51 @@ class GCNBot:
     # ------------------------------------------------------------------
 
     def _process_notice_message(self, topic: str, value: Any) -> None:
+        """Run the notice pipeline; give back any SMTP pre-warm lease it left."""
+        self._notice_leases = {}
+        try:
+            self._process_notice_pipeline(topic, value)
+        finally:
+            leases, self._notice_leases = self._notice_leases, {}
+            for telescope, token in leases.items():
+                emailer, _ = self._telescope_ctx(telescope)
+                if emailer is not None:
+                    emailer.release_prewarm(token)       # non-blocking
+
+    def _prewarm_auto_too(self, notice_data: dict) -> None:
+        """Pre-warm the SMTP connection of each telescope that may auto-ToO this notice.
+
+        Runs right after parsing, so the ~1.1-1.5 s login overlaps the ~3 s of
+        visibility / tile work before the decision. Cheap gates only (the real
+        decision needs the tile count): Slack/auto mode on, the telescope has an
+        auto-ToO case enabled, GRB-only satisfied, an error radius present, and
+        no ToO sent for the event yet. Leases are taken back in
+        ``_process_notice_message`` unless a send consumed them.
+        """
+        if not self.send_to_slack:
+            return
+        from too.emailer import _is_grb_facility
+        facility = str(notice_data.get("Facility", "")).strip()
+        trigger  = str(notice_data.get("Trigger_num", "")).strip()
+        error    = notice_data.get("Error")
+        try:
+            if error is None or not float(error) > 0:
+                return
+        except (TypeError, ValueError):
+            return
+        for telescope, emailer in (("7DT", self.emailer), ("RASA36", self.emailer_rasa36)):
+            flags = self._auto_too_enabled_flags.get(telescope, {})
+            if not (emailer.smtp_prewarm and (flags.get("single") or flags.get("multi"))):
+                continue
+            if emailer.auto_too_grb_only and not _is_grb_facility(facility):
+                continue
+            if facility and trigger and self.notice_handler.was_too_sent(facility, trigger, telescope):
+                continue
+            token = f"notice:{telescope}:{facility}|{trigger}:{uuid.uuid4().hex[:8]}"
+            emailer.prewarm(token, emailer.PREWARM_HOLD_AUTO_SEC)
+            self._notice_leases[telescope] = token
+
+    def _process_notice_pipeline(self, topic: str, value: Any) -> None:
         """
         Full notice pipeline:
 
@@ -531,6 +580,7 @@ class GCNBot:
 
         facility    = notice_data.get("Facility", "")
         trigger_num = notice_data.get("Trigger_num", "")
+        self._prewarm_auto_too(notice_data)
         name        = notice_data.get("Name", "GRB Candidate")
         ra          = notice_data.get("RA")
         dec         = notice_data.get("DEC")
@@ -1048,6 +1098,8 @@ class GCNBot:
                     too_config=too_config,
                     on_success=self._make_too_notice(too_slot, telescope, True),
                     on_failure=self._make_too_notice(too_slot, telescope, False),
+                    # the send gives the pre-warm lease back itself, after sending
+                    release_token=self._notice_leases.pop(telescope, None),
                 )
                 return True
             except Exception as exc:
@@ -1138,6 +1190,18 @@ class GCNBot:
             return None
 
     def _fire_deferred_too(self, entry: "DeferredEntry") -> None:
+        """Pre-warm SMTP for the fire-time re-check, then run it (scheduler thread)."""
+        emailer, _ = self._telescope_ctx(entry.telescope)
+        token = f"deferred:{entry.telescope}:{entry.facility}|{entry.trigger_num}:{uuid.uuid4().hex[:8]}"
+        if emailer is not None:
+            emailer.prewarm(token, emailer.PREWARM_HOLD_AUTO_SEC)
+        try:
+            self._fire_deferred_too_checked(entry)
+        finally:
+            if emailer is not None:
+                emailer.release_prewarm(token)
+
+    def _fire_deferred_too_checked(self, entry: "DeferredEntry") -> None:
         """
         Fire (or re-evaluate) a deferred ToO — runs on the scheduler thread.
 
@@ -1524,10 +1588,6 @@ class GCNBot:
         # the ASCII file (e.g. the bot restarted while a target was still rising).
         self.deferred_scheduler.start()
 
-        # Open + keep warm one SMTP connection per telescope (background), so
-        # the first alert's ToO email skips the TLS+AUTH handshake.
-        for em in (self.emailer, self.emailer_rasa36):
-            em.start_smtp_keepalive()
         try:
             self._reload_deferred_too()
         except Exception as exc:

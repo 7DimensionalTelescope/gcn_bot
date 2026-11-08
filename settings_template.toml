@@ -71,7 +71,7 @@ EMAIL_FROM      = "your-bot-email@example.com"
 EMAIL_PASSWORD  = "your-email-app-password"
 EMAIL_TO        = "your-team@example.com"
 EMAIL_TO_RASA36 = "rasa36-team@example.com"  # RASA36 ToO recipient (separate observatory account)
-SMTP_KEEPALIVE_SEC = 60  # keep a logged-in SMTP connection per telescope warm (NOOP every N s) so ToO sends skip the TLS+AUTH handshake; 0 = new connection per send
+SMTP_PREWARM = true  # open the ToO SMTP connection when a send becomes likely (notice / form / deferred fire) and close it right after; false = connect per send
 TOO_TEST_EMAIL  = ""  # optional; overrides EMAIL_TO during tests only
 
 # ---------------------------------------------------------------------------

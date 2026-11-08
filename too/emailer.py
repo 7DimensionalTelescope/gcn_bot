@@ -73,22 +73,34 @@ _STALE_CONNECTION_ERRORS = (
 
 class SMTPSession:
     """
-    One logged-in, kept-warm SMTP connection (thread-safe).
+    One logged-in SMTP connection per emailer, opened just before it is needed.
 
-    A ToO email used to open a new connection per send (TCP + TLS + AUTH,
-    ~1.5-2 s of the ~4 s from decision to "accepted"). This keeps the
-    connection open and logged in so a send is just ``MAIL FROM/RCPT/DATA``.
+    A ToO email used to open a fresh connection per send (TCP + TLS + AUTH,
+    ~1.1-1.5 s). Holding a connection open all day (NOOP keep-alive, tried
+    first) was cut by Gmail after 60 min (421) and then every 5-6 min, and
+    each reconnect is a login — hundreds a day, which risks Google's
+    "too many login attempts" lock-out of the very account ToOs depend on.
 
-    * ``start()`` connects in the background and spawns a daemon thread that
-      issues ``NOOP`` every ``keepalive_sec`` so the server never idles the
-      session out; if the NOOP fails the connection is dropped and re-opened
-      eagerly, so the next alert still finds a warm session.
-    * ``send()`` reuses the session; on a dead-connection error it reconnects
-      and retries once, so a stale session costs only the old per-send price.
-    * Works without ``start()`` too (connects lazily on first send).
+    Instead the connection is *pre-warmed* when a send becomes likely and
+    closed as soon as nobody needs it:
 
-    A single connection serialises sends, hence one session per emailer
-    (7DT / RASA36) so the two telescopes' emails still go out in parallel.
+    * ``acquire(token, max_hold)`` takes a lease and opens the connection on a
+      background thread (the caller never waits) — e.g. when a notice arrives,
+      in parallel with the ~3 s visibility / tile computation that precedes the
+      auto-ToO decision, or when the manual ToO form opens.
+    * ``release(token)`` returns the lease; the connection is closed (QUIT) once
+      no live lease remains. Closing runs in the background too and waits for
+      an in-progress open/send via the lock, so the caller never blocks.
+    * A lease older than its ``max_hold`` is ignored (an abandoned form, or a
+      code path that never released) — no timer thread: expiry is evaluated on
+      acquire / release / send.
+    * ``send()`` reuses the connection (or connects lazily); on a dead
+      connection it reconnects and retries once. With no live lease after the
+      send, the connection is closed — without pre-warming this is exactly the
+      old connect-per-send behaviour.
+
+    A connection serialises sends, hence one session per emailer (7DT / RASA36)
+    so the two telescopes still send in parallel.
     """
 
     def __init__(
@@ -97,19 +109,79 @@ class SMTPSession:
         port: int,
         user: str,
         password: str,
-        keepalive_sec: float = 60.0,
+        label: str = "",
         timeout: float = 20.0,
     ) -> None:
         self.host, self.port = host, port
         self._user, self._password = user, password
-        self.keepalive_sec = float(keepalive_sec)
+        self.label = label or host
         self.timeout = timeout
         self._conn: Optional[smtplib.SMTP_SSL] = None
-        self._lock = threading.Lock()
-        self._stop = threading.Event()
-        self._thread: Optional[threading.Thread] = None
+        self._lock = threading.Lock()          # guards _conn (open / send / close)
+        self._lease_lock = threading.Lock()    # guards _leases only
+        self._leases: Dict[str, float] = {}    # token -> monotonic deadline
 
-    # -- connection management (caller must hold self._lock) --------------
+    # -- leases -------------------------------------------------------------
+
+    def _live_leases(self) -> int:
+        """Drop expired leases; return how many are still live (lease lock held)."""
+        now = time.monotonic()
+        for token in [t for t, deadline in self._leases.items() if deadline <= now]:
+            del self._leases[token]
+            logger.info(f"SMTP[{self.label}] lease {token!r} expired without release")
+        return len(self._leases)
+
+    def acquire(self, token: str, max_hold_sec: float) -> None:
+        """Take a lease and open the connection in the background (non-blocking)."""
+        with self._lease_lock:
+            self._leases[token] = time.monotonic() + max_hold_sec
+            self._live_leases()
+        threading.Thread(
+            target=self._warm, name=f"smtp-warm-{self.label}", daemon=True
+        ).start()
+
+    def release(self, token: str, wait: bool = False) -> None:
+        """Return a lease; close the connection when no live lease remains.
+
+        ``wait=False`` (default) closes on a background thread so the caller
+        (e.g. the Kafka loop) never waits for an in-progress open or send.
+        """
+        with self._lease_lock:
+            self._leases.pop(token, None)
+            if self._live_leases():
+                return
+        if wait:
+            self._close_if_unused()
+        else:
+            threading.Thread(
+                target=self._close_if_unused, name=f"smtp-close-{self.label}", daemon=True
+            ).start()
+
+    def _warm(self) -> None:
+        with self._lock:
+            with self._lease_lock:
+                if not self._live_leases():
+                    return              # released before we got here
+            if self._conn is not None:
+                return
+            try:
+                self._open()
+            except Exception as exc:
+                logger.warning(
+                    f"SMTP[{self.label}] pre-warm failed ({type(exc).__name__}: {exc}); "
+                    "the send will connect itself"
+                )
+
+    def _close_if_unused(self) -> None:
+        with self._lock:
+            with self._lease_lock:
+                if self._live_leases():
+                    return              # someone took a new lease meanwhile
+            if self._conn is not None:
+                self._drop()
+                logger.info(f"SMTP[{self.label}] connection closed (no pending send)")
+
+    # -- connection management (caller holds self._lock) ----------------------
 
     def _open(self) -> None:
         t0 = time.monotonic()
@@ -122,7 +194,8 @@ class SMTPSession:
             raise
         self._conn = conn
         logger.info(
-            f"SMTP session opened to {self.host} ({time.monotonic() - t0:.2f}s)"
+            f"SMTP[{self.label}] connection opened to {self.host} "
+            f"({time.monotonic() - t0:.2f}s)"
         )
 
     @staticmethod
@@ -141,96 +214,65 @@ class SMTPSession:
         conn, self._conn = self._conn, None
         self._quiet_close(conn)
 
-    # -- public API -------------------------------------------------------
+    # -- public API -----------------------------------------------------------
 
     def send(self, msg, from_addr: str, to_addrs: List[str]) -> Tuple[Dict[str, Any], bool]:
         """
         Send ``msg``; return ``(refused, reused)`` where ``refused`` is
         ``send_message``'s per-recipient refusal dict and ``reused`` says
-        whether an already-open connection carried the send.
+        whether an already-open (pre-warmed) connection carried the send.
         """
         with self._lock:
-            reused = self._conn is not None
-            for attempt in (1, 2):
-                try:
-                    if self._conn is None:
-                        self._open()
-                    refused = self._conn.send_message(
-                        msg, from_addr=from_addr, to_addrs=to_addrs
-                    )
-                    return refused, reused
-                except _STALE_CONNECTION_ERRORS as exc:
-                    # Connection state is unknown after a transport failure.
+            try:
+                return self._send_locked(msg, from_addr, to_addrs)
+            finally:
+                with self._lease_lock:
+                    unused = not self._live_leases()
+                if unused and self._conn is not None:
+                    self._drop()
+
+    def _send_locked(self, msg, from_addr, to_addrs) -> Tuple[Dict[str, Any], bool]:
+        reused = self._conn is not None
+        for attempt in (1, 2):
+            try:
+                if self._conn is None:
+                    self._open()
+                refused = self._conn.send_message(
+                    msg, from_addr=from_addr, to_addrs=to_addrs
+                )
+                return refused, reused
+            except _STALE_CONNECTION_ERRORS as exc:
+                # Connection state is unknown after a transport failure.
+                self._drop()
+                reused = False
+                if attempt == 2:
+                    raise
+                logger.warning(
+                    f"SMTP[{self.label}] connection unusable ({type(exc).__name__}: {exc}); "
+                    "reconnecting and retrying once"
+                )
+            except smtplib.SMTPResponseException as exc:
+                if exc.smtp_code == 421:  # "service not available, closing"
                     self._drop()
                     reused = False
                     if attempt == 2:
                         raise
-                    logger.warning(
-                        f"SMTP session unusable ({type(exc).__name__}: {exc}); "
-                        f"reconnecting and retrying once"
-                    )
-                except smtplib.SMTPResponseException as exc:
-                    if exc.smtp_code == 421:  # "service not available, closing"
-                        self._drop()
-                        reused = False
-                        if attempt == 2:
-                            raise
-                        logger.warning("SMTP 421 from server; reconnecting and retrying once")
-                        continue
-                    # Rejected mid-transaction: reset so the session stays usable.
-                    try:
-                        self._conn.rset()
-                    except Exception:
-                        self._drop()
-                    raise
-            raise RuntimeError("unreachable")  # pragma: no cover
-
-    def start(self) -> None:
-        """Warm the connection and begin keep-alive pings (idempotent)."""
-        if self.keepalive_sec <= 0 or self._thread is not None:
-            return
-        self._stop.clear()
-        self._thread = threading.Thread(
-            target=self._run, name=f"smtp-keepalive-{self.host}", daemon=True
-        )
-        self._thread.start()
+                    logger.warning(f"SMTP[{self.label}] 421 from server; reconnecting and retrying once")
+                    continue
+                # Rejected mid-transaction: reset so the connection stays usable.
+                try:
+                    self._conn.rset()
+                except Exception:
+                    self._drop()
+                raise
+        raise RuntimeError("unreachable")  # pragma: no cover
 
     def close(self) -> None:
-        """Stop keep-alive and close the connection."""
-        self._stop.set()
+        """Drop all leases and close the connection (shutdown)."""
+        with self._lease_lock:
+            self._leases.clear()
         with self._lock:
             self._drop()
-        self._thread = None
-
-    # -- keep-alive thread ------------------------------------------------
-
-    def _ensure_warm(self) -> None:
-        with self._lock:
-            try:
-                if self._conn is None:
-                    self._open()
-                else:
-                    sock = self._conn.sock
-                    if sock is not None:
-                        sock.settimeout(5.0)  # don't let a dead link stall a send behind us
-                    code, _ = self._conn.noop()
-                    if sock is not None:
-                        sock.settimeout(self.timeout)
-                    if code != 250:
-                        raise smtplib.SMTPServerDisconnected(f"NOOP -> {code}")
-            except Exception as exc:
-                logger.warning(
-                    f"SMTP keep-alive failed ({type(exc).__name__}: {exc}); "
-                    f"will retry in {self.keepalive_sec:.0f}s"
-                )
-                self._drop()
-
-    def _run(self) -> None:
-        # The first pass connects immediately; later passes wait a full interval.
-        while not self._stop.is_set():
-            self._ensure_warm()
-            if self._stop.wait(self.keepalive_sec):
-                break
 
 
 # ---------------------------------------------------------------------------
@@ -402,9 +444,9 @@ class GCNToOEmailer:
         SMTP hostname (default: Gmail SSL).
     smtp_port : int
         SMTP port (default: 465 for SSL).
-    smtp_keepalive_sec : float
-        Keep one logged-in SMTP connection open and ping it this often (s);
-        ``0`` (default) opens a new connection for every send.
+    smtp_prewarm : bool
+        Allow :meth:`prewarm` to open the SMTP connection ahead of a likely send
+        (default ``False`` → every send opens and closes its own connection).
     min_altitude : float
         Minimum target altitude in degrees (informational, passed to visibility).
     min_moon_sep : float
@@ -436,7 +478,7 @@ class GCNToOEmailer:
         auto_too_grb_only: bool = False,
         auto_too_max_tiles: Optional[int] = None,
         observable_soon_hours: float = OBSERVABLE_SOON_HOURS,
-        smtp_keepalive_sec: float = 0.0,
+        smtp_prewarm: bool = False,
     ) -> None:
         self.email_from     = email_from
         self.email_to       = [email_to] if isinstance(email_to, str) else list(email_to)
@@ -458,24 +500,35 @@ class GCNToOEmailer:
         # Read by the observable_soon criterion — how many hours before the
         # target rises an auto-ToO may still fire.
         self.observable_soon_hours = observable_soon_hours
-        # Persistent, kept-warm SMTP connection (skips TCP+TLS+AUTH on every
-        # send). 0 disables it → a fresh connection per send, as before.
-        self._smtp: Optional[SMTPSession] = (
-            SMTPSession(smtp_server, smtp_port, email_from, email_password,
-                        keepalive_sec=smtp_keepalive_sec)
-            if smtp_keepalive_sec > 0 else None
+        # One SMTP connection, pre-warmed on demand and closed when unused (see
+        # SMTPSession). Without pre-warming it connects per send, as before.
+        self.smtp_prewarm = smtp_prewarm
+        self._smtp = SMTPSession(
+            smtp_server, smtp_port, email_from, email_password, label=telescope
         )
         logger.info(f"GCNToOEmailer initialised for telescope={telescope}")
 
-    def start_smtp_keepalive(self) -> None:
-        """Open the SMTP connection in the background and keep it warm."""
-        if self._smtp is not None:
-            self._smtp.start()
+    # Upper bounds on how long a pre-warm lease is honoured if never released.
+    PREWARM_HOLD_AUTO_SEC   = 120.0   # notice → auto-ToO decision takes ~3 s
+    PREWARM_HOLD_MANUAL_SEC = 900.0   # a person filling in the Slack form
+
+    def prewarm(self, token: str, max_hold_sec: float = PREWARM_HOLD_AUTO_SEC) -> None:
+        """Open the SMTP connection in the background ahead of a likely send.
+
+        Non-blocking. Pair with :meth:`release_prewarm` (or pass the token as
+        ``release_token`` to a send). No-op when ``smtp_prewarm`` is off.
+        """
+        if self.smtp_prewarm:
+            self._smtp.acquire(token, max_hold_sec)
+
+    def release_prewarm(self, token: Optional[str], wait: bool = False) -> None:
+        """Give back a pre-warm lease; the connection closes once none remain."""
+        if token and self.smtp_prewarm:
+            self._smtp.release(token, wait=wait)
 
     def close_smtp(self) -> None:
-        """Stop keep-alive pings and close the SMTP connection."""
-        if self._smtp is not None:
-            self._smtp.close()
+        """Close the SMTP connection and forget all leases (shutdown)."""
+        self._smtp.close()
 
     # ==================================================================
     # Public: criteria evaluation
@@ -596,9 +649,13 @@ class GCNToOEmailer:
         too_config: Optional[Dict[str, Any]] = None,
         on_success: Optional[Callable[[], None]] = None,
         on_failure: Optional[Callable[[], None]] = None,
+        release_token: Optional[str] = None,
     ) -> None:
         """
         Queue a ToO email on a background thread and return immediately.
+
+        ``release_token``: a :meth:`prewarm` lease to give back once the send is
+        done — in the same task, so the connection cannot be closed under it.
 
         Fire-and-forget: used by the *automatic* alert path so that email
         latency (TLS handshake + SMTP AUTH, ~1-2s) never blocks the notice
@@ -621,7 +678,7 @@ class GCNToOEmailer:
         """
         def _task() -> None:
             try:
-                ok = self.send_too_email(notice_data, too_config)
+                ok = self.send_too_email(notice_data, too_config, release_token=release_token)
             except Exception as exc:  # send_too_email already guards, belt-and-braces
                 logger.error(f"Async ToO send crashed: {exc}", exc_info=True)
                 ok = False
@@ -642,6 +699,7 @@ class GCNToOEmailer:
         self,
         notice_data: Dict[str, Any],
         too_config: Optional[Dict[str, Any]] = None,
+        release_token: Optional[str] = None,
     ) -> bool:
         """
         Compose and send a ToO request email.
@@ -651,6 +709,8 @@ class GCNToOEmailer:
         notice_data : dict
         too_config : dict | None
             Observation parameter overrides.
+        release_token : str | None
+            :meth:`prewarm` lease to give back after the send (success or not).
 
         Returns
         -------
@@ -685,19 +745,10 @@ class GCNToOEmailer:
             # from the To header) and the per-recipient result is checked:
             # send_message() only raises when *every* recipient is refused, so a
             # partial refusal used to be logged as "sent".
-            if self._smtp is not None:
-                refused, reused = self._smtp.send(
-                    msg, from_addr=self.email_from, to_addrs=self.email_to
-                )
-                conn_note = "reused connection" if reused else "new connection"
-            else:
-                ctx = ssl.create_default_context()
-                with smtplib.SMTP_SSL(self.smtp_server, self.smtp_port, context=ctx) as server:
-                    server.login(self.email_from, self.email_password)
-                    refused = server.send_message(
-                        msg, from_addr=self.email_from, to_addrs=self.email_to
-                    )
-                conn_note = "new connection"
+            refused, reused = self._smtp.send(
+                msg, from_addr=self.email_from, to_addrs=self.email_to
+            )
+            conn_note = "pre-warmed connection" if reused else "new connection"
             t_sent = time.monotonic()
 
             if refused:
@@ -719,6 +770,10 @@ class GCNToOEmailer:
         except Exception as exc:
             logger.error(f"Error sending ToO email: {exc}", exc_info=True)
             return False
+        finally:
+            # Background close: the send is already done, and the caller (e.g. the
+            # manual form's confirmation) should not wait ~0.2 s for QUIT.
+            self.release_prewarm(release_token)
 
     # ==================================================================
     # Private helpers

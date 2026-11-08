@@ -20,6 +20,7 @@ constructor arguments so it can be tested with mocks independently.
 """
 
 import json
+import uuid
 import logging
 from typing import Any, Callable, Dict, List, Optional
 
@@ -218,6 +219,7 @@ class SlackToOHandler:
             "title": {"type": "plain_text", "text": f"{self.telescope} ToO Request Form"},
             "submit": {"type": "plain_text", "text": "Submit Request"},
             "close":  {"type": "plain_text", "text": "Cancel"},
+            "notify_on_close": True,   # → view_closed: release the SMTP pre-warm
             "blocks": [
                 # Header
                 {
@@ -362,6 +364,7 @@ class SlackToOHandler:
             "title": {"type": "plain_text", "text": "RASA36 ToO Request Form"},
             "submit": {"type": "plain_text", "text": "Submit Request"},
             "close":  {"type": "plain_text", "text": "Cancel"},
+            "notify_on_close": True,   # → view_closed: release the SMTP pre-warm
             "blocks": [
                 {
                     "type": "section",
@@ -514,6 +517,13 @@ class SlackToOHandler:
             ack()
             self._on_modal_submit(body, client, view)
 
+        # Sent because the modal sets notify_on_close: the form was cancelled,
+        # so the SMTP connection pre-warmed when it opened can be closed.
+        @app.view_closed(self.callback_id)
+        def handle_modal_closed(ack, body, view):
+            ack()
+            self._emailer.release_prewarm(self._lease_from(view))
+
         logger.info(f"Slack ToO handlers registered ({self.telescope})")
 
     def _prepend_duplicate_warning(
@@ -588,13 +598,34 @@ class SlackToOHandler:
         user_email = self._slack.get_user_email(user_id) or ""
         payload["_channel_id"] = channel_id
         payload["_message_ts"] = message_ts
-        self.create_too_modal(trigger_id, user_email, payload)
+        # Pre-warm SMTP while the person fills in the form; the lease rides in
+        # the modal's private_metadata and is given back on submit or cancel.
+        token = f"manual:{self.telescope}:{uuid.uuid4().hex[:8]}"
+        self._emailer.prewarm(token, self._emailer.PREWARM_HOLD_MANUAL_SEC)
+        payload["_smtp_lease"] = token
+        if not self.create_too_modal(trigger_id, user_email, payload):
+            self._emailer.release_prewarm(token)
+
+    @staticmethod
+    def _lease_from(view: Dict[str, Any]) -> Optional[str]:
+        try:
+            return json.loads(view.get("private_metadata") or "{}").get("_smtp_lease")
+        except (json.JSONDecodeError, AttributeError):
+            return None
 
     # ------------------------------------------------------------------
     # Private: modal submission handler
     # ------------------------------------------------------------------
 
     def _on_modal_submit(self, body: Dict[str, Any], client, view: Dict[str, Any]) -> None:
+        try:
+            self._submit(body, client, view)
+        finally:
+            # Normally the send already gave the lease back; this covers the
+            # early-return and exception paths (releasing twice is harmless).
+            self._emailer.release_prewarm(self._lease_from(view))
+
+    def _submit(self, body: Dict[str, Any], client, view: Dict[str, Any]) -> None:
         user_id    = body["user"]["id"]
         channel_id = body.get("container", {}).get("channel_id") or self._slack.channel
 
@@ -617,6 +648,7 @@ class SlackToOHandler:
 
         thread_ts  = notice_data.pop("_message_ts", None)
         thread_channel = notice_data.pop("_channel_id", None) or channel_id
+        lease      = notice_data.pop("_smtp_lease", None)
 
         # Build too_config from form
         if self.telescope == "RASA36":
@@ -651,7 +683,7 @@ class SlackToOHandler:
         merged = {**notice_data, "Name": form_data.get("target", notice_data.get("Name", ""))}
 
         username = self._slack.get_user_display_name(user_id)
-        success  = self._emailer.send_too_email(merged, too_config=too_config)
+        success  = self._emailer.send_too_email(merged, too_config=too_config, release_token=lease)
 
         post_channel = thread_channel or channel_id
         if success:

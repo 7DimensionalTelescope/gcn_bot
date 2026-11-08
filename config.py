@@ -108,10 +108,11 @@ _DEFAULTS: Dict[str, Any] = {
     # Deferred-ToO scheduler tick — how often (seconds) pending "observable soon"
     # ToOs are checked for whether they are due to fire.
     "TOO_DEFERRED_CHECK_INTERVAL_SEC": 30.0,
-    # Persistent SMTP connection for ToO emails: keep one logged-in connection
-    # per telescope open and NOOP it this often (seconds), so a send skips the
-    # TCP+TLS+AUTH handshake (~1.5-2 s). 0 = open a new connection per send.
-    "SMTP_KEEPALIVE_SEC": 60.0,
+    # Pre-warm the ToO SMTP connection when a send becomes likely (notice
+    # arrival, manual form opened, deferred ToO about to fire) so the send
+    # skips TCP+TLS+AUTH (~1.1-1.5 s); closed again as soon as it is unused.
+    # False = every send opens and closes its own connection.
+    "SMTP_PREWARM": True,
 
     # Email credentials
     "EMAIL_FROM": "",
@@ -466,11 +467,9 @@ class BotConfig:
         ))
 
     @property
-    def smtp_keepalive_sec(self) -> float:
-        """Interval (s) between SMTP keep-alive NOOPs; 0 disables the persistent connection."""
-        return max(0.0, float(self.__dict__.get(
-            "smtp_keepalive_sec", _DEFAULTS["SMTP_KEEPALIVE_SEC"],
-        )))
+    def smtp_prewarm(self) -> bool:
+        """Pre-warm the ToO SMTP connection ahead of a likely send."""
+        return bool(self.__dict__.get("smtp_prewarm", _DEFAULTS["SMTP_PREWARM"]))
 
     @property
     def email_from(self) -> str:
