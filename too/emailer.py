@@ -127,6 +127,17 @@ _GRB_FACILITIES: frozenset = frozenset({
     "EinsteinProbe", "SVOM",
 })
 
+# Facility-name prefixes treated as GRB sources. SVOM notices are tagged with
+# the instrument ("SVOM-GRM", "SVOM-ECLAIRs", "SVOM-MXT"; see
+# GCNNoticeHandler.SVOM_FACILITY_MAP), so an exact match on "SVOM" never hits.
+_GRB_FACILITY_PREFIXES: tuple = ("SVOM",)
+
+
+def _is_grb_facility(facility: Any) -> bool:
+    """True if *facility* is a GRB source (exact name or SVOM-* instrument)."""
+    name = str(facility or "").strip()
+    return name in _GRB_FACILITIES or name.startswith(_GRB_FACILITY_PREFIXES)
+
 
 # Fallback for how many hours ahead of the target rising an auto-ToO may still
 # fire (so the request can be queued before the target is up). The live value
@@ -332,7 +343,7 @@ class GCNToOEmailer:
         # GRB-only gate: RASA36 auto-ToO fires for GRBs, not neutrino/GW alerts.
         if self.auto_too_grb_only:
             facility = str(notice_data.get("Facility", "")).strip()
-            if facility not in _GRB_FACILITIES:
+            if not _is_grb_facility(facility):
                 logger.info(
                     f"Auto-ToO suppressed: facility '{facility}' is not a GRB source"
                 )
