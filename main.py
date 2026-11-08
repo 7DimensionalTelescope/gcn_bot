@@ -138,6 +138,7 @@ class GCNBot:
             output_csv=config.output_circular_csv,
             output_ascii=config.output_ascii,
             ascii_max_events=config.ascii_max_events,
+            file_lock=self.notice_handler.file_lock,  # same ASCII file → same lock
         )
 
         # --- Visibility ---

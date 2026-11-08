@@ -31,7 +31,7 @@ import shutil
 import time
 from datetime import datetime, timezone
 from string import ascii_lowercase, ascii_uppercase
-from threading import Lock
+from threading import Lock, RLock
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import voeventparse as vp
@@ -178,7 +178,10 @@ class GCNNoticeHandler:
         self.output_ascii = output_ascii
         self.ascii_max_events = ascii_max_events
         self.strict_parsing = strict_parsing
-        self.file_lock = Lock()
+        # Re-entrant and shared with GCNCircularHandler (see main.py): both write
+        # grb_targets.ascii, and the deferred-ToO scheduler / Slack-button threads
+        # write it too, so one lock must cover every read-modify-write.
+        self.file_lock = RLock()
         self.thread_index_path = thread_index_path
         self._thread_index_max_age = thread_index_max_age_days * 86400.0
         self._thread_index_lock = Lock()

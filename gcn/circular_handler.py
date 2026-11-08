@@ -98,11 +98,15 @@ class GCNCircularHandler:
         output_csv: str = "gcn_circulars.csv",
         output_ascii: str = "grb_targets.ascii",
         ascii_max_events: int = 10,
+        file_lock: Optional[Any] = None,
     ) -> None:
         self.output_csv = output_csv
         self.output_ascii = output_ascii
         self.ascii_max_events = ascii_max_events
-        self.file_lock = threading.Lock()
+        # Pass GCNNoticeHandler.file_lock so both handlers serialise their
+        # read-modify-write of the shared ASCII file (a private lock per handler
+        # cannot prevent a lost update between them).
+        self.file_lock = file_lock if file_lock is not None else threading.RLock()
 
     # ==================================================================
     # Public API
