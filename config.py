@@ -49,6 +49,7 @@ _DEFAULTS: Dict[str, Any] = {
     "TURN_ON_NOTICE": True,
     "OUTPUT_NOTICE_CSV": "gcn_notices.csv",
     "OUTPUT_ASCII": "grb_targets.ascii",
+    "OUTPUT_THREAD_INDEX": "thread_index.json",  # event → Slack thread_ts (survives ASCII trimming)
     "ASCII_MAX_EVENTS": 10,
 
     # Circular storage
@@ -307,6 +308,11 @@ class BotConfig:
     @property
     def output_ascii(self) -> str:
         raw = str(self.__dict__.get("output_ascii", _DEFAULTS["OUTPUT_ASCII"]))
+        return self._resolve_path(raw)
+
+    @property
+    def output_thread_index(self) -> str:
+        raw = str(self.__dict__.get("output_thread_index", _DEFAULTS["OUTPUT_THREAD_INDEX"]))
         return self._resolve_path(raw)
 
     @property

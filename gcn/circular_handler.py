@@ -577,6 +577,24 @@ class GCNCircularHandler:
         except Exception as exc:
             logger.error(f"Error updating circular CSV: {exc}", exc_info=True)
 
+    @staticmethod
+    def _circular_time_utc(data: Dict[str, Any]) -> str:
+        """Circular publication time as ``YYYY-MM-DD HH:MM:SS`` UTC (now if unknown)."""
+        raw = str(data.get("created_on") or "").replace("_", " ").strip()
+        if raw and not pd.isna(pd.to_datetime(raw, errors="coerce")):
+            return raw
+        return datetime.now(tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+
+    @staticmethod
+    def _recency(df: pd.DataFrame) -> pd.Series:
+        """UTC recency key for trimming: Last_Update, falling back to Notice_date.
+
+        Kept identical to ``GCNNoticeHandler._recency`` so both writers trim the
+        shared ASCII file by the same ordering.
+        """
+        upd = pd.to_datetime(df["Last_Update"], errors="coerce", utc=True)
+        return upd.fillna(pd.to_datetime(df["Notice_date"], errors="coerce", utc=True))
+
     def _update_ascii(self, data: Dict[str, Any]) -> None:
         import csv as _csv
         try:
@@ -606,7 +624,10 @@ class GCNCircularHandler:
                 elif "arcmin" in unit:
                     error_deg = error_deg / 60.0
 
-            now        = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            # Stamp rows with the circular's own publication time (UTC), not the
+            # processing time: a replayed/late old circular must not look like
+            # the freshest event and push live ones out of the trimmed ASCII file.
+            now        = self._circular_time_utc(data)
             event_id   = data.get("event_id") or data.get("event_name")
             event_name = data.get("event_name") or event_id
             facility   = data["facility"]
@@ -668,7 +689,10 @@ class GCNCircularHandler:
                 if cid not in current_gcn.split(","):
                     df.at[existing_idx, "GCN_ID"] = f"{current_gcn},{cid}" if current_gcn else cid
 
-                df.at[existing_idx, "Last_Update"] = now
+                # Never move an existing row backwards (old circular on a live row).
+                prev_upd = pd.to_datetime(df.at[existing_idx, "Last_Update"], errors="coerce", utc=True)
+                if pd.isna(prev_upd) or pd.Timestamp(now, tz="UTC") > prev_upd:
+                    df.at[existing_idx, "Last_Update"] = now
 
                 if data.get("redshift") is not None:
                     df.at[existing_idx, "Redshift"] = f"{data['redshift']:.1f}"
@@ -703,7 +727,12 @@ class GCNCircularHandler:
 
             # Trim
             if len(df) > self.ascii_max_events:
-                df = df.sort_values("Last_Update", ascending=False).head(self.ascii_max_events)
+                df = (
+                    df.assign(_sort=self._recency(df))
+                    .sort_values("_sort", ascending=False, na_position="last")
+                    .head(self.ascii_max_events)
+                    .drop(columns=["_sort"])
+                )
 
             # Backup + write (same format as notice_handler: space-separated, QUOTE_NONNUMERIC)
             self._create_backup(self.output_ascii)

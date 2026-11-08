@@ -151,6 +151,7 @@ class GCNBot:
             output_csv=config.output_notice_csv,
             output_ascii=config.output_ascii,
             ascii_max_events=config.ascii_max_events,
+            thread_index_path=config.output_thread_index,
         )
         self.circular_handler = GCNCircularHandler(
             output_csv=config.output_circular_csv,
@@ -481,11 +482,22 @@ class GCNBot:
                 )
                 if existing_event and isinstance(existing_event, dict):
                     existing_thread_ts = existing_event.get("thread_ts", "")
-                    is_update = bool(existing_thread_ts)
                     logger.info(
                         f"Existing event found for {facility} #{trigger_num} "
                         f"(thread_ts={existing_thread_ts})"
                     )
+                if not existing_thread_ts:
+                    # Row evicted from the 10-row ASCII file, or re-created by a
+                    # circular without a thread_ts — recover the original thread.
+                    indexed = self.notice_handler.lookup_thread(facility, trigger_num)
+                    if indexed:
+                        existing_thread_ts = indexed["thread_ts"]
+                        existing_event = existing_event if isinstance(existing_event, dict) else {}
+                        logger.info(
+                            f"Recovered thread_ts={existing_thread_ts} from thread index "
+                            f"for {facility} #{trigger_num}"
+                        )
+                is_update = bool(existing_thread_ts)
             except Exception as exc:
                 logger.error(f"Error looking up existing event: {exc}")
 

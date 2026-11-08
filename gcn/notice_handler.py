@@ -56,6 +56,12 @@ class GCNNoticeHandler:
     strict_parsing : bool
         When ``True``, a notice is rejected unless *all* regex patterns match.
         When ``False`` (default), partial matches are accepted.
+    thread_index_path : str, optional
+        JSON file mapping ``facility-family|trigger`` → Slack ``thread_ts``.
+        Unlike the ASCII file (trimmed to ``ascii_max_events`` rows, and rows
+        can be re-created by circulars without a ``thread_ts``) this survives
+        eviction, so a late notice still lands in its original thread.
+        ``None`` disables the index.
     """
 
     # ------------------------------------------------------------------
@@ -165,12 +171,17 @@ class GCNNoticeHandler:
         output_ascii: str = "grb_targets.ascii",
         ascii_max_events: int = 10,
         strict_parsing: bool = False,
+        thread_index_path: Optional[str] = None,
+        thread_index_max_age_days: float = 30.0,
     ) -> None:
         self.output_csv = output_csv
         self.output_ascii = output_ascii
         self.ascii_max_events = ascii_max_events
         self.strict_parsing = strict_parsing
         self.file_lock = Lock()
+        self.thread_index_path = thread_index_path
+        self._thread_index_max_age = thread_index_max_age_days * 86400.0
+        self._thread_index_lock = Lock()
 
     # ==================================================================
     # Public API
@@ -227,6 +238,9 @@ class GCNNoticeHandler:
         existing_idx = self._find_index(df, facility, trigger_num)
         if existing_idx is not None:
             notice_data["Name"] = df.at[existing_idx, "Name"]
+        elif (indexed := self.lookup_thread(facility, trigger_num)) and indexed.get("name"):
+            # Row was evicted from the ASCII file; keep the name already shown in Slack.
+            notice_data["Name"] = indexed["name"]
         else:
             notice_data["Name"] = self._generate_name(
                 notice_data.get("Discovery_UTC"), facility, df
@@ -289,9 +303,15 @@ class GCNNoticeHandler:
                 if too_sent:
                     self._set_too_flags(df, row_idx, too_sent)
 
+                if thread_ts:
+                    self.record_thread(
+                        facility, trigger_num, thread_ts,
+                        str(df.at[row_idx, "Name"]).strip().strip('"'),
+                    )
+
                 # Trim to max events
                 if len(df) > self.ascii_max_events:
-                    df["_sort"] = pd.to_datetime(df["Notice_date"], errors="coerce", utc=True)
+                    df["_sort"] = self._recency(df)
                     df = (
                         df.sort_values("_sort", ascending=False, na_position="last")
                         .head(self.ascii_max_events)
@@ -314,6 +334,77 @@ class GCNNoticeHandler:
         except Exception as exc:
             logger.error(f"Critical error in save_to_ascii: {exc}", exc_info=True)
             return False
+
+    # ------------------------------------------------------------------
+    # Thread index (facility-family|trigger → Slack thread_ts)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _recency(df: pd.DataFrame) -> pd.Series:
+        """UTC recency key for trimming: Last_Update, falling back to Notice_date.
+
+        Kept identical to ``GCNCircularHandler._recency`` so both writers trim
+        the shared ASCII file by the same ordering.
+        """
+        upd = pd.to_datetime(df["Last_Update"], errors="coerce", utc=True)
+        return upd.fillna(pd.to_datetime(df["Notice_date"], errors="coerce", utc=True))
+
+    def _thread_key(self, facility: str, trigger_num: str) -> str:
+        return f"{self._normalize_facility(facility)}|{str(trigger_num).strip()}"
+
+    def _load_thread_index(self) -> Dict[str, Any]:
+        try:
+            with open(self.thread_index_path, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+            return data if isinstance(data, dict) else {}
+        except FileNotFoundError:
+            return {}
+        except Exception as exc:
+            logger.warning(f"Could not read thread index {self.thread_index_path}: {exc}")
+            return {}
+
+    def record_thread(
+        self, facility: str, trigger_num: str, thread_ts: str, name: str = ""
+    ) -> None:
+        """Remember which Slack thread an event lives in (survives ASCII trimming)."""
+        facility = str(facility).strip()
+        trigger_num = str(trigger_num).strip()
+        thread_ts = str(thread_ts).strip()
+        if not (self.thread_index_path and facility and trigger_num and thread_ts):
+            return
+        try:
+            with self._thread_index_lock:
+                data = self._load_thread_index()
+                data[self._thread_key(facility, trigger_num)] = {
+                    "thread_ts": thread_ts, "name": name,
+                }
+                # Prune by thread_ts epoch so the file cannot grow without bound.
+                cutoff = time.time() - self._thread_index_max_age
+                data = {
+                    k: v for k, v in data.items()
+                    if self._ts_epoch(v.get("thread_ts")) >= cutoff
+                }
+                tmp = f"{self.thread_index_path}.tmp"
+                with open(tmp, "w", encoding="utf-8") as fh:
+                    json.dump(data, fh, indent=1)
+                os.replace(tmp, self.thread_index_path)
+        except Exception as exc:
+            logger.error(f"record_thread failed: {exc}")
+
+    @staticmethod
+    def _ts_epoch(thread_ts: Any) -> float:
+        try:
+            return float(str(thread_ts))
+        except ValueError:
+            return float("inf")  # unparsable → keep
+
+    def lookup_thread(self, facility: str, trigger_num: str) -> Optional[Dict[str, Any]]:
+        """Return ``{thread_ts, name}`` recorded for the event, or ``None``."""
+        if not (self.thread_index_path and facility and trigger_num):
+            return None
+        with self._thread_index_lock:
+            entry = self._load_thread_index().get(self._thread_key(facility, trigger_num))
+        return entry if entry and entry.get("thread_ts") else None
 
     # ------------------------------------------------------------------
     # ToO-sent state (duplicate-send guard)

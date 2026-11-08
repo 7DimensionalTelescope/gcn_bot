@@ -34,6 +34,7 @@ MIN_MOON_SEP = 30  # degrees from moon
 # ---------------------------------------------------------------------------
 OUTPUT_NOTICE_CSV   = "gcn_notices.csv"
 OUTPUT_ASCII        = "grb_targets.ascii"
+OUTPUT_THREAD_INDEX    = "thread_index.json"   # event → Slack thread_ts; survives ASCII trimming so late notices still thread
 ASCII_MAX_EVENTS    = 10
 OUTPUT_CIRCULAR_CSV = "gcn_circular.csv"
 
