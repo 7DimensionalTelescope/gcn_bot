@@ -222,10 +222,11 @@ class MessageFormatter:
             ]
         }
 
-    # Fermi GBM sends up to three position notices per trigger; say which one
-    # an update is (FIN_POS supersedes the automated ground position).
+    # Fermi sends several position notices per trigger; say which one an update
+    # is (GBM FIN_POS supersedes the automated ground position; LAT POS_UPD is
+    # the LAT's own on-board localization, 1-2 deg within ~30 s).
     _NOTICE_KINDS = (("FIN_POS", "Final Position"), ("GND_POS", "Ground Position"),
-                     ("FLT_POS", "Flight Position"))
+                     ("FLT_POS", "Flight Position"), ("LAT_POS_UPD", "Updated Position"))
 
     def notice_kind(self, topic: str) -> str:
         """``"Final Position"`` etc. for a GBM position topic, ``""`` otherwise."""

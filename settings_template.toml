@@ -105,6 +105,7 @@ DISPLAY_TOPICS = [
   # Fermi
   "gcn.classic.text.FERMI_GBM_GND_POS",
   "gcn.classic.text.FERMI_GBM_FIN_POS",
+  "gcn.classic.text.FERMI_LAT_POS_UPD",
   "gcn.classic.text.FERMI_LAT_OFFLINE",
   # Swift
   "gcn.classic.text.SWIFT_BAT_GRB_POS_ACK",

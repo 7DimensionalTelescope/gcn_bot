@@ -127,7 +127,7 @@ class GCNNoticeHandler:
         "SwiftXRT":       ["SWIFT_XRT_POSITION"],
         "SwiftUVOT":      ["SWIFT_UVOT_POS"],
         "FermiGBM":       ["FERMI_GBM_GND_POS", "FERMI_GBM_FIN_POS", "FERMI_GBM_FLT_POS"],
-        "FermiLAT":       ["FERMI_LAT_OFFLINE"],
+        "FermiLAT":       ["FERMI_LAT_OFFLINE", "FERMI_LAT_POS_UPD"],
         "AMON":           ["AMON_NU_EM_COINC"],
         "IceCubeCASCADE": ["ICECUBE_CASCADE"],
         "HAWC":           ["HAWC_BURST_MONITOR"],
