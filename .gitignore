@@ -199,3 +199,7 @@ too_request*
 *test*.ascii*
 *test*.csv
 *test*
+
+# runtime state files written by the bot
+thread_index.json
+too_slots.json
