@@ -78,6 +78,9 @@ class DBTileChecker:
     def available(self) -> bool:
         return self._client is not None
 
+    # Tile IDs per request (the IDs travel in the URL; see count_existing).
+    _QUERY_CHUNK = 500
+
     def count_existing(self, tile_ids: List[str]) -> Optional[int]:
         """
         Return how many of ``tile_ids`` exist in the GWPortal tile database.
@@ -94,12 +97,18 @@ class DBTileChecker:
         """
         if not self.available or not tile_ids:
             return None
+        ids = [str(t) for t in tile_ids]
+        total = 0
         try:
-            response = self._client.query_tiles(
-                tile_name=",".join(str(t) for t in tile_ids),
-                page_size=len(tile_ids),
-            )
-            return int(response.get("count", 0))
+            # The IDs go in the query string: 1045 and 1727 of them overflowed the
+            # URL (HTTP 414) while 569 worked, so ask in chunks of _QUERY_CHUNK.
+            for i in range(0, len(ids), self._QUERY_CHUNK):
+                chunk = ids[i:i + self._QUERY_CHUNK]
+                response = self._client.query_tiles(
+                    tile_name=",".join(chunk), page_size=len(chunk),
+                )
+                total += int(response.get("count", 0))
+            return total
         except Exception as exc:
             logger.error(f"DBTileChecker: tile query failed: {exc}")
             return None
