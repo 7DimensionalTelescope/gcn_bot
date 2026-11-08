@@ -20,7 +20,7 @@ Usage::
 import logging
 import threading
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Callable, List, Optional
 
 logger = logging.getLogger(__name__)
@@ -107,6 +107,7 @@ class GCNConsumer:
                 if topic == self.HEARTBEAT_TOPIC:
                     self._update_heartbeat()
                 else:
+                    self._log_kafka_latency(msg)
                     try:
                         on_message(topic, value)
                     except Exception as exc:
@@ -116,6 +117,28 @@ class GCNConsumer:
                 logger.error(f"Error in polling loop: {exc}", exc_info=True)
                 if self._running:
                     time.sleep(5)
+
+    @staticmethod
+    def _log_kafka_latency(msg) -> None:
+        """Log the broker timestamp and how long the message waited before we got it.
+
+        ``broker_ts`` is stamped on the GCN side, so it is independent of this
+        machine's clock; ``lag`` (local now − broker_ts) is the Kafka→bot leg
+        and is only as accurate as the local clock (NTP).
+        """
+        try:
+            ts_type, ts_ms = msg.timestamp()
+            if ts_ms is None or ts_ms < 0:
+                return
+            lag = time.time() - ts_ms / 1000.0
+            broker_ts = datetime.fromtimestamp(ts_ms / 1000.0, tz=timezone.utc)
+            logger.info(
+                f"Kafka timestamp: topic={msg.topic()} offset={msg.offset()} "
+                f"broker_ts={broker_ts:%Y-%m-%d %H:%M:%S}Z "
+                f"(type={ts_type}) lag={lag:.1f}s"
+            )
+        except Exception as exc:
+            logger.debug(f"Could not read Kafka timestamp: {exc}")
 
     def stop(self) -> None:
         """Signal the polling loop to exit and close the consumer."""
