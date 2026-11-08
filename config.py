@@ -51,6 +51,9 @@ _DEFAULTS: Dict[str, Any] = {
     "OUTPUT_ASCII": "grb_targets.ascii",
     "OUTPUT_TOO_SLOTS": "too_slots.json",  # per-event Auto-ToO Slack status message state
     "OUTPUT_THREAD_INDEX": "thread_index.json",  # event → Slack thread_ts (survives ASCII trimming)
+    # Days an event stays in the thread index — also how long late notices and
+    # follow-up circulars can still find the event's Slack thread.
+    "THREAD_INDEX_MAX_AGE_DAYS": 30.0,
     "ASCII_MAX_EVENTS": 10,
 
     # Circular storage
@@ -324,6 +327,13 @@ class BotConfig:
     def output_thread_index(self) -> str:
         raw = str(self.__dict__.get("output_thread_index", _DEFAULTS["OUTPUT_THREAD_INDEX"]))
         return self._resolve_path(raw)
+
+    @property
+    def thread_index_max_age_days(self) -> float:
+        """Retention of thread-index entries, in days (floored at 1)."""
+        return max(1.0, float(self.__dict__.get(
+            "thread_index_max_age_days", _DEFAULTS["THREAD_INDEX_MAX_AGE_DAYS"],
+        )))
 
     @property
     def ascii_max_events(self) -> int:

@@ -36,6 +36,7 @@ OUTPUT_NOTICE_CSV   = "gcn_notices.csv"
 OUTPUT_ASCII        = "grb_targets.ascii"
 OUTPUT_TOO_SLOTS    = "too_slots.json"   # Auto-ToO status message state (Slack ts + lines per event thread)
 OUTPUT_THREAD_INDEX    = "thread_index.json"   # event → Slack thread_ts; survives ASCII trimming so late notices still thread
+THREAD_INDEX_MAX_AGE_DAYS = 30   # days an event's Slack thread stays findable for late notices and follow-up circulars
 ASCII_MAX_EVENTS    = 10
 OUTPUT_CIRCULAR_CSV = "gcn_circular.csv"
 

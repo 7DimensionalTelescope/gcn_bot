@@ -133,6 +133,7 @@ class GCNBot:
             output_ascii=config.output_ascii,
             ascii_max_events=config.ascii_max_events,
             thread_index_path=config.output_thread_index,
+            thread_index_max_age_days=config.thread_index_max_age_days,
         )
         self.circular_handler = GCNCircularHandler(
             output_csv=config.output_circular_csv,
@@ -322,6 +323,40 @@ class GCNBot:
         except Exception as exc:
             logger.error(f"Error processing circular from {topic}: {exc}", exc_info=True)
 
+    def _thread_from_index(self, processed: dict, event_name: Optional[str]) -> "tuple[str, str]":
+        """Look a circular's event up in the thread index; ``(thread_ts, via)`` or ``("", "")``.
+
+        Order: facility + trigger, then event name. A name hit is refused when the
+        circular explicitly names a *different* trigger of the same facility
+        family (the bot letters events in the order it sees them, so its "GRB
+        261029C" need not be GCN's).
+        """
+        nh = self.notice_handler
+        facility    = processed.get("facility")
+        trigger_num = processed.get("trigger_num")
+        try:
+            if facility and trigger_num:
+                entry = nh.lookup_thread(facility, trigger_num)
+                if entry:
+                    return entry["thread_ts"], "thread index (trigger)"
+            if event_name:
+                entry = nh.lookup_thread_by_name(event_name)
+                if entry:
+                    fam, _, idx_trigger = entry["key"].partition("|")
+                    if (facility and trigger_num
+                            and nh._normalize_facility(facility) == fam
+                            and str(trigger_num).strip() != idx_trigger):
+                        logger.info(
+                            f"Circular {processed.get('circular_id')}: name {event_name!r} is in "
+                            f"the thread index as {fam} #{idx_trigger}, but the circular cites "
+                            f"#{trigger_num} — not used"
+                        )
+                    else:
+                        return entry["thread_ts"], "thread index (name)"
+        except Exception as exc:
+            logger.error(f"Thread-index lookup for circular failed: {exc}")
+        return "", ""
+
     def _handle_circular_slack(self, processed: dict) -> None:
         """Post a message to the matching Slack thread for a processed circular.
 
@@ -365,10 +400,13 @@ class GCNBot:
         ascii_event: Optional[dict] = None
         name_corrected: Optional[tuple] = None  # (old_name, new_name) if a rename occurred
 
-        # Pass 1 — match by official event_id in the Name column (space-insensitive)
-        if event_id:
+        # Event name: GCN's official eventId, else the name parsed from the subject.
+        event_name = event_id or processed.get("event_name")
+
+        # Pass 1 — match by event name in the Name column (space-insensitive)
+        if event_name:
             try:
-                ascii_event = self.notice_handler.find_event_by_name(event_id)
+                ascii_event = self.notice_handler.find_event_by_name(event_name)
             except Exception as exc:
                 logger.error(f"find_event_by_name failed: {exc}")
 
@@ -399,18 +437,29 @@ class GCNBot:
             except Exception as exc:
                 logger.error(f"find_existing_event failed: {exc}")
 
-        if ascii_event is None:
+        thread_ts = ""
+        via = ""
+        if ascii_event is not None:
+            thread_ts = str(ascii_event.get("thread_ts", "")).strip().strip('"')
+            via = "ASCII"
+
+        # Pass 3 — the thread index (30 d) when the ASCII file (10 rows) has no
+        # usable row: the event was trimmed out, or a circular re-created its row
+        # without a thread_ts. Thread-only: ASCII row fixes (renames) are skipped.
+        if not thread_ts:
+            thread_ts, via = self._thread_from_index(processed, event_name)
+            if thread_ts:
+                ascii_event = None
+
+        if not thread_ts:
+            reason = "no ASCII match" if ascii_event is None else "ASCII row has no thread_ts"
             logger.info(
-                f"No ASCII match for circular {circular_id} "
-                f"(event_id={event_id!r}, facility={facility!r}, trigger={trigger_num!r}) "
+                f"Circular {circular_id}: {reason} and not in the thread index "
+                f"(event={event_name!r}, facility={facility!r}, trigger={trigger_num!r}) "
                 "— skipping Slack post"
             )
             return
-
-        thread_ts = str(ascii_event.get("thread_ts", "")).strip().strip('"')
-        if not thread_ts:
-            logger.info(f"Circular {circular_id}: ASCII row has no thread_ts — skipping Slack post")
-            return
+        logger.info(f"Circular {circular_id}: matched thread {thread_ts} via {via}")
 
         # ---- Post rename notification first (if name was corrected via trigger match) ----
         if name_corrected and self.send_to_slack:
@@ -434,7 +483,7 @@ class GCNBot:
             # Update ASCII Name to the official event_id if it was provisional
             # (only needed if Pass 1 matched with a space difference; Pass 2 renames
             # are already handled above by name_corrected).
-            if event_id:
+            if event_id and ascii_event is not None:
                 old_name = str(ascii_event.get("Name", "")).strip().strip('"')
                 if old_name.lower().replace(" ", "") != event_id.lower().replace(" ", ""):
                     try:

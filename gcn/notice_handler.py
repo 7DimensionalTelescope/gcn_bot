@@ -310,6 +310,7 @@ class GCNNoticeHandler:
                     self.record_thread(
                         facility, trigger_num, thread_ts,
                         str(df.at[row_idx, "Name"]).strip().strip('"'),
+                        str(df.at[row_idx, "Discovery_UTC"]).strip().strip('"'),
                     )
 
                 # Trim to max events
@@ -367,9 +368,14 @@ class GCNNoticeHandler:
             return {}
 
     def record_thread(
-        self, facility: str, trigger_num: str, thread_ts: str, name: str = ""
+        self, facility: str, trigger_num: str, thread_ts: str, name: str = "",
+        discovery_utc: str = "",
     ) -> None:
-        """Remember which Slack thread an event lives in (survives ASCII trimming)."""
+        """Remember which Slack thread an event lives in (survives ASCII trimming).
+
+        ``discovery_utc`` (trigger time, UTC) lets a circular that names the
+        event only by time ("EP Alert 261106.58") find the thread later.
+        """
         facility = str(facility).strip()
         trigger_num = str(trigger_num).strip()
         thread_ts = str(thread_ts).strip()
@@ -378,9 +384,11 @@ class GCNNoticeHandler:
         try:
             with self._thread_index_lock:
                 data = self._load_thread_index()
-                data[self._thread_key(facility, trigger_num)] = {
-                    "thread_ts": thread_ts, "name": name,
-                }
+                entry = {"thread_ts": thread_ts, "name": name}
+                discovery_utc = str(discovery_utc or "").strip()
+                if discovery_utc and discovery_utc.lower() != "nan":
+                    entry["discovery_utc"] = discovery_utc
+                data[self._thread_key(facility, trigger_num)] = entry
                 # Prune by thread_ts epoch so the file cannot grow without bound.
                 cutoff = time.time() - self._thread_index_max_age
                 data = {
@@ -408,6 +416,31 @@ class GCNNoticeHandler:
         with self._thread_index_lock:
             entry = self._load_thread_index().get(self._thread_key(facility, trigger_num))
         return entry if entry and entry.get("thread_ts") else None
+
+    @staticmethod
+    def _name_key(name: Any) -> str:
+        return str(name or "").strip().strip('"').lower().replace(" ", "")
+
+    def lookup_thread_by_name(self, name: str) -> Optional[Dict[str, Any]]:
+        """Return the index entry whose event name matches *name*, plus its ``key``.
+
+        Same comparison as :meth:`find_event_by_name` (case- and space-
+        insensitive). ``None`` when nothing — or more than one entry — matches,
+        so an ambiguous name never picks a thread.
+        """
+        target = self._name_key(name)
+        if not (self.thread_index_path and target):
+            return None
+        with self._thread_index_lock:
+            data = self._load_thread_index()
+        hits = [
+            {**v, "key": k} for k, v in data.items()
+            if v.get("thread_ts") and self._name_key(v.get("name")) == target
+        ]
+        if len(hits) > 1:
+            logger.info(f"Thread index: name {name!r} is ambiguous ({len(hits)} events) — not used")
+            return None
+        return hits[0] if hits else None
 
     # ------------------------------------------------------------------
     # ToO-sent state (duplicate-send guard)
