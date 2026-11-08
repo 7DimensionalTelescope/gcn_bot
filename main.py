@@ -233,6 +233,7 @@ class GCNBot:
             too_config=config.too_config,
             telescope="7DT",
             on_sent=self.notice_handler.mark_too_sent,
+            sent_at_provider=self.notice_handler.too_sent_at,
         )
         self.too_handler_rasa36 = SlackToOHandler(
             slack=self.slack,
@@ -241,6 +242,7 @@ class GCNBot:
             too_config=config.too_config,
             telescope="RASA36",
             on_sent=self.notice_handler.mark_too_sent,
+            sent_at_provider=self.notice_handler.too_sent_at,
             defaults_provider=self._rasa36_form_config,
         )
 

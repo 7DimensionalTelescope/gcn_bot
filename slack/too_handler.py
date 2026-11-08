@@ -43,6 +43,11 @@ class SlackToOHandler:
         (e.g. ``"too-operators"`` or ``"7dt"``).
     too_config : dict | None
         Default observation parameters to pre-populate the modal (7DT).
+    sent_at_provider : callable | None
+        ``provider(facility, trigger_num, telescope) -> str`` returning the UTC
+        timestamp of a ToO already sent for this event+telescope (``""`` if
+        none). When set, the modal opens with a warning so an operator does not
+        unknowingly send a second request (e.g. after the automatic one).
     defaults_provider : callable | None
         ``provider(notice_data) -> dict | None`` returning the observation
         config the *automatic* ToO would use for this event. The RASA36 form is
@@ -59,6 +64,7 @@ class SlackToOHandler:
         telescope: str = "7DT",
         on_sent: Optional[Callable[[str, str, str], None]] = None,
         defaults_provider: Optional[Callable[[Dict[str, Any]], Optional[Dict[str, Any]]]] = None,
+        sent_at_provider: Optional[Callable[[str, str, str], str]] = None,
     ) -> None:
         self._slack      = slack
         self._emailer    = emailer
@@ -71,6 +77,7 @@ class SlackToOHandler:
         # decoupled from the notice handler.
         self._on_sent    = on_sent
         self._defaults_provider = defaults_provider
+        self._sent_at_provider = sent_at_provider
         # Bolt routing keys — unique per telescope so multiple handlers coexist
         self.action_id   = f"submit_too_request_{telescope.lower()}"
         self.callback_id = f"too_request_modal_{telescope.lower()}"
@@ -321,6 +328,7 @@ class SlackToOHandler:
         }
 
         try:
+            self._prepend_duplicate_warning(modal, notice_data)
             self._slack.client.views_open(trigger_id=trigger_id, view=modal)
             logger.info("ToO modal opened successfully")
             return True
@@ -423,6 +431,7 @@ class SlackToOHandler:
         }
 
         try:
+            self._prepend_duplicate_warning(modal, notice_data)
             self._slack.client.views_open(trigger_id=trigger_id, view=modal)
             logger.info("RASA36 ToO modal opened successfully")
             return True
@@ -506,6 +515,39 @@ class SlackToOHandler:
             self._on_modal_submit(body, client, view)
 
         logger.info(f"Slack ToO handlers registered ({self.telescope})")
+
+    def _prepend_duplicate_warning(
+        self, modal: Dict[str, Any], notice_data: Dict[str, Any]
+    ) -> None:
+        """Put a warning at the top of *modal* if a ToO was already sent.
+
+        Not blocking: a second request can be legitimate (changed parameters),
+        so the operator is only told, and the form still submits.
+        """
+        if self._sent_at_provider is None:
+            return
+        facility = str(notice_data.get("Facility", "")).strip()
+        trigger  = str(notice_data.get("Trigger_num", "")).strip()
+        if not (facility and trigger):
+            return
+        try:
+            sent_at = self._sent_at_provider(facility, trigger, self.telescope)
+        except Exception as exc:
+            logger.warning(f"ToO already-sent lookup failed: {exc}")
+            return
+        if not sent_at:
+            return
+        modal["blocks"].insert(0, {
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": (
+                    f":warning: *A {self.telescope} ToO request was already sent for "
+                    f"this event* ({sent_at.replace('T', ' ')}).\n"
+                    "Submitting again will send a *second* request."
+                ),
+            },
+        })
 
     # ------------------------------------------------------------------
     # Private: button click handler

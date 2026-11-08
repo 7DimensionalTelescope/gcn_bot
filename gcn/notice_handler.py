@@ -423,34 +423,40 @@ class GCNNoticeHandler:
             if col:
                 df.at[idx, col] = stamp
 
-    def was_too_sent(
+    def too_sent_at(
         self, facility: str, trigger_num: str, telescope: str
-    ) -> bool:
-        """Return ``True`` if a ToO for this event+telescope was already sent.
+    ) -> str:
+        """Return the UTC marker timestamp of a prior ToO for this event+telescope.
 
         Looks the event up by ``(trigger_num, facility-family)`` — the same key
-        used for event dedup — and checks whether the telescope's marker column
-        is non-empty. Returns ``False`` when the row does not yet exist (a
-        brand-new event), so the first send always proceeds.
+        used for event dedup. Returns ``""`` when no ToO was sent, the event row
+        does not yet exist (a brand-new event, so the first send always
+        proceeds), or the lookup fails.
         """
         col = self._TOO_STATE_COLUMNS.get(telescope)
         if not col:
-            logger.warning(f"was_too_sent: unknown telescope '{telescope}'")
-            return False
+            logger.warning(f"too_sent_at: unknown telescope '{telescope}'")
+            return ""
         facility = str(facility).strip()
         trigger_num = str(trigger_num).strip()
         if not facility or not trigger_num:
-            return False
+            return ""
         try:
             with self.file_lock:
                 df = self._load_ascii()
                 idx = self._find_index(df, facility, trigger_num)
                 if idx is None:
-                    return False
-                return bool(str(df.at[idx, col]).strip())
+                    return ""
+                return str(df.at[idx, col]).strip()
         except Exception as exc:
-            logger.error(f"was_too_sent failed: {exc}")
-            return False
+            logger.error(f"too_sent_at failed: {exc}")
+            return ""
+
+    def was_too_sent(
+        self, facility: str, trigger_num: str, telescope: str
+    ) -> bool:
+        """Return ``True`` if a ToO for this event+telescope was already sent."""
+        return bool(self.too_sent_at(facility, trigger_num, telescope))
 
     def mark_too_sent(
         self, facility: str, trigger_num: str, telescope: str
