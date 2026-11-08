@@ -327,6 +327,9 @@ class GCNBot:
 
         Decision tree
         -------------
+        Re-published, identical → silent (``processed["dedup"] == "duplicate"``)
+        Re-published, edited    → :pencil2: reply, only if the subject changed or
+                                  it newly reports a false trigger
         False trigger  → :warning: thread reply
         First circular → :bell: thread reply with event-page URL
         Follow-up      → :memo: thread reply (subject hyperlink only)
@@ -343,6 +346,20 @@ class GCNBot:
 
         if not circular_id or not subject:
             return
+
+        # ---- GCN re-publishes: identical copies are silent; edits only when visible ----
+        dedup = processed.get("dedup", "new")
+        if dedup == "duplicate":
+            return
+        if dedup == "edited":
+            subject_changed = processed.get("prev_subject", "") != subject
+            newly_false     = is_false and not processed.get("prev_false_trigger", False)
+            if not (subject_changed or newly_false):
+                logger.info(
+                    f"Circular {circular_id}: edited without a subject / false-trigger "
+                    "change — databases updated, no Slack post"
+                )
+                return
 
         # ---- Find the matching ASCII event (two passes) ----
         ascii_event: Optional[dict] = None
@@ -407,7 +424,11 @@ class GCNBot:
         circular_url = f"https://gcn.nasa.gov/circulars/{circular_id}"
         link = f"<{circular_url}|{subject}>"
 
-        if is_false:
+        if dedup == "edited":
+            text = f":pencil2: *Circular updated* — {link}"
+            if is_false and not processed.get("prev_false_trigger", False):
+                text += "\n:warning: Now reports a *false trigger*."
+        elif is_false:
             text = f":warning: *False trigger* — {link}"
         elif is_first and event_page:
             # Update ASCII Name to the official event_id if it was provisional

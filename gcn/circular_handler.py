@@ -27,6 +27,7 @@ import glob
 import json
 import logging
 import os
+import hashlib
 import re
 import shutil
 import threading
@@ -58,6 +59,7 @@ class GCNCircularHandler:
         "circular_id", "event_name", "subject", "facility", "trigger_num",
         "ra", "dec", "error", "error_unit", "redshift", "redshift_error",
         "host_info", "false_trigger", "created_on", "processed_on",
+        "content_hash",
     ]
 
     ASCII_COLUMNS = [
@@ -107,6 +109,11 @@ class GCNCircularHandler:
         # read-modify-write of the shared ASCII file (a private lock per handler
         # cannot prevent a lost update between them).
         self.file_lock = file_lock if file_lock is not None else threading.RLock()
+        # circular_id -> {"hash", "subject", "false_trigger"} of the last version
+        # processed. GCN re-publishes circulars (bulk replays of old ones, and
+        # edited ones under the same ID); this lets an identical copy be skipped
+        # while an edit is still applied. Rebuilt from the CSV on start-up.
+        self._seen: Dict[str, Dict[str, Any]] = self._load_seen()
 
     # ==================================================================
     # Public API
@@ -122,20 +129,109 @@ class GCNCircularHandler:
         decoded the Kafka payload).
 
         Returns the processed result dict so callers can act on it (e.g. for
-        Slack thread notifications).
+        Slack thread notifications). Its ``dedup`` key is ``"new"``,
+        ``"edited"`` (same circular ID, different content — databases are
+        updated in place) or ``"duplicate"`` (identical copy of a circular
+        already processed — nothing is written and the dict carries only the
+        ID, subject and ``dedup``).
         """
         try:
             if isinstance(json_str_or_dict, dict):
                 data = json_str_or_dict
             else:
                 data = json.loads(json_str_or_dict)
+
+            content_hash = self._content_hash(data)
+            dedup, prev = self._classify_repeat(data, content_hash)
+            if dedup == "duplicate":
+                logger.info(
+                    f"Circular {data.get('circularId')} already processed with identical "
+                    f"content — skipping (GCN re-publish)"
+                )
+                return {
+                    "circular_id": data.get("circularId"),
+                    "subject":     data.get("subject", ""),
+                    "dedup":       "duplicate",
+                }
+
             processed = self.process_circular(data)
+            processed["content_hash"] = content_hash
+            processed["dedup"] = dedup
+            if dedup == "edited":
+                processed["prev_subject"] = prev.get("subject", "")
+                processed["prev_false_trigger"] = bool(prev.get("false_trigger"))
+                logger.info(
+                    f"Circular {processed.get('circular_id')} re-published with changed "
+                    f"content — updating"
+                )
             self._update_databases(processed)
+            self._remember(processed)
             logger.info(f"Processed circular {processed.get('circular_id')}")
             return processed
         except Exception as exc:
             logger.error(f"Error processing circular: {exc}", exc_info=True)
             return None
+
+    # ------------------------------------------------------------------
+    # Re-publish detection
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _content_hash(data: Dict[str, Any]) -> str:
+        text = f"{data.get('subject') or ''}\n{data.get('body') or ''}"
+        return hashlib.sha1(text.encode("utf-8", errors="replace")).hexdigest()
+
+    @staticmethod
+    def _as_bool(value: Any) -> bool:
+        return str(value).strip().lower() in ("true", "1", "yes")
+
+    def _load_seen(self) -> Dict[str, Dict[str, Any]]:
+        """Last processed version of every circular in the CSV (by circular_id)."""
+        seen: Dict[str, Dict[str, Any]] = {}
+        try:
+            if not os.path.exists(self.output_csv):
+                return seen
+            df = pd.read_csv(self.output_csv, dtype=str, keep_default_na=False)
+            if "circular_id" not in df.columns:
+                return seen
+            for row in df.to_dict("records"):          # later rows win
+                cid = str(row.get("circular_id", "")).strip()
+                if not cid:
+                    continue
+                seen[cid] = {
+                    "hash":          str(row.get("content_hash", "") or "").strip(),
+                    "subject":       str(row.get("subject", "") or ""),
+                    "false_trigger": self._as_bool(row.get("false_trigger", "")),
+                }
+        except Exception as exc:
+            logger.error(f"Could not load processed-circular index from CSV: {exc}")
+        return seen
+
+    def _classify_repeat(
+        self, data: Dict[str, Any], content_hash: str
+    ) -> "tuple[str, Dict[str, Any]]":
+        """Return ``("new"|"edited"|"duplicate", previous_entry)``."""
+        cid = str(data.get("circularId") or "").strip()
+        prev = self._seen.get(cid) if cid else None
+        if prev is None:
+            return "new", {}
+        if prev.get("hash"):
+            same = prev["hash"] == content_hash
+        else:
+            # Row written before hashes were stored: the subject is all we have.
+            same = prev.get("subject", "") == str(data.get("subject") or "")
+            if same:
+                prev["hash"] = content_hash   # later copies compare by hash
+        return ("duplicate" if same else "edited"), prev
+
+    def _remember(self, processed: Dict[str, Any]) -> None:
+        cid = str(processed.get("circular_id") or "").strip()
+        if cid:
+            self._seen[cid] = {
+                "hash":          processed.get("content_hash", ""),
+                "subject":       processed.get("subject", ""),
+                "false_trigger": bool(processed.get("false_trigger")),
+            }
 
     def process_circular(self, circular_data: Dict[str, Any]) -> Dict[str, Any]:
         """
@@ -566,18 +662,33 @@ class GCNCircularHandler:
                 logger.error(f"Error updating databases: {exc}", exc_info=True)
 
     def _update_csv(self, data: Dict[str, Any]) -> None:
+        """Insert the circular, or replace its row(s) if the ID is already there.
+
+        Read and written as text so trigger IDs keep their leading zeros and
+        numbers are not reformatted.
+        """
         try:
             if os.path.exists(self.output_csv):
-                df = pd.read_csv(self.output_csv)
+                df = pd.read_csv(self.output_csv, dtype=str, keep_default_na=False)
             else:
                 df = pd.DataFrame(columns=self.CSV_COLUMNS)
+            for col in self.CSV_COLUMNS:
+                if col not in df.columns:
+                    df[col] = ""
 
-            new_row = {col: data.get(col) for col in self.CSV_COLUMNS}
-            if new_row.get("trigger_num") is not None:
-                new_row["trigger_num"] = str(new_row["trigger_num"])
+            new_row = {
+                col: ("" if data.get(col) is None else str(data.get(col)))
+                for col in self.CSV_COLUMNS
+            }
+            cid = new_row["circular_id"]
+            replaced = bool(cid) and (df["circular_id"] == cid).any()
+            if replaced:
+                df = df[df["circular_id"] != cid]
             df = pd.concat([df, pd.DataFrame([new_row])], ignore_index=True)
             df.to_csv(self.output_csv, index=False)
-            logger.info(f"CSV updated with circular {data.get('circular_id')}")
+            logger.info(
+                f"CSV {'row replaced' if replaced else 'updated'} with circular {cid}"
+            )
         except Exception as exc:
             logger.error(f"Error updating circular CSV: {exc}", exc_info=True)
 
