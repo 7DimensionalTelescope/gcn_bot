@@ -132,6 +132,32 @@ class SlackManager:
             logger.error(f"Failed to send thread message: {exc.response['error']}")
             return None
 
+    def update_message(
+        self,
+        ts: str,
+        blocks: Optional[List[Dict[str, Any]]] = None,
+        text: str = "",
+        channel: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Edit an existing message in place (``chat.update``).
+
+        Returns the Slack API response dict, or ``None`` on failure.
+        """
+        target = channel or self.channel
+        try:
+            resp = self._client.chat_update(
+                channel=target,
+                ts=ts,
+                blocks=blocks or [],
+                text=text or "Update",
+            )
+            logger.info(f"Message updated (ts={ts})")
+            return resp.data
+        except SlackApiError as exc:
+            logger.error(f"Failed to update message {ts}: {exc.response['error']}")
+            return None
+
     def upload_file(
         self,
         thread_ts: str,
@@ -158,22 +184,6 @@ class SlackManager:
             return True
         except SlackApiError as exc:
             logger.error(f"Failed to upload file: {exc.response['error']}")
-            return False
-
-    def update_message(
-        self,
-        ts: str,
-        blocks: List[Dict[str, Any]],
-        channel: Optional[str] = None,
-    ) -> bool:
-        """Replace the content of an existing message."""
-        target = channel or self.channel
-        try:
-            self._client.chat_update(channel=target, ts=ts, blocks=blocks)
-            logger.info(f"Message {ts} updated")
-            return True
-        except SlackApiError as exc:
-            logger.error(f"Failed to update message {ts}: {exc.response['error']}")
             return False
 
     # ------------------------------------------------------------------

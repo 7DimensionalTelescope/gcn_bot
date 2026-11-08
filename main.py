@@ -32,6 +32,7 @@ import threading
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, List, Optional
 
+from slack.too_slot import ToOSlot
 from too.scheduler import DeferredEntry, DeferredToOScheduler
 
 # ---------------------------------------------------------------------------
@@ -69,33 +70,8 @@ def _log_banner(title: str, lines: "Optional[list]" = None) -> None:
     logger.info(bar)
 
 
-class _DeferredThreadTs:
-    """
-    Holds a Slack ``thread_ts`` that is produced only after the main event
-    message is posted, but is needed earlier by the async auto-ToO callbacks.
-
-    The auto-ToO email is dispatched *before* the Slack post (so it runs in
-    parallel with plot rendering/uploads). Its success/failure notice must be
-    threaded under the main message, so the worker thread calls :meth:`get`,
-    which blocks briefly until :meth:`set` is called from the notice handler.
-    On timeout (Slack post slow or failed) ``get`` returns ``None`` and the
-    caller falls back to a channel post.
-    """
-
-    def __init__(self) -> None:
-        self._event = threading.Event()
-        self._ts: Optional[str] = None
-
-    def set(self, ts: Optional[str]) -> None:
-        """Publish the thread_ts (idempotent — first call wins)."""
-        if not self._event.is_set():
-            self._ts = ts or None
-            self._event.set()
-
-    def get(self, timeout: float = 5.0) -> Optional[str]:
-        """Block up to *timeout* seconds for the thread_ts; ``None`` if unset."""
-        self._event.wait(timeout)
-        return self._ts
+_KST = timezone(timedelta(hours=9))
+_MAX_TOO_SLOTS = 200  # in-memory ToOSlot cache bound (oldest dropped first)
 
 
 class GCNBot:
@@ -127,6 +103,7 @@ class GCNBot:
         from slack.client import SlackManager
         from slack.formatters import MessageFormatter
         from slack.too_handler import SlackToOHandler
+        from slack.too_slot import ToOSlotStore
         from gcn.notice_handler import GCNNoticeHandler
         from gcn.circular_handler import GCNCircularHandler
         from gcn.consumer import GCNConsumer
@@ -145,6 +122,10 @@ class GCNBot:
             app_token=config.slack_app_token,
         )
         self.formatter = MessageFormatter()
+        # Per-event 'Auto-ToO' status message (edited in place); see slack/too_slot.py
+        self.too_slot_store = ToOSlotStore(config.output_too_slots)
+        self._too_slots: dict = {}
+        self._too_slots_lock = threading.Lock()
 
         # --- Notice / Circular storage ---
         self.notice_handler = GCNNoticeHandler(
@@ -593,13 +574,12 @@ class GCNBot:
         # it). Gated by turn_on_too_email_auto_on_update; was_too_sent inside
         # _dispatch_auto_too prevents a second send if this event was already
         # ToO'd. The event's thread already exists, so feed it straight into the
-        # deferred holder for immediate threading.
+        # event's status slot for immediate threading.
         too_dispatched: List[str] = []
         if self.config.turn_on_too_email_auto_on_update:
-            too_thread = _DeferredThreadTs()
-            too_thread.set(existing_thread_ts)
+            too_slot = self._too_slot_for_thread(existing_thread_ts)
             too_dispatched = self._dispatch_auto_too(
-                notice_data, visibility_result, tile_result, tile_result_rasa36, too_thread
+                notice_data, visibility_result, tile_result, tile_result_rasa36, too_slot
             )
 
         # Save ASCII with the existing thread_ts (and any ToO-sent marker) so the
@@ -718,11 +698,13 @@ class GCNBot:
         # async, so the email now fires in parallel with plot rendering/uploads
         # (which follow) instead of waiting ~5-15s behind them. Its inputs
         # (visibility_result + tile_result) are already computed. The success/
-        # failure notice threads under the main message via `too_thread`, whose
-        # thread_ts is filled in once the Slack post below returns.
-        too_thread = _DeferredThreadTs()
+        # failure status goes into the event's 'Auto-ToO' slot, which accumulates
+        # state silently and is posted by `too_slot.attach(thread_ts)` as soon as
+        # the Slack post below returns (so it sits right under the main message,
+        # ahead of the plot uploads).
+        too_slot = ToOSlot(self.slack, self.too_slot_store)
         too_dispatched = self._dispatch_auto_too(
-            notice_data, visibility_result, tile_result, tile_result_rasa36, too_thread
+            notice_data, visibility_result, tile_result, tile_result_rasa36, too_slot
         )
 
         # Save to ASCII first (without thread_ts) to get storage status. The
@@ -749,12 +731,12 @@ class GCNBot:
         )
         if raw_result is None:
             logger.error("Message formatter returned None — aborting")
-            too_thread.set(None)  # unblock any waiting ToO-notice callbacks
+            too_slot.attach(None)  # no thread — flush any ToO status to the channel
             return
         blocks: list = raw_result.get("blocks", []) if isinstance(raw_result, dict) else list(raw_result)
         if not blocks:
             logger.error("Message formatter returned empty blocks — aborting")
-            too_thread.set(None)  # unblock any waiting ToO-notice callbacks
+            too_slot.attach(None)  # no thread — flush any ToO status to the channel
             return
 
         # Append visibility blocks (7DT + LOAO) directly to the main message
@@ -789,7 +771,7 @@ class GCNBot:
 
         if not self.send_to_slack:
             logger.info("send_to_slack=False — skipping Slack post")
-            too_thread.set(None)  # no auto-ToO dispatched in this mode, but stay safe
+            too_slot.attach(None)  # no auto-ToO dispatched in this mode (no-op)
             return
 
         # Send main message
@@ -799,12 +781,14 @@ class GCNBot:
         )
         if not resp:
             logger.error("Failed to send Slack message")
-            too_thread.set(None)  # unblock ToO-notice callbacks → channel fallback
+            too_slot.attach(None)  # Slack post failed → channel fallback
             return
 
         new_thread_ts = resp.get("ts", "")
-        # Publish thread_ts so the already-dispatched auto-ToO notices thread here.
-        too_thread.set(new_thread_ts)
+        # Bind the already-dispatched auto-ToO status slot to this thread (posts it
+        # now, before the plot uploads).
+        self._register_too_slot(new_thread_ts, too_slot)
+        too_slot.attach(new_thread_ts)
         logger.info(
             f"New message posted (thread_ts={new_thread_ts}) for "
             f"{notice_data.get('Facility')} #{notice_data.get('Trigger_num')}"
@@ -884,7 +868,7 @@ class GCNBot:
         visibility_result: Optional[dict],
         tile_result: Optional[dict],
         tile_result_rasa36: Optional[dict],
-        too_thread: "_DeferredThreadTs",
+        too_slot: "ToOSlot",
     ) -> List[str]:
         """
         Evaluate auto-ToO criteria and dispatch the (async) emails for both
@@ -905,19 +889,19 @@ class GCNBot:
         without ``--send``, no automatic ToO emails go out. Each telescope×case
         combination has its own enable flag (checked inside
         ``_dispatch_auto_too_one`` once the tile case is known). Success/failure
-        notices thread under the main message once ``too_thread`` is set.
+        status lines go into the event's ``too_slot`` (one editable thread message).
         """
         dispatched: List[str] = []
         if not self.send_to_slack:
             return dispatched
         if self._dispatch_auto_too_one(
             "7DT", self.emailer, tile_result,
-            notice_data, visibility_result, too_thread
+            notice_data, visibility_result, too_slot
         ):
             dispatched.append("7DT")
         if self._dispatch_auto_too_one(
             "RASA36", self.emailer_rasa36, tile_result_rasa36,
-            notice_data, visibility_result, too_thread
+            notice_data, visibility_result, too_slot
         ):
             dispatched.append("RASA36")
         return dispatched
@@ -929,7 +913,7 @@ class GCNBot:
         tile_result: Optional[dict],
         notice_data: dict,
         visibility_result: Optional[dict],
-        too_thread: "_DeferredThreadTs",
+        too_slot: "ToOSlot",
     ) -> bool:
         """
         Handle one telescope's auto-ToO decision.
@@ -949,7 +933,6 @@ class GCNBot:
 
         facility    = notice_data.get("Facility", "")
         trigger     = notice_data.get("Trigger_num", "")
-        target_name = notice_data.get("Name", "Unknown")
         key = (str(facility), str(trigger), telescope)
         try:
             if self.notice_handler.was_too_sent(facility, trigger, telescope):
@@ -975,11 +958,12 @@ class GCNBot:
                 self.notice_handler.clear_too_deferred(facility, trigger, telescope)
             too_config = self._auto_too_config(telescope, n_tiles)
             try:
+                too_slot.begin_send(telescope)
                 emailer.send_too_email_async(
                     notice_data,
                     too_config=too_config,
-                    on_success=self._make_too_notice(too_thread, telescope, target_name, True),
-                    on_failure=self._make_too_notice(too_thread, telescope, target_name, False),
+                    on_success=self._make_too_notice(too_slot, telescope, True),
+                    on_failure=self._make_too_notice(too_slot, telescope, False),
                 )
                 return True
             except Exception as exc:
@@ -1002,7 +986,8 @@ class GCNBot:
                 facility=str(facility), trigger_num=str(trigger),
                 telescope=telescope, fire_at=fire_at,
             ))
-            self._notify_too_scheduled(too_thread, telescope, target_name, fire_at)
+            too_slot.tag_deferred(telescope, f"{facility}|{trigger}")
+            too_slot.add_line(telescope, self._scheduled_line(fire_at, rescheduled=False))
         return False
 
     # ------------------------------------------------------------------
@@ -1075,6 +1060,12 @@ class GCNBot:
                 f"Deferred ToO {entry.key}: event no longer in ASCII "
                 f"(retracted / trimmed) — skipping"
             )
+            # The row (and its thread_ts) is gone; find the slot via its tag.
+            slot_thread = self.too_slot_store.find_thread(telescope, f"{facility}|{trigger}")
+            if slot_thread:
+                self._post_deferred_result(
+                    slot_thread, telescope, sent=None, reason="retracted / no longer qualifies"
+                )
             return
         if self.notice_handler.was_too_sent(facility, trigger, telescope):
             logger.info(f"Deferred ToO {entry.key}: already sent — clearing")
@@ -1089,6 +1080,9 @@ class GCNBot:
         except (TypeError, ValueError):
             logger.warning(f"Deferred ToO {entry.key}: unusable coordinates — skipping")
             self.notice_handler.clear_too_deferred(facility, trigger, telescope)
+            self._post_deferred_result(
+                thread_ts, telescope, sent=None, reason="unusable coordinates"
+            )
             return
         error = row.get("Error")
         notice_data = {
@@ -1119,7 +1113,7 @@ class GCNBot:
                 f"Deferred ToO {entry.key}: {tile_case}-tile case now disabled — skipping"
             )
             self.notice_handler.clear_too_deferred(facility, trigger, telescope)
-            self._post_deferred_result(thread_ts, telescope, name, sent=None)
+            self._post_deferred_result(thread_ts, telescope, sent=None)
             return
 
         if case == "now":
@@ -1130,7 +1124,7 @@ class GCNBot:
             # Clear the pending marker either way; a failed send is not retried
             # (the operator is notified to submit manually).
             self.notice_handler.clear_too_deferred(facility, trigger, telescope)
-            self._post_deferred_result(thread_ts, telescope, name, sent=ok)
+            self._post_deferred_result(thread_ts, telescope, sent=ok)
         elif case == "soon":
             hrs = self._soon_hours(visibility_result) or 0.05
             new_fire = datetime.now(timezone.utc) + timedelta(hours=hrs)
@@ -1141,6 +1135,9 @@ class GCNBot:
                 facility=facility, trigger_num=trigger, telescope=telescope,
                 fire_at=new_fire, payload=entry.payload,
             ))
+            self._too_slot_for_thread(thread_ts).add_line(
+                telescope, self._scheduled_line(new_fire, rescheduled=True)
+            )
             logger.info(
                 f"Deferred ToO {entry.key}: target still rising — rescheduled to "
                 f"{new_fire.isoformat()}"
@@ -1150,7 +1147,7 @@ class GCNBot:
                 f"Deferred ToO {entry.key}: no longer qualifies (case={case}) — skipping"
             )
             self.notice_handler.clear_too_deferred(facility, trigger, telescope)
-            self._post_deferred_result(thread_ts, telescope, name, sent=None)
+            self._post_deferred_result(thread_ts, telescope, sent=None)
 
     def _reload_deferred_too(self) -> None:
         """Re-schedule ToOs left pending in the ASCII file (called on startup).
@@ -1180,95 +1177,81 @@ class GCNBot:
             ))
         logger.info(f"Reloaded {self.deferred_scheduler.pending_count()} pending deferred ToO(s)")
 
-    def _notify_too_scheduled(
-        self, too_thread: "_DeferredThreadTs", telescope: str,
-        target_name: str, fire_at: datetime,
-    ) -> None:
-        """Post a '⏳ ToO scheduled' notice under the event thread (non-blocking).
+    # ------------------------------------------------------------------
+    # Auto-ToO status slot (one editable Slack message per event thread)
+    # ------------------------------------------------------------------
 
-        Runs on a short-lived daemon thread so it can wait for ``too_thread``
-        (the main message may still be posting) without blocking the caller.
+    def _register_too_slot(self, thread_ts: str, slot: "ToOSlot") -> None:
+        with self._too_slots_lock:
+            self._too_slots[thread_ts] = slot
+            while len(self._too_slots) > _MAX_TOO_SLOTS:
+                self._too_slots.pop(next(iter(self._too_slots)))
+
+    def _too_slot_for_thread(self, thread_ts: Optional[str]) -> "ToOSlot":
+        """The event thread's slot — cached, else restored from the store.
+
+        Keeping a single object per thread stops concurrent writers (immediate
+        send callbacks, the scheduler thread, later updates) from overwriting
+        each other's lines.
         """
-        when = fire_at.strftime("%Y-%m-%d %H:%M UTC")
-        text = (
-            f":hourglass_flowing_sand: Automatic {telescope} ToO *scheduled* for "
-            f"*{target_name}* at {when} (when the target rises; a final "
-            f"retraction / visibility / tile check runs before it sends)."
+        if not thread_ts:
+            slot = ToOSlot(self.slack, self.too_slot_store)
+            slot.attach(None)
+            return slot
+        with self._too_slots_lock:
+            slot = self._too_slots.get(thread_ts)
+        if slot is None:
+            slot = ToOSlot(self.slack, self.too_slot_store)
+            self._register_too_slot(thread_ts, slot)
+            slot.attach(thread_ts)
+        return slot
+
+    @staticmethod
+    def _scheduled_line(fire_at: datetime, rescheduled: bool) -> str:
+        when = fire_at.astimezone(timezone.utc).strftime("%H:%M")
+        if rescheduled:
+            return (
+                f":hourglass_flowing_sand: rescheduled for {when} UTC "
+                f"(target rises later than estimated)"
+            )
+        return (
+            f":hourglass_flowing_sand: scheduled for {when} UTC "
+            f"(target rises; re-checked before send)"
         )
 
-        def _task() -> None:
-            thread_ts = too_thread.get(timeout=5.0)
-            if thread_ts:
-                self.slack.send_thread_message(thread_ts=thread_ts, text=text)
-            else:
-                self.slack.send_message(blocks=[], text=text)
-
-        threading.Thread(target=_task, name="too-scheduled-notice", daemon=True).start()
-
     def _post_deferred_result(
-        self, thread_ts: Optional[str], telescope: str,
-        target_name: str, sent: Optional[bool],
+        self, thread_ts: Optional[str], telescope: str, sent: Optional[bool],
+        reason: str = "retracted / no longer qualifies",
     ) -> None:
-        """Post the outcome of a fired deferred ToO under the event thread.
+        """Append the outcome of a fired deferred ToO below its ``scheduled`` line.
 
         ``sent`` is ``True`` (sent), ``False`` (send failed), or ``None``
-        (skipped at fire time — no longer qualifies / retracted).
+        (skipped at fire time — see ``reason``).
         """
         if sent is True:
-            text = (
-                f":white_check_mark: Deferred {telescope} ToO email *sent* for "
-                f"*{target_name}* (target now observable)."
-            )
+            now = datetime.now(timezone.utc).strftime("%H:%M")
+            text = f":white_check_mark: sent {now} UTC (deferred)"
         elif sent is False:
-            text = (
-                f":warning: Deferred {telescope} ToO email *failed to send* for "
-                f"*{target_name}*. Check the bot logs and submit manually if needed."
-            )
+            text = ":warning: failed to send — check logs, submit manually"
         else:
-            text = (
-                f":no_entry_sign: Deferred {telescope} ToO for *{target_name}* "
-                f"*not sent* — at fire time it no longer qualified (retracted, no "
-                f"longer a single tile, or not observable)."
-            )
-        if thread_ts:
-            self.slack.send_thread_message(thread_ts=thread_ts, text=text)
-        else:
-            self.slack.send_message(blocks=[], text=text)
+            text = f":no_entry_sign: not sent — {reason}"
+        self._too_slot_for_thread(thread_ts).add_line(telescope, text)
 
     def _make_too_notice(
-        self,
-        too_thread: "_DeferredThreadTs",
-        telescope: str,
-        target_name: str,
-        success: bool,
+        self, too_slot: "ToOSlot", telescope: str, success: bool,
     ) -> Callable[[], None]:
         """
         Build a zero-arg callback (run on the emailer's worker thread) that
-        posts an auto-ToO send result as a reply under the original event
-        thread. ``success`` selects the ✅ sent / ⚠️ failed message.
-
-        The callback waits briefly for ``too_thread`` (the main message may
-        still be posting); on timeout it falls back to a channel post.
+        turns the telescope's ``sending…`` line into ✅ sent / ⚠️ failed.
         """
-        if success:
-            text = (
-                f":white_check_mark: Automatic {telescope} ToO email *sent* "
-                f"for *{target_name}*."
-            )
-        else:
-            text = (
-                f":warning: Automatic {telescope} ToO email *failed to send* "
-                f"for *{target_name}*. Check the bot logs and submit manually "
-                f"if needed."
-            )
-
         def _notify() -> None:
-            thread_ts = too_thread.get(timeout=5.0)
-            if thread_ts:
-                self.slack.send_thread_message(thread_ts=thread_ts, text=text)
+            if success:
+                stamp = datetime.now(_KST).strftime("%H:%M:%S")
+                too_slot.finish_send(telescope, f":white_check_mark: sent {stamp} KST")
             else:
-                # Main message unavailable — post to the channel so it's not lost.
-                self.slack.send_message(blocks=[], text=text)
+                too_slot.finish_send(
+                    telescope, ":warning: failed to send — check logs, submit manually"
+                )
 
         return _notify
 
