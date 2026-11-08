@@ -222,10 +222,20 @@ class MessageFormatter:
             ]
         }
 
+    # Fermi GBM sends up to three position notices per trigger; say which one
+    # an update is (FIN_POS supersedes the automated ground position).
+    _NOTICE_KINDS = (("FIN_POS", "Final Position"), ("GND_POS", "Ground Position"),
+                     ("FLT_POS", "Flight Position"))
+
+    def notice_kind(self, topic: str) -> str:
+        """``"Final Position"`` etc. for a GBM position topic, ``""`` otherwise."""
+        return next((label for key, label in self._NOTICE_KINDS if key in (topic or "")), "")
+
     def format_thread_update(
         self,
         differences: Dict[str, Any],
         notice_data: Dict[str, Any],
+        kind: str = "",
     ) -> str:
         """
         Compose a compact Slack mrkdwn string showing only changed fields.
@@ -236,11 +246,14 @@ class MessageFormatter:
             As returned by ``GCNNoticeHandler.compare_event_data()``.
         notice_data : dict
             Incoming notice data (used for the facility name in the header).
+        kind : str
+            Notice kind shown next to the facility (see :meth:`notice_kind`).
         """
         try:
             facility = notice_data.get("Facility", "Unknown")
+            label = f"{facility} ({kind})" if kind else facility
             lines: List[str] = [
-                f"🔄 *UPDATE: {facility}*",
+                f"🔄 *UPDATE: {label}*",
                 "> *New Information:*",
             ]
 

@@ -23,6 +23,8 @@ import time
 from datetime import datetime, timezone
 from typing import Any, Callable, List, Optional
 
+from confluent_kafka import KafkaError
+
 logger = logging.getLogger(__name__)
 
 
@@ -45,6 +47,16 @@ class GCNConsumer:
     HEARTBEAT_TOPIC = "gcn.heartbeat"
     MAX_RECONNECT_ATTEMPTS = 5
     BASE_RECONNECT_DELAY   = 30   # seconds
+    # Errors about one subscribed topic, not the connection ("Subscribed topic
+    # not available", no access). The broker repeats them after every
+    # (re)subscription, so reconnecting only loops — and since heartbeats keep
+    # flowing the attempt counter never resets: after 5 tries (~15 min) the bot
+    # gave up and stopped consuming every topic. Warn and keep the others.
+    _TOPIC_ERRORS = frozenset({
+        KafkaError.UNKNOWN_TOPIC_OR_PART,
+        KafkaError._UNKNOWN_TOPIC,
+        KafkaError.TOPIC_AUTHORIZATION_FAILED,
+    })
 
     def __init__(
         self,
@@ -65,6 +77,7 @@ class GCNConsumer:
         self._last_heartbeat = datetime.now()
         self._last_connected = True
         self._reconnect_attempts = 0
+        self._topic_errors_seen: set = set()
 
     # ------------------------------------------------------------------
     # Public API
@@ -95,8 +108,14 @@ class GCNConsumer:
                 msg = self._consumer.poll(timeout=3.0)
                 if msg is None:
                     continue
-                if msg.error():
-                    logger.error(f"Kafka consumer error: {msg.error()}")
+                err = msg.error()
+                if err:
+                    if err.code() in self._TOPIC_ERRORS:
+                        self._warn_topic_error(err)
+                        continue
+                    if err.code() == KafkaError._PARTITION_EOF:
+                        continue
+                    logger.error(f"Kafka consumer error: {err}")
                     if self._running:
                         self._do_reconnect()
                     continue
@@ -117,6 +136,17 @@ class GCNConsumer:
                 logger.error(f"Error in polling loop: {exc}", exc_info=True)
                 if self._running:
                     time.sleep(5)
+
+    def _warn_topic_error(self, err: Any) -> None:
+        """Log a topic-level error once; the other topics keep being consumed."""
+        text = str(err.str() if hasattr(err, "str") else err)
+        if text in self._topic_errors_seen:
+            return
+        self._topic_errors_seen.add(text)
+        logger.warning(
+            f"Kafka topic error (not reconnecting; other topics keep flowing): {text} "
+            "— check DISPLAY_TOPICS in settings.toml"
+        )
 
     @staticmethod
     def _log_kafka_latency(msg) -> None:

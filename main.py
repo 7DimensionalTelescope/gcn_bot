@@ -912,7 +912,9 @@ class GCNBot:
             n = tile_result_rasa36["n_tiles"]
             tile_suffix += f"\n - RASA36 Tiles: {n} tile{'s' if n != 1 else ''}"
 
-        thread_update = self.formatter.format_thread_update(differences, notice_data)
+        thread_update = self.formatter.format_thread_update(
+            differences, notice_data, kind=self.formatter.notice_kind(topic)
+        )
         if isinstance(thread_update, list):
             send_kwargs = dict(thread_ts=existing_thread_ts, blocks=thread_update, text="GCN Notice Update")
         else:
