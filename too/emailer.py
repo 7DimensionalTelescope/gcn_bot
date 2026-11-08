@@ -40,16 +40,197 @@ import logging
 import os
 import re
 import smtplib
+import socket
 import ssl
-import tempfile
+import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from email.mime.application import MIMEApplication
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
+from email.utils import formatdate, make_msgid
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Persistent SMTP session
+# ---------------------------------------------------------------------------
+
+# Errors meaning "the connection is dead / unusable" — the send is retried once
+# on a fresh connection. Anything else (e.g. every recipient refused, message
+# rejected) is a real answer from the server and is raised untouched.
+_STALE_CONNECTION_ERRORS = (
+    smtplib.SMTPServerDisconnected,
+    ConnectionError,
+    socket.timeout,
+    TimeoutError,
+    ssl.SSLError,
+)
+
+
+class SMTPSession:
+    """
+    One logged-in, kept-warm SMTP connection (thread-safe).
+
+    A ToO email used to open a new connection per send (TCP + TLS + AUTH,
+    ~1.5-2 s of the ~4 s from decision to "accepted"). This keeps the
+    connection open and logged in so a send is just ``MAIL FROM/RCPT/DATA``.
+
+    * ``start()`` connects in the background and spawns a daemon thread that
+      issues ``NOOP`` every ``keepalive_sec`` so the server never idles the
+      session out; if the NOOP fails the connection is dropped and re-opened
+      eagerly, so the next alert still finds a warm session.
+    * ``send()`` reuses the session; on a dead-connection error it reconnects
+      and retries once, so a stale session costs only the old per-send price.
+    * Works without ``start()`` too (connects lazily on first send).
+
+    A single connection serialises sends, hence one session per emailer
+    (7DT / RASA36) so the two telescopes' emails still go out in parallel.
+    """
+
+    def __init__(
+        self,
+        host: str,
+        port: int,
+        user: str,
+        password: str,
+        keepalive_sec: float = 60.0,
+        timeout: float = 20.0,
+    ) -> None:
+        self.host, self.port = host, port
+        self._user, self._password = user, password
+        self.keepalive_sec = float(keepalive_sec)
+        self.timeout = timeout
+        self._conn: Optional[smtplib.SMTP_SSL] = None
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+
+    # -- connection management (caller must hold self._lock) --------------
+
+    def _open(self) -> None:
+        t0 = time.monotonic()
+        ctx = ssl.create_default_context()
+        conn = smtplib.SMTP_SSL(self.host, self.port, context=ctx, timeout=self.timeout)
+        try:
+            conn.login(self._user, self._password)
+        except Exception:
+            self._quiet_close(conn)
+            raise
+        self._conn = conn
+        logger.info(
+            f"SMTP session opened to {self.host} ({time.monotonic() - t0:.2f}s)"
+        )
+
+    @staticmethod
+    def _quiet_close(conn: Optional[smtplib.SMTP]) -> None:
+        if conn is None:
+            return
+        try:
+            conn.quit()
+        except Exception:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+    def _drop(self) -> None:
+        conn, self._conn = self._conn, None
+        self._quiet_close(conn)
+
+    # -- public API -------------------------------------------------------
+
+    def send(self, msg, from_addr: str, to_addrs: List[str]) -> Tuple[Dict[str, Any], bool]:
+        """
+        Send ``msg``; return ``(refused, reused)`` where ``refused`` is
+        ``send_message``'s per-recipient refusal dict and ``reused`` says
+        whether an already-open connection carried the send.
+        """
+        with self._lock:
+            reused = self._conn is not None
+            for attempt in (1, 2):
+                try:
+                    if self._conn is None:
+                        self._open()
+                    refused = self._conn.send_message(
+                        msg, from_addr=from_addr, to_addrs=to_addrs
+                    )
+                    return refused, reused
+                except _STALE_CONNECTION_ERRORS as exc:
+                    # Connection state is unknown after a transport failure.
+                    self._drop()
+                    reused = False
+                    if attempt == 2:
+                        raise
+                    logger.warning(
+                        f"SMTP session unusable ({type(exc).__name__}: {exc}); "
+                        f"reconnecting and retrying once"
+                    )
+                except smtplib.SMTPResponseException as exc:
+                    if exc.smtp_code == 421:  # "service not available, closing"
+                        self._drop()
+                        reused = False
+                        if attempt == 2:
+                            raise
+                        logger.warning("SMTP 421 from server; reconnecting and retrying once")
+                        continue
+                    # Rejected mid-transaction: reset so the session stays usable.
+                    try:
+                        self._conn.rset()
+                    except Exception:
+                        self._drop()
+                    raise
+            raise RuntimeError("unreachable")  # pragma: no cover
+
+    def start(self) -> None:
+        """Warm the connection and begin keep-alive pings (idempotent)."""
+        if self.keepalive_sec <= 0 or self._thread is not None:
+            return
+        self._stop.clear()
+        self._thread = threading.Thread(
+            target=self._run, name=f"smtp-keepalive-{self.host}", daemon=True
+        )
+        self._thread.start()
+
+    def close(self) -> None:
+        """Stop keep-alive and close the connection."""
+        self._stop.set()
+        with self._lock:
+            self._drop()
+        self._thread = None
+
+    # -- keep-alive thread ------------------------------------------------
+
+    def _ensure_warm(self) -> None:
+        with self._lock:
+            try:
+                if self._conn is None:
+                    self._open()
+                else:
+                    sock = self._conn.sock
+                    if sock is not None:
+                        sock.settimeout(5.0)  # don't let a dead link stall a send behind us
+                    code, _ = self._conn.noop()
+                    if sock is not None:
+                        sock.settimeout(self.timeout)
+                    if code != 250:
+                        raise smtplib.SMTPServerDisconnected(f"NOOP -> {code}")
+            except Exception as exc:
+                logger.warning(
+                    f"SMTP keep-alive failed ({type(exc).__name__}: {exc}); "
+                    f"will retry in {self.keepalive_sec:.0f}s"
+                )
+                self._drop()
+
+    def _run(self) -> None:
+        # The first pass connects immediately; later passes wait a full interval.
+        while not self._stop.is_set():
+            self._ensure_warm()
+            if self._stop.wait(self.keepalive_sec):
+                break
 
 
 # ---------------------------------------------------------------------------
@@ -221,6 +402,9 @@ class GCNToOEmailer:
         SMTP hostname (default: Gmail SSL).
     smtp_port : int
         SMTP port (default: 465 for SSL).
+    smtp_keepalive_sec : float
+        Keep one logged-in SMTP connection open and ping it this often (s);
+        ``0`` (default) opens a new connection for every send.
     min_altitude : float
         Minimum target altitude in degrees (informational, passed to visibility).
     min_moon_sep : float
@@ -252,6 +436,7 @@ class GCNToOEmailer:
         auto_too_grb_only: bool = False,
         auto_too_max_tiles: Optional[int] = None,
         observable_soon_hours: float = OBSERVABLE_SOON_HOURS,
+        smtp_keepalive_sec: float = 0.0,
     ) -> None:
         self.email_from     = email_from
         self.email_to       = [email_to] if isinstance(email_to, str) else list(email_to)
@@ -273,7 +458,24 @@ class GCNToOEmailer:
         # Read by the observable_soon criterion — how many hours before the
         # target rises an auto-ToO may still fire.
         self.observable_soon_hours = observable_soon_hours
+        # Persistent, kept-warm SMTP connection (skips TCP+TLS+AUTH on every
+        # send). 0 disables it → a fresh connection per send, as before.
+        self._smtp: Optional[SMTPSession] = (
+            SMTPSession(smtp_server, smtp_port, email_from, email_password,
+                        keepalive_sec=smtp_keepalive_sec)
+            if smtp_keepalive_sec > 0 else None
+        )
         logger.info(f"GCNToOEmailer initialised for telescope={telescope}")
+
+    def start_smtp_keepalive(self) -> None:
+        """Open the SMTP connection in the background and keep it warm."""
+        if self._smtp is not None:
+            self._smtp.start()
+
+    def close_smtp(self) -> None:
+        """Stop keep-alive pings and close the SMTP connection."""
+        if self._smtp is not None:
+            self._smtp.close()
 
     # ==================================================================
     # Public: criteria evaluation
@@ -455,50 +657,68 @@ class GCNToOEmailer:
         bool
             ``True`` if the email was delivered successfully.
         """
+        t_start = time.monotonic()
         try:
             email_data = self._prepare_email_content(notice_data, too_config)
             subject    = self._build_subject(email_data)
             body       = self._build_body(email_data)
 
-            # Write JSON attachment to a temp file
+            # JSON attachment, built in memory (no temp-file round trip)
             now_str   = datetime.now().strftime("%Y%m%d%H%M%S")
             file_name = f"too_request_{now_str}.json"
-            with tempfile.NamedTemporaryFile(
-                mode="w", suffix=".json", prefix="too_request_", delete=False
-            ) as fh:
-                json.dump(email_data, fh, indent=4, default=str)
-                file_path = fh.name
+            payload   = json.dumps(email_data, indent=4, default=str).encode("utf-8")
 
             # Build MIME message
             msg            = MIMEMultipart()
             msg["Subject"] = subject
             msg["From"]    = self.email_from
             msg["To"]      = ", ".join(self.email_to)
+            msg["Date"]    = formatdate(localtime=True)
+            msg["Message-ID"] = make_msgid(domain=self.email_from.rsplit("@", 1)[-1])
             msg.attach(MIMEText(body, "plain"))
-            with open(file_path, "rb") as fh:
-                att = MIMEApplication(fh.read(), Name=file_name)
-                att["Content-Disposition"] = f'attachment; filename="{file_name}"'
-                msg.attach(att)
+            att = MIMEApplication(payload, Name=file_name)
+            att["Content-Disposition"] = f'attachment; filename="{file_name}"'
+            msg.attach(att)
+            t_built = time.monotonic()
 
-            # Send
-            ctx = ssl.create_default_context()
-            with smtplib.SMTP_SSL(self.smtp_server, self.smtp_port, context=ctx) as server:
-                server.login(self.email_from, self.email_password)
-                server.send_message(msg)
+            # Send. The envelope recipients are passed explicitly (not inferred
+            # from the To header) and the per-recipient result is checked:
+            # send_message() only raises when *every* recipient is refused, so a
+            # partial refusal used to be logged as "sent".
+            if self._smtp is not None:
+                refused, reused = self._smtp.send(
+                    msg, from_addr=self.email_from, to_addrs=self.email_to
+                )
+                conn_note = "reused connection" if reused else "new connection"
+            else:
+                ctx = ssl.create_default_context()
+                with smtplib.SMTP_SSL(self.smtp_server, self.smtp_port, context=ctx) as server:
+                    server.login(self.email_from, self.email_password)
+                    refused = server.send_message(
+                        msg, from_addr=self.email_from, to_addrs=self.email_to
+                    )
+                conn_note = "new connection"
+            t_sent = time.monotonic()
 
-            logger.info(f"ToO email sent for {email_data.get('target')}")
+            if refused:
+                logger.error(
+                    f"ToO email for {email_data.get('target')} refused by SMTP "
+                    f"server for: {refused}"
+                )
+                return False
+
+            logger.info(
+                f"ToO email accepted by {self.smtp_server} for "
+                f"{email_data.get('target')} ({self.telescope}) → "
+                f"{', '.join(self.email_to)} [Message-ID {msg['Message-ID']}] "
+                f"(build {t_built - t_start:.2f}s, smtp {t_sent - t_built:.2f}s, "
+                f"{conn_note})"
+            )
             return True
 
         except Exception as exc:
             logger.error(f"Error sending ToO email: {exc}", exc_info=True)
             return False
-        finally:
-            # Clean up temp file if it was created
-            if "file_path" in locals() and os.path.exists(file_path):
-                try:
-                    os.remove(file_path)
-                except OSError:
-                    pass
 
     # ==================================================================
     # Private helpers

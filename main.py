@@ -178,6 +178,7 @@ class GCNBot:
             auto_too_grb_only=config.too_auto_grb_only,
             auto_too_max_tiles=config.auto_too_max_tiles,
             observable_soon_hours=config.too_observable_soon_hours,
+            smtp_keepalive_sec=config.smtp_keepalive_sec,
         )
         self.emailer_rasa36 = GCNToOEmailer(
             email_from=config.email_from,
@@ -187,6 +188,7 @@ class GCNBot:
             auto_too_grb_only=config.too_auto_grb_only,
             auto_too_max_tiles=config.auto_too_max_tiles,
             observable_soon_hours=config.too_observable_soon_hours,
+            smtp_keepalive_sec=config.smtp_keepalive_sec,
         )
         # Auto-ToO observation params (from settings.toml), split by tile case:
         # the single-tile (n==1) and multi-tile (2..max) cases are handled
@@ -1432,6 +1434,11 @@ class GCNBot:
         # Start the deferred-ToO scheduler and re-arm any ToOs left pending in
         # the ASCII file (e.g. the bot restarted while a target was still rising).
         self.deferred_scheduler.start()
+
+        # Open + keep warm one SMTP connection per telescope (background), so
+        # the first alert's ToO email skips the TLS+AUTH handshake.
+        for em in (self.emailer, self.emailer_rasa36):
+            em.start_smtp_keepalive()
         try:
             self._reload_deferred_too()
         except Exception as exc:
@@ -1465,6 +1472,11 @@ class GCNBot:
             self.consumer.stop()
         except Exception as exc:
             logger.warning(f"Consumer stop error: {exc}")
+        for em in (self.emailer, self.emailer_rasa36):
+            try:
+                em.close_smtp()
+            except Exception as exc:
+                logger.warning(f"SMTP close error: {exc}")
         try:
             self.slack.stop_socket_mode()
         except Exception as exc:
