@@ -127,11 +127,18 @@ DISPLAY_TOPICS = [
 # ---------------------------------------------------------------------------
 # ToO observation parameters
 # ---------------------------------------------------------------------------
+# 7DT modes (validated in code; see too/emailer.py OBSMODES_7DT …):
+#   obsmode = "Spec"  → specmode  = "specall" | "specblue" | "specred"
+#   obsmode = "Color" → colormode = "gri" | "g" | "gr" | "ri"
+#   obsmode = "Deep"  → filters / selectedFilters = any of g r i u z m375w … m875;
+#                       units lacking a selected filter are skipped (only g,r,i on every unit)
 [TOO_CONFIG]
 exptime    = 100
 count      = 3
 obsmode    = "Spec"
 specmode   = "specall"
+colormode  = "gri"
+filters    = ["g", "r", "i"]
 ntelescope = 1
 binning    = "1"
 gain       = "2750"

@@ -144,6 +144,8 @@ _DEFAULTS: Dict[str, Any] = {
         "count": 3,
         "obsmode": "Spec",
         "specmode": "specall",
+        "colormode": "gri",
+        "filters": ["g", "r", "i"],
         "ntelescope": 1,
         "binning": "1",
         "gain": "2750",

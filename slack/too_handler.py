@@ -26,6 +26,11 @@ from typing import Any, Callable, Dict, List, Optional
 
 from slack_sdk.errors import SlackApiError
 
+from too.emailer import (
+    COLORMODES_7DT, FILTERS_7DT, FILTERS_7DT_ALL_UNITS, OBSMODES_7DT,
+    SPECMODES_7DT, deep_filter_note,
+)
+
 logger = logging.getLogger(__name__)
 
 
@@ -208,8 +213,11 @@ class SlackToOHandler:
             init_priority = str(cfg.get("priority", "50"))
             init_gain     = str(cfg.get("gain", "2750"))
             init_binning  = str(cfg.get("binning", "1"))
-            init_obsmode  = cfg.get("obsmode", "Spec")
-            init_specmode = cfg.get("specmode", "specall")
+            init_obsmode   = cfg.get("obsmode", "Spec")
+            init_specmode  = cfg.get("specmode", "specall")
+            init_colormode = cfg.get("colormode", "gri")
+            init_filters   = cfg.get("filters") or list(FILTERS_7DT_ALL_UNITS)
+            init_ntel      = str(cfg.get("ntelescope", 1))
 
         if self.telescope == "RASA36":
             return self._open_modal_rasa36(
@@ -249,39 +257,35 @@ class SlackToOHandler:
                 self._input_block("exposure_block", "exposure_input", "Single Exposure Time (seconds) *", init_exposure, "100"),
                 # Image count
                 self._input_block("count_block", "count_input", "Number of Images *", init_count, "3"),
-                # Obs mode
-                {
-                    "type": "input",
-                    "block_id": "obsmode_block",
-                    "element": {
-                        "type": "static_select",
-                        "action_id": "obsmode_input",
-                        "initial_option": {"text": {"type": "plain_text", "text": init_obsmode}, "value": init_obsmode},
-                        "options": [
-                            {"text": {"type": "plain_text", "text": "Deep"}, "value": "Deep"},
-                            {"text": {"type": "plain_text", "text": "Spec"}, "value": "Spec"},
-                        ],
-                    },
-                    "label": {"type": "plain_text", "text": "Observation Mode *"},
-                },
-                # Spec mode
-                self._input_block("specmode_block", "specmode_input", "Spec Mode *", init_specmode, "specall"),
-                # Filters
+                # Obs mode — only the field for the chosen mode is used
+                self._select_block("obsmode_block", "obsmode_input", "Observation Mode *",
+                                   OBSMODES_7DT, init_obsmode),
+                self._select_block("specmode_block", "specmode_input", "Spec Mode (Spec only)",
+                                   SPECMODES_7DT, init_specmode),
+                self._select_block("colormode_block", "colormode_input", "Color Mode (Color only)",
+                                   COLORMODES_7DT, init_colormode),
                 {
                     "type": "input",
                     "block_id": "filters_block",
+                    "optional": True,
                     "element": {
                         "type": "multi_static_select",
                         "action_id": "filters_input",
                         "initial_options": [
-                            {"text": {"type": "plain_text", "text": f}, "value": f} for f in ["g", "r", "i"]
+                            self._option(f) for f in init_filters if f in FILTERS_7DT
                         ],
-                        "options": [
-                            {"text": {"type": "plain_text", "text": f}, "value": f} for f in ["u", "g", "r", "i", "z"]
-                        ],
+                        "options": [self._option(f) for f in FILTERS_7DT],
                     },
-                    "label": {"type": "plain_text", "text": "Filters *"},
+                    "label": {"type": "plain_text", "text": "Filters (Deep only)"},
+                    "hint": {
+                        "type": "plain_text",
+                        "text": ("Only g, r, i are on every unit. Units without a selected "
+                                 "filter are left out, so selecting many filters can leave "
+                                 "no unit to observe."),
+                    },
                 },
+                self._input_block("ntel_block", "ntel_input", "Number of Telescopes (Deep only)",
+                                  init_ntel, "1"),
                 {"type": "divider"},
                 # Priority
                 self._input_block("priority_block", "priority_input", "Priority *", init_priority, "50"),
@@ -314,7 +318,7 @@ class SlackToOHandler:
                             {"text": {"type": "plain_text", "text": "False"}, "value": "False"},
                         ],
                     },
-                    "label": {"type": "plain_text", "text": "Abort Current Observation *"},
+                    "label": {"type": "plain_text", "text": "Rapid ToO (Is_rapid_ToO) *"},
                 },
                 {"type": "divider"},
                 # Comments
@@ -497,7 +501,9 @@ class SlackToOHandler:
             "exposure":         text_val("exposure_block",   "exposure_input"),
             "imageCount":       text_val("count_block",      "count_input"),
             "obsmode":          select_val("obsmode_block",  "obsmode_input"),
-            "specmode":         text_val("specmode_block",   "specmode_input"),
+            "specmode":         select_val("specmode_block", "specmode_input"),
+            "colormode":        select_val("colormode_block", "colormode_input"),
+            "selectedTelNumber": text_val("ntel_block",      "ntel_input"),
             "priority":         text_val("priority_block",   "priority_input"),
             "binning":          select_val("binning_block",  "binning_input"),
             "gain":             text_val("gain_block",       "gain_input"),
@@ -505,6 +511,30 @@ class SlackToOHandler:
             "comments":         text_val("comments_block",   "comments_input"),
             "selectedFilters":  filters,
         }
+
+    def validate_form(self, form_values: Dict[str, Any]) -> Dict[str, str]:
+        """Slack ``errors`` dict (block_id → message) for an invalid 7DT form."""
+        if self.telescope == "RASA36":
+            return {}
+        try:
+            data = self.extract_form_data(form_values)
+        except Exception:
+            return {}   # let the submit path report it
+        errors: Dict[str, str] = {}
+        obsmode = data.get("obsmode") or "Spec"
+        if obsmode == "Spec" and not data.get("specmode"):
+            errors["specmode_block"] = "Choose a spec mode for Spec observations."
+        elif obsmode == "Color" and not data.get("colormode"):
+            errors["colormode_block"] = "Choose a color mode for Color observations."
+        elif obsmode == "Deep":
+            if not data.get("selectedFilters"):
+                errors["filters_block"] = "Choose at least one filter for Deep observations."
+            elif set(data["selectedFilters"]) == set(FILTERS_7DT):
+                errors["filters_block"] = "No unit carries every filter, so nothing would be observed."
+            ntel = str(data.get("selectedTelNumber") or "").strip()
+            if not ntel.isdigit() or int(ntel) < 1:
+                errors["ntel_block"] = "Enter a whole number of telescopes (1 or more)."
+        return errors
 
     # ------------------------------------------------------------------
     # Bolt handler registration
@@ -520,6 +550,10 @@ class SlackToOHandler:
 
         @app.view(self.callback_id)
         def handle_modal_submit(ack, body, client, view):
+            errors = self.validate_form(view["state"]["values"])
+            if errors:
+                ack(response_action="errors", errors=errors)   # modal stays open
+                return
             ack()
             self._on_modal_submit(body, client, view)
 
@@ -684,8 +718,10 @@ class SlackToOHandler:
                 "singleExposure":    int(form_data.get("exposure", 100)),
                 "imageCount":        int(form_data.get("imageCount", 3)),
                 "obsmode":           form_data.get("obsmode", "Spec"),
-                "specmode":          form_data.get("specmode", "specall"),
+                "specmode":          form_data.get("specmode") or "specall",
+                "colormode":         form_data.get("colormode") or "gri",
                 "selectedFilters":   form_data.get("selectedFilters", []),
+                "selectedTelNumber": int(form_data.get("selectedTelNumber") or 1),
                 "abortObservation":  form_data.get("abortObservation", "False"),
                 "priority":          form_data.get("priority", "50"),
                 "gain":              form_data.get("gain", "2750"),
@@ -710,6 +746,12 @@ class SlackToOHandler:
                     f"*RA/DEC:* {form_data.get('ra')}, {form_data.get('dec')}"
                 ),
             }
+            if self.telescope != "RASA36":
+                msg_kwargs["text"] += f"\n*Mode:* {self._mode_summary(too_config)}"
+                note = (deep_filter_note(too_config["selectedFilters"])
+                        if too_config["obsmode"] == "Deep" else "")
+                if note:
+                    msg_kwargs["text"] += f"\n:warning: {note}"
             if thread_ts:
                 msg_kwargs["thread_ts"] = thread_ts
             client.chat_postMessage(**msg_kwargs)
@@ -734,6 +776,44 @@ class SlackToOHandler:
     # ------------------------------------------------------------------
     # Private: block builder helper
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _mode_summary(cfg: Dict[str, Any]) -> str:
+        obsmode = cfg.get("obsmode", "Spec")
+        if obsmode == "Spec":
+            return f"Spec ({cfg.get('specmode')})"
+        if obsmode == "Color":
+            return f"Color ({cfg.get('colormode')})"
+        return f"Deep ({','.join(cfg.get('selectedFilters', []))}, {cfg.get('selectedTelNumber')} tel)"
+
+    @staticmethod
+    def _option(value: str) -> Dict[str, Any]:
+        return {"text": {"type": "plain_text", "text": value}, "value": value}
+
+    @classmethod
+    def _select_block(
+        cls,
+        block_id: str,
+        action_id: str,
+        label: str,
+        choices,
+        initial: str,
+    ) -> Dict[str, Any]:
+        """static_select over *choices*, preselecting *initial* if it is one."""
+        element: Dict[str, Any] = {
+            "type": "static_select",
+            "action_id": action_id,
+            "options": [cls._option(c) for c in choices],
+        }
+        match = next((c for c in choices if c.lower() == str(initial).lower()), None)
+        if match:
+            element["initial_option"] = cls._option(match)
+        return {
+            "type": "input",
+            "block_id": block_id,
+            "element": element,
+            "label": {"type": "plain_text", "text": label},
+        }
 
     @staticmethod
     def _input_block(

@@ -333,6 +333,88 @@ def _tcspy_bool(value: Any) -> str:
 
 
 # ---------------------------------------------------------------------------
+# 7DT observation modes and filters
+#
+# * Spec  — spectral mode, one of SPECMODES_7DT.
+# * Color — colour mode, one of COLORMODES_7DT.
+# * Deep  — any subset of FILTERS_7DT. A unit that lacks a selected filter is
+#           left out and only units carrying it observe, so selecting every
+#           filter means nothing gets observed. Only g, r, i are on every unit.
+# ---------------------------------------------------------------------------
+
+OBSMODES_7DT: Tuple[str, ...] = ("Spec", "Deep", "Color")
+SPECMODES_7DT: Tuple[str, ...] = ("specall", "specblue", "specred")
+COLORMODES_7DT: Tuple[str, ...] = ("gri", "g", "gr", "ri")
+FILTERS_7DT: Tuple[str, ...] = (
+    'g', 'r', 'i', 'u', 'z',
+    'm375w', 'm386', 'm400', 'm425', 'm438', 'm450', 'm466w', 'm475', 'm483',
+    'm500', 'm512', 'm525', 'm534', 'm550', 'm561', 'm575', 'm586', 'm600',
+    'm615', 'm625', 'm640', 'm650', 'm661', 'm675', 'm692w', 'm700', 'm710w',
+    'm725', 'm750', 'm769w', 'm775', 'm800', 'm825', 'm832w', 'm850', 'm875',
+)
+FILTERS_7DT_ALL_UNITS: Tuple[str, ...] = ("g", "r", "i")
+
+
+def _canonical(value: Any, choices: Tuple[str, ...]) -> Optional[str]:
+    """*value* spelled as in *choices* (case-insensitive), or None."""
+    wanted = str(value or "").strip().lower()
+    return next((c for c in choices if c.lower() == wanted), None)
+
+
+def normalize_7dt_mode(cfg: Dict[str, Any]) -> Tuple[Dict[str, Any], List[str]]:
+    """Check and normalise the 7DT mode fields of *cfg*.
+
+    Returns ``(fields, problems)``. *fields* holds ``obsmode`` plus the one
+    field that mode uses (``specmode`` / ``colormode`` / ``selectedFilters``),
+    spelled as 7DT expects. *problems* lists what had to be corrected; an
+    invalid value falls back to the mode's default rather than being sent.
+    """
+    problems: List[str] = []
+    obsmode = _canonical(cfg.get("obsmode"), OBSMODES_7DT)
+    if obsmode is None:
+        problems.append(f"unknown obsmode {cfg.get('obsmode')!r}, using Spec")
+        obsmode = "Spec"
+
+    if obsmode == "Spec":
+        specmode = _canonical(cfg.get("specmode") or "specall", SPECMODES_7DT)
+        if specmode is None:
+            problems.append(f"unknown specmode {cfg.get('specmode')!r}, using specall")
+            specmode = "specall"
+        return {"obsmode": obsmode, "specmode": specmode}, problems
+
+    if obsmode == "Color":
+        colormode = _canonical(cfg.get("colormode") or "gri", COLORMODES_7DT)
+        if colormode is None:
+            problems.append(f"unknown colormode {cfg.get('colormode')!r}, using gri")
+            colormode = "gri"
+        return {"obsmode": obsmode, "colormode": colormode}, problems
+
+    raw = cfg.get("selectedFilters") or []
+    if isinstance(raw, str):
+        raw = raw.split(",")
+    filters: List[str] = []
+    for f in raw:
+        name = _canonical(f, FILTERS_7DT)
+        if name is None:
+            problems.append(f"unknown filter {f!r} dropped")
+        elif name not in filters:
+            filters.append(name)
+    if not filters:
+        problems.append("no filter selected, using g,r,i")
+        filters = list(FILTERS_7DT_ALL_UNITS)
+    return {"obsmode": obsmode, "selectedFilters": filters}, problems
+
+
+def deep_filter_note(filters: List[str]) -> str:
+    """Warning for a Deep request whose filters are not on every unit ('' if none)."""
+    partial = [f for f in filters if f not in FILTERS_7DT_ALL_UNITS]
+    if not partial:
+        return ""
+    return (f"{', '.join(partial)} {'is' if len(partial) == 1 else 'are'} not on every unit: "
+            "units without a selected filter are left out of the observation.")
+
+
+# ---------------------------------------------------------------------------
 # Criterion functions
 # Each function receives (notice_data, visibility_result, emailer) and returns
 # bool. The emailer instance is passed so a criterion can read per-instance
@@ -801,6 +883,7 @@ class GCNToOEmailer:
                 "imageCount":        3,
                 "obsmode":           "Spec",
                 "specmode":          "specall",
+                "colormode":         "gri",
                 "abortObservation":  "No",
                 "priority":          "50",
                 "gain":              "2750",
@@ -869,12 +952,15 @@ class GCNToOEmailer:
 
         # 7DT-only fields (RASA36 has fixed r-band, Single mode, no radius / obsStart)
         if self.telescope != "RASA36":
+            mode, problems = normalize_7dt_mode(cfg)
+            for problem in problems:
+                logger.warning(f"[{self.telescope}] ToO for {target_name}: {problem}")
+            data.update(mode)
             data.update({
-                "specmode":          cfg.get("specmode", "specall"),
-                "selectedFilters":   cfg.get("selectedFilters", []),
                 "selectedTelNumber": cfg.get("selectedTelNumber", 1),
                 "radius":            cfg.get("radius", "0"),
-                "obsStartTime":      cfg.get("obsStartTime", datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
+                # None = no scheduling constraint, observe as soon as possible.
+                "obsStartTime":      cfg.get("obsStartTime") or None,
             })
 
         if cfg.get("additional_comments"):
@@ -895,46 +981,51 @@ class GCNToOEmailer:
         if self.telescope == "RASA36":
             return self._build_body_rasa36(email_data)
 
+        # Layout of the 7DT ToO form mail (labels are on tcspy's whitelist).
+        # Only the field of the selected obsmode follows the Obsmode line.
         obsmode = email_data.get("obsmode", "Spec")
         if obsmode == "Spec":
-            details = f"- Specmode: {email_data.get('specmode', 'specall')}"
+            mode_lines = f"\n- Specmode: {email_data.get('specmode', 'specall')}"
+        elif obsmode == "Color":
+            mode_lines = f"\n- Colormode: {email_data.get('colormode', 'gri')}"
         else:
-            details = (
-                f"- Filters: {','.join(email_data.get('selectedFilters', []))}\n"
-                f"    - NumberOfTelescopes: {email_data.get('selectedTelNumber', 1)}"
+            mode_lines = (
+                f"\n- Filters: {','.join(email_data.get('selectedFilters', []))}"
+                f"\n- Number of Telescopes: {email_data.get('selectedTelNumber', 1)}"
             )
+        is_too   = _tcspy_bool(email_data.get("isToO", True))
+        is_rapid = _tcspy_bool(email_data.get("rapidToO", False))
 
         return f"""
 ================================
-AUTOMATIC ToO Request - GRB Alert
+    New ToO Request Submitted
 ================================
 
 **Observation Information**
---------------------------
+----------------------
 - Requester: {email_data['requester']}
 - Target Name: {email_data['target']}
-- Right Ascension: {email_data['ra']}
-- Declination:     {email_data['dec']}
-- Total Exposure:  {email_data['exposure']} s
-- Single Exposure: {email_data['singleExposure']} s
-- # of Images:     {email_data['imageCount']}
-- Obsmode:         {obsmode}
-    {details}
+- Right Ascension (R.A.): {email_data['ra']}
+- Declination (Dec.): {email_data['dec']}
+- Total Exposure Time (seconds): {float(email_data['exposure'])}
+- Single Exposure Time (seconds): {float(email_data['singleExposure'])}
+- # of images: {email_data['imageCount']}
+- Obsmode: {obsmode}{mode_lines}
 
 **Detailed Settings**
 --------------------
-- Abort Current Observation: {email_data['abortObservation']}
-- Priority:  {email_data['priority']}
-- Gain:      {email_data['gain']}
-- Radius:    {email_data['radius']}
-- Binning:   {email_data['binning']}
-- Obs Start: {email_data['obsStartTime']}
-- Comments:  {email_data['comments']}
-
-================================
-THIS IS AN AUTOMATED REQUEST
-PLEASE TAKE APPROPRIATE ACTION
-================================
+- Is_ToO: {is_too}
+- Is_rapid_ToO: {is_rapid}
+- Cadence: 1
+- Number of Observations: 1
+- ToO start time: None
+- ToO end time: None
+- Priority: {email_data['priority']}
+- Gain: {email_data['gain']}
+- Radius (arcsec): {float(email_data.get('radius') or 0)}
+- Binning: {email_data['binning']}
+- Observation Start Time: {email_data.get('obsStartTime')}
+- Comments: {_sanitize_for_tcspy(email_data.get('comments', ''))}
 """
 
     def _build_body_rasa36(self, email_data: Dict[str, Any]) -> str:
