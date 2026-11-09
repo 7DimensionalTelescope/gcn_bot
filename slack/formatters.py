@@ -27,6 +27,8 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 import pytz
 import voeventparse as vp
 
+from gcn.linking import angular_sep
+
 logger = logging.getLogger(__name__)
 
 
@@ -237,72 +239,116 @@ class MessageFormatter:
         differences: Dict[str, Any],
         notice_data: Dict[str, Any],
         kind: str = "",
+        previous: Optional[Dict[str, Any]] = None,
+        tile_result: Optional[Dict[str, Any]] = None,
+        tile_result_rasa36: Optional[Dict[str, Any]] = None,
+        visibility_result: Optional[Dict[str, Any]] = None,
+        visibility_result_loao: Optional[Dict[str, Any]] = None,
     ) -> str:
         """
-        Compose a compact Slack mrkdwn string showing only changed fields.
+        Compose the text-only thread update: everything needed to judge a
+        follow-up, without re-uploading plots (see ``THREAD_UPDATE_PLOTS``).
 
         Parameters
         ----------
         differences : dict
             As returned by ``GCNNoticeHandler.compare_event_data()``.
         notice_data : dict
-            Incoming notice data (used for the facility name in the header).
+            Incoming notice data (facility, current RA/DEC/Error).
         kind : str
             Notice kind shown next to the facility (see :meth:`notice_kind`).
+        previous : dict | None
+            The event's ASCII row before this notice — gives the shift.
+        tile_result, tile_result_rasa36 : dict | None
+            Tile coverage at the new position (``TileManager.get_tile_info``).
+        visibility_result, visibility_result_loao : dict | None
+            ``VisibilityManager.get_status`` / ``get_status_loao`` results.
         """
         try:
             facility = notice_data.get("Facility", "Unknown")
             label = f"{facility} ({kind})" if kind else facility
-            lines: List[str] = [
-                f"🔄 *UPDATE: {label}*",
-                "> *New Information:*",
-            ]
+            lines: List[str] = [f"🔄 *UPDATE: {label}*"]
 
             if "facility_change" in differences:
                 ch = differences["facility_change"]
-                lines.append(f"> - 🔬 *Instrument:* {ch['from']} → *{ch['to']}*")
+                lines.append(f"> 🔬 *Instrument:* {ch['from']} → *{ch['to']}*")
 
-            if "coordinates" in differences:
-                coords = differences["coordinates"]
-                parts: List[str] = []
-                if "RA"    in coords: parts.append(f"RA={coords['RA']}")
-                if "DEC"   in coords: parts.append(f"DEC={coords['DEC']}")
-                if "Error" in coords: parts.append(f"±{coords['Error']}°")
-                if parts:
-                    lines.append(f"> - 📍 *Coordinates:* {', '.join(parts)}")
+            position = self._update_position_line(notice_data, previous, "coordinates" in differences)
+            if position:
+                lines.append(position)
 
-            if "visibility" in differences:
-                vis   = differences["visibility"]
-                case  = vis.get("case", vis.get("status", ""))  # support both key names
-                msg   = vis.get("message", "")
+            tiles = []
+            for tel, tr in (("7DT", tile_result), ("RASA36", tile_result_rasa36)):
+                if tr is None:
+                    continue
+                n = tr.get("n_tiles", 0)
+                part = f"{tel} *{n}*" if n else f"{tel} none"
+                db = tr.get("db_count")
+                if n and db is not None:
+                    part += f" (ref. images {min(db, n)}/{n})"
+                tiles.append(part)
+            if tiles:
+                lines.append(f"> 🧩 *Tiles to cover the error region:* {' · '.join(tiles)}")
 
-                if case == "observable_now":
-                    remaining = vis.get("remaining_hours", 0)
-                    end_t     = vis.get("observable_end")
-                    end_s     = end_t.strftime("%H:%M") if hasattr(end_t, "strftime") else str(end_t or "Unknown")
-                    lines.append(f"> - 🌃 *Visibility:* 🟢 Observable until {end_s} CLT ({self._fmt_duration(remaining)} remaining)")
-                elif case == "observable_later":
-                    hrs   = vis.get("hours_until_observable", 0)
-                    start = vis.get("observable_start")
-                    st_s  = start.strftime("%H:%M") if hasattr(start, "strftime") else str(start or "Unknown")
-                    lines.append(f"> - 🌃 *Visibility:* 🟠 Observable in {self._fmt_duration(hrs)} (from {st_s} CLT)")
-                elif case == "observable_tomorrow":
-                    lines.append("> - 🌃 *Visibility:* 🔵 Observable Tomorrow Night")
-                else:
-                    reason = vis.get("reason", msg or "Unknown limitation")
-                    lines.append(f"> - 🌃 *Visibility:* 🔴 Not Observable ({reason})")
+            for site, vr in (("7DT & RASA36 (Chile)", visibility_result),
+                             ("LOAO (Arizona)", visibility_result_loao)):
+                if vr:
+                    lines.append(f"> 🌃 *{site}:* {self._visibility_brief(vr)}")
 
-            if len(lines) <= 2:
-                lines.append("> - ℹ️ *Status:* Updated information received")
-
+            if len(lines) == 1:
+                lines.append("> ℹ️ Updated information received")
             return "\n".join(lines)
 
         except Exception as exc:
             logger.error(f"Error formatting thread message: {exc}")
             return (
                 f"🔄 *UPDATE: {notice_data.get('Facility', 'Unknown')}*\n"
-                "> - ℹ️ *Status:* Updated information received"
+                "> ℹ️ Updated information received"
             )
+
+    def _update_position_line(
+        self, notice_data: Dict[str, Any], previous: Optional[Dict[str, Any]], changed: bool,
+    ) -> str:
+        """``📍 Position: RA …, Dec …, err … — moved X° (previous err Y)``."""
+        def num(v: Any) -> Optional[float]:
+            try:
+                f = float(str(v).strip().strip('"'))
+            except (TypeError, ValueError):
+                return None
+            return None if f != f else f
+
+        ra, dec, err = num(notice_data.get("RA")), num(notice_data.get("DEC")), num(notice_data.get("Error"))
+        if ra is None or dec is None:
+            return ""
+        text = f"> 📍 *Position:* RA {ra:g}, Dec {dec:g}"
+        if err is not None:
+            text += f", err {self.fmt_err(err)}"
+        p_ra, p_dec, p_err = (num((previous or {}).get(k)) for k in ("RA", "DEC", "Error"))
+        if not changed:
+            return text + " (unchanged)"
+        if p_ra is not None and p_dec is not None:
+            shift = angular_sep(p_ra, p_dec, ra, dec)
+            moved = f"{shift:.1f}°" if shift >= 0.1 else f"{shift * 60:.1f}′"
+            prev = f", previous err {self.fmt_err(p_err)}" if p_err is not None else ""
+            text += f" — moved {moved}{prev}"
+        return text
+
+    def _visibility_brief(self, vr: Dict[str, Any]) -> str:
+        """One line: when the target can be observed, for how long, how high."""
+        case = vr.get("case", "")
+        window = ((vr.get("details") or {}).get("tonight") or {}).get("window") or {}
+        hhmm = lambda iso: str(iso or "")[11:16]
+        alt = window.get("max_altitude")
+        alt_s = f" · max alt {float(alt):.0f}°" if alt is not None else ""
+        if case == "observable_now" and window:
+            return (f"🟢 Observable now until {hhmm(window.get('end_time_utc'))} UTC "
+                    f"({self._fmt_duration(float(window.get('time_remaining_hours', 0)))} left{alt_s})")
+        if case == "observable_later" and window:
+            return (f"🟠 Observable {hhmm(window.get('start_time_utc'))}–{hhmm(window.get('end_time_utc'))} UTC "
+                    f"(in {self._fmt_duration(float(window.get('time_until_start_hours', 0)))}, "
+                    f"{self._fmt_duration(float(window.get('duration_hours', 0)))} window{alt_s})")
+        emoji = self._VIS_EMOJI.get(case, "🔴")
+        return f"{emoji} {vr.get('message', '')}".strip()
 
     # ------------------------------------------------------------------
     # Private: facility helpers

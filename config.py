@@ -67,6 +67,10 @@ _DEFAULTS: Dict[str, Any] = {
     # Logging
     "LOG_FILE": "",  # empty = stdout only
 
+    # Re-upload tile / visibility plots on thread updates (off: the update
+    # text carries position, tile counts and observability instead)
+    "THREAD_UPDATE_PLOTS": False,
+
     # Same-burst linking across facility families (gcn/linking.py has the
     # evidence for each value). A new notice is the same burst as an existing
     # event of another family when trigger times are within the window and
@@ -382,6 +386,10 @@ class BotConfig:
 
     def _get(self, key: str) -> Any:
         return self.__dict__.get(key.lower(), _DEFAULTS[key])
+
+    @property
+    def thread_update_plots(self) -> bool:
+        return bool(self._get("THREAD_UPDATE_PLOTS"))
 
     @property
     def same_event_link(self) -> bool:

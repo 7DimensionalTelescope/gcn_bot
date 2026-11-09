@@ -1558,10 +1558,8 @@ class GCNNoticeHandler:
         else:
             prefix, sep, alphabet = "GRB", " ", ascii_uppercase
 
-        if isinstance(trigger_date, datetime):
-            date_key = trigger_date.strftime("%y%m%d")
-        else:
-            date_key = datetime.now(tz=timezone.utc).strftime("%y%m%d")
+        t = linking.to_utc(trigger_date)       # datetime or "YYYY-MM-DD hh:mm:ss"
+        date_key = (t if t is not None else datetime.now(tz=timezone.utc)).strftime("%y%m%d")
 
         used: set = set()
         if not df.empty and "Name" in df.columns:

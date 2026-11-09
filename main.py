@@ -901,28 +901,23 @@ class GCNBot:
             logger.info("No meaningful differences found — skipping thread update")
             return
 
+        # Plots are re-uploaded only when THREAD_UPDATE_PLOTS is on: the text
+        # carries position + shift, tile counts and observability instead (each
+        # update used to add 3-5 posts; GBM FIN_POS alone ~20 updates/month).
         coord_changed = isinstance(differences, dict) and "coordinates" in differences
-
-        # Build tile suffix for the update text
-        tile_suffix = ""
-        if tile_result is not None:
-            n = tile_result["n_tiles"]
-            tile_suffix = f"\n - 7DT Tiles: {n} tile{'s' if n != 1 else ''}"
-        if tile_result_rasa36 is not None:
-            n = tile_result_rasa36["n_tiles"]
-            tile_suffix += f"\n - RASA36 Tiles: {n} tile{'s' if n != 1 else ''}"
+        plots = coord_changed and self.config.thread_update_plots
 
         thread_update = self.formatter.format_thread_update(
-            differences, notice_data, kind=self.formatter.notice_kind(topic)
+            differences, notice_data, kind=self.formatter.notice_kind(topic),
+            previous=existing_event,
+            tile_result=tile_result, tile_result_rasa36=tile_result_rasa36,
+            visibility_result=visibility_result, visibility_result_loao=visibility_result_loao,
         )
-        if isinstance(thread_update, list):
-            send_kwargs = dict(thread_ts=existing_thread_ts, blocks=thread_update, text="GCN Notice Update")
-        else:
-            send_kwargs = dict(thread_ts=existing_thread_ts, text=str(thread_update) + tile_suffix)
+        send_kwargs = dict(thread_ts=existing_thread_ts, text=str(thread_update))
 
         if self.send_to_slack:
             # Upload tile plots first (so they appear above the text in the thread)
-            if coord_changed and ra is not None and dec is not None:
+            if plots and ra is not None and dec is not None:
                 error = notice_data.get("Error")
                 if tile_result is not None:
                     try:
@@ -965,7 +960,7 @@ class GCNBot:
             logger.info(f"Thread update posted (thread_ts={existing_thread_ts})")
 
             # Upload updated visibility plots if coordinates changed
-            if coord_changed and ra is not None and dec is not None:
+            if plots and ra is not None and dec is not None:
                 target = notice_data.get("Name", "Target")
                 if visibility_result:
                     self._upload_visibility_plot(

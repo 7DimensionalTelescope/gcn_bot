@@ -53,6 +53,11 @@ GWPORTAL_BASE_URL = "https://your-portal-host:port/"
 GWPORTAL_API_KEY  = "your-gwportal-api-key"
 
 # ---------------------------------------------------------------------------
+# Slack thread updates
+# ---------------------------------------------------------------------------
+THREAD_UPDATE_PLOTS = false   # re-upload tile/visibility plots on each position update (false: text only — position + shift, tiles, observability)
+
+# ---------------------------------------------------------------------------
 # Same-burst linking (one burst seen by several facilities, e.g. Fermi GBM + SVOM)
 # ---------------------------------------------------------------------------
 # Values were fixed on the bot's Sep–Nov 2026 history: 8/8 genuine pairs, 0 false
