@@ -405,6 +405,18 @@ def normalize_7dt_mode(cfg: Dict[str, Any]) -> Tuple[Dict[str, Any], List[str]]:
     return {"obsmode": obsmode, "selectedFilters": filters}, problems
 
 
+AUTO_COMMENT_SOURCE = "Automatic ToO request from GCN Alert System."
+MANUAL_COMMENT_SOURCE = "Manual ToO request via Slack."
+
+
+def gcn_event_comment(notice_data: Dict[str, Any], source: str) -> str:
+    """Comment line naming the GCN event, facility and trigger ID."""
+    return (f"New event {notice_data.get('Name', 'New_GRB_Event')}. "
+            f"Facility: {notice_data.get('Facility')}. "
+            f"Trigger: {notice_data.get('Trigger_num')}. "
+            f"{source}")
+
+
 def deep_filter_note(filters: List[str]) -> str:
     """Warning for a Deep request whose filters are not on every unit ('' if none)."""
     partial = [f for f in filters if f not in FILTERS_7DT_ALL_UNITS]
@@ -942,12 +954,7 @@ class GCNToOEmailer:
             # to the originating GCN notice even after a position refinement.
             "facility":          notice_data.get("Facility"),
             "trigger_num":       notice_data.get("Trigger_num"),
-            "comments": (
-                f"New event {target_name}. "
-                f"Facility: {notice_data.get('Facility')}. "
-                f"Trigger: {notice_data.get('Trigger_num')}. "
-                f"Automatic ToO request from GCN Alert System."
-            ),
+            "comments":          gcn_event_comment(notice_data, AUTO_COMMENT_SOURCE),
         }
 
         # 7DT-only fields (RASA36 has fixed r-band, Single mode, no radius / obsStart)
@@ -963,6 +970,11 @@ class GCNToOEmailer:
                 "obsStartTime":      cfg.get("obsStartTime") or None,
             })
 
+        if "comments" in cfg:
+            # Manual form: its comment box starts as the event line (see
+            # gcn_event_comment) and is sent as edited; emptied → event line.
+            data["comments"] = (str(cfg["comments"]).strip()
+                                or gcn_event_comment(notice_data, MANUAL_COMMENT_SOURCE))
         if cfg.get("additional_comments"):
             data["comments"] += f" {cfg['additional_comments']}"
 

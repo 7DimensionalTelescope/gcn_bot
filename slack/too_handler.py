@@ -20,6 +20,7 @@ constructor arguments so it can be tested with mocks independently.
 """
 
 import json
+import re
 import uuid
 import logging
 from typing import Any, Callable, Dict, List, Optional
@@ -28,7 +29,7 @@ from slack_sdk.errors import SlackApiError
 
 from too.emailer import (
     COLORMODES_7DT, FILTERS_7DT, FILTERS_7DT_ALL_UNITS, OBSMODES_7DT,
-    SPECMODES_7DT, deep_filter_note,
+    MANUAL_COMMENT_SOURCE, SPECMODES_7DT, deep_filter_note, gcn_event_comment,
 )
 
 logger = logging.getLogger(__name__)
@@ -213,11 +214,7 @@ class SlackToOHandler:
             init_priority = str(cfg.get("priority", "50"))
             init_gain     = str(cfg.get("gain", "2750"))
             init_binning  = str(cfg.get("binning", "1"))
-            init_obsmode   = cfg.get("obsmode", "Spec")
-            init_specmode  = cfg.get("specmode", "specall")
-            init_colormode = cfg.get("colormode", "gri")
-            init_filters   = cfg.get("filters") or list(FILTERS_7DT_ALL_UNITS)
-            init_ntel      = str(cfg.get("ntelescope", 1))
+            init_obsmode  = cfg.get("obsmode", "Spec")
 
         if self.telescope == "RASA36":
             return self._open_modal_rasa36(
@@ -257,35 +254,8 @@ class SlackToOHandler:
                 self._input_block("exposure_block", "exposure_input", "Single Exposure Time (seconds) *", init_exposure, "100"),
                 # Image count
                 self._input_block("count_block", "count_input", "Number of Images *", init_count, "3"),
-                # Obs mode — only the field for the chosen mode is used
-                self._select_block("obsmode_block", "obsmode_input", "Observation Mode *",
-                                   OBSMODES_7DT, init_obsmode),
-                self._select_block("specmode_block", "specmode_input", "Spec Mode (Spec only)",
-                                   SPECMODES_7DT, init_specmode),
-                self._select_block("colormode_block", "colormode_input", "Color Mode (Color only)",
-                                   COLORMODES_7DT, init_colormode),
-                {
-                    "type": "input",
-                    "block_id": "filters_block",
-                    "optional": True,
-                    "element": {
-                        "type": "multi_static_select",
-                        "action_id": "filters_input",
-                        "initial_options": [
-                            self._option(f) for f in init_filters if f in FILTERS_7DT
-                        ],
-                        "options": [self._option(f) for f in FILTERS_7DT],
-                    },
-                    "label": {"type": "plain_text", "text": "Filters (Deep only)"},
-                    "hint": {
-                        "type": "plain_text",
-                        "text": ("Only g, r, i are on every unit. Units without a selected "
-                                 "filter are left out, so selecting many filters can leave "
-                                 "no unit to observe."),
-                    },
-                },
-                self._input_block("ntel_block", "ntel_input", "Number of Telescopes (Deep only)",
-                                  init_ntel, "1"),
+                # Obs mode — the blocks below it follow the chosen mode
+                *self._mode_blocks(init_obsmode),
                 {"type": "divider"},
                 # Priority
                 self._input_block("priority_block", "priority_input", "Priority *", init_priority, "50"),
@@ -329,7 +299,7 @@ class SlackToOHandler:
                         "type": "plain_text_input",
                         "action_id": "comments_input",
                         "multiline": True,
-                        "initial_value": f"Submitted via Slack for {target}" if target else "Submitted via Slack",
+                        "initial_value": gcn_event_comment(notice_data, MANUAL_COMMENT_SOURCE),
                         "placeholder": {"type": "plain_text", "text": "Additional comments or special instructions..."},
                     },
                     "label": {"type": "plain_text", "text": "Comments"},
@@ -433,7 +403,7 @@ class SlackToOHandler:
                         "type": "plain_text_input",
                         "action_id": "comments_input",
                         "multiline": True,
-                        "initial_value": f"Submitted via Slack for {target}" if target else "Submitted via Slack",
+                        "initial_value": gcn_event_comment(notice_data, MANUAL_COMMENT_SOURCE),
                         "placeholder": {"type": "plain_text", "text": "Additional comments or special instructions..."},
                     },
                     "label": {"type": "plain_text", "text": "Comments"},
@@ -486,9 +456,10 @@ class SlackToOHandler:
                 "selectedFilters":  ["r"],
             }
 
+        filters_id = self._filters_block_id(form_values)
         filters = [
             opt["value"]
-            for opt in form_values.get("filters_block", {})
+            for opt in form_values.get(filters_id, {})
                                   .get("filters_input", {})
                                   .get("selected_options", [])
         ]
@@ -528,9 +499,12 @@ class SlackToOHandler:
             errors["colormode_block"] = "Choose a color mode for Color observations."
         elif obsmode == "Deep":
             if not data.get("selectedFilters"):
-                errors["filters_block"] = "Choose at least one filter for Deep observations."
+                errors[self._filters_block_id(form_values)] = (
+                    "Choose at least one filter for Deep observations.")
             elif set(data["selectedFilters"]) == set(FILTERS_7DT):
-                errors["filters_block"] = "No unit carries every filter, so nothing would be observed."
+                errors[self._filters_block_id(form_values)] = (
+                    "No unit carries every filter, so nothing would be observed. "
+                    "Deselect the filters you don't need.")
             ntel = str(data.get("selectedTelNumber") or "").strip()
             if not ntel.isdigit() or int(ntel) < 1:
                 errors["ntel_block"] = "Enter a whole number of telescopes (1 or more)."
@@ -563,6 +537,18 @@ class SlackToOHandler:
         def handle_modal_closed(ack, body, view):
             ack()
             self._emailer.release_prewarm(self._lease_from(view))
+
+        if self.telescope != "RASA36":
+            # Mode dropdown and filter shortcut buttons redraw the open modal.
+            @app.action("obsmode_input")
+            def handle_obsmode_change(ack, body, client):
+                ack()
+                self._on_form_action(body, client)
+
+            @app.action(re.compile(r"^filters_(all|gri|clear)$"))
+            def handle_filter_shortcut(ack, body, client):
+                ack()
+                self._on_form_action(body, client)
 
         logger.info(f"Slack ToO handlers registered ({self.telescope})")
 
@@ -711,7 +697,7 @@ class SlackToOHandler:
                 "priority":          form_data.get("priority", "50"),
                 "gain":              form_data.get("gain", "25"),
                 "binning":           form_data.get("binning", "1"),
-                "additional_comments": form_data.get("comments", ""),
+                "comments":          form_data.get("comments") or "",
             }
         else:
             too_config = {
@@ -726,7 +712,7 @@ class SlackToOHandler:
                 "priority":          form_data.get("priority", "50"),
                 "gain":              form_data.get("gain", "2750"),
                 "binning":           form_data.get("binning", "1"),
-                "additional_comments": form_data.get("comments", ""),
+                "comments":          form_data.get("comments") or "",
             }
 
         # Merge with notice_data for the emailer
@@ -776,6 +762,128 @@ class SlackToOHandler:
     # ------------------------------------------------------------------
     # Private: block builder helper
     # ------------------------------------------------------------------
+
+    # ------------------------------------------------------------------
+    # 7DT form: mode-dependent blocks
+    # ------------------------------------------------------------------
+
+    _MODE_BLOCK_IDS = ("specmode_block", "colormode_block", "filters_actions", "ntel_block")
+    _FILTER_SHORTCUTS = {
+        "filters_all":   list(FILTERS_7DT),
+        "filters_gri":   list(FILTERS_7DT_ALL_UNITS),
+        "filters_clear": [],
+    }
+
+    @staticmethod
+    def _filters_block_id(form_values: Dict[str, Any]) -> str:
+        """Current id of the filters block.
+
+        A shortcut button replaces the block under a new id ("filters_block_N"):
+        Slack keeps what was typed into an input block whose id is unchanged,
+        which would override the new selection.
+        """
+        return next((k for k in form_values if k.startswith("filters_block")), "filters_block")
+
+    def _mode_blocks(
+        self,
+        obsmode: str,
+        filters: Optional[List[str]] = None,
+        filters_block_id: str = "filters_block",
+    ) -> List[Dict[str, Any]]:
+        """Observation-mode select plus only the fields that mode uses."""
+        cfg = self.too_config
+        obsmode = next((m for m in OBSMODES_7DT if m.lower() == str(obsmode).lower()), "Spec")
+        mode_select = self._select_block("obsmode_block", "obsmode_input", "Observation Mode *",
+                                         OBSMODES_7DT, obsmode)
+        mode_select["dispatch_action"] = True    # redraw the form when it changes
+        blocks = [mode_select]
+        if obsmode == "Spec":
+            blocks.append(self._select_block("specmode_block", "specmode_input", "Spec Mode *",
+                                             SPECMODES_7DT, cfg.get("specmode", "specall")))
+        elif obsmode == "Color":
+            blocks.append(self._select_block("colormode_block", "colormode_input", "Color Mode *",
+                                             COLORMODES_7DT, cfg.get("colormode", "gri")))
+        else:
+            if filters is None:
+                filters = cfg.get("filters") or list(FILTERS_7DT_ALL_UNITS)
+            element: Dict[str, Any] = {
+                "type": "multi_static_select",
+                "action_id": "filters_input",
+                "options": [self._option(f) for f in FILTERS_7DT],
+            }
+            initial = [self._option(f) for f in FILTERS_7DT if f in filters]
+            if initial:
+                element["initial_options"] = initial
+            blocks += [
+                {
+                    "type": "input",
+                    "block_id": filters_block_id,
+                    "element": element,
+                    "label": {"type": "plain_text", "text": "Filters *"},
+                    "hint": {
+                        "type": "plain_text",
+                        "text": ("Only g, r, i are on every unit. Units without a selected "
+                                 "filter are left out, so selecting many filters can leave "
+                                 "no unit to observe."),
+                    },
+                },
+                {
+                    "type": "actions",
+                    "block_id": "filters_actions",
+                    "elements": [
+                        {"type": "button", "action_id": aid,
+                         "text": {"type": "plain_text", "text": text}}
+                        for aid, text in (("filters_all", "Select all"),
+                                          ("filters_gri", "g, r, i"),
+                                          ("filters_clear", "Clear"))
+                    ],
+                },
+                self._input_block("ntel_block", "ntel_input", "Number of Telescopes *",
+                                  str(cfg.get("ntelescope", 1)), "1"),
+            ]
+        return blocks
+
+    def _redrawn_view(self, view: Dict[str, Any], action: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """*view* with its mode blocks rebuilt for *action*, or None if unchanged."""
+        values = view.get("state", {}).get("values", {})
+        old_filters_id = self._filters_block_id(values)
+        aid = action.get("action_id", "")
+        if aid == "obsmode_input":
+            obsmode = (action.get("selected_option") or {}).get("value", "Spec")
+            new_mode = self._mode_blocks(obsmode)
+        elif aid in self._FILTER_SHORTCUTS:
+            n = int(old_filters_id.rsplit("_", 1)[-1]) + 1 if old_filters_id[-1].isdigit() else 1
+            new_mode = self._mode_blocks("Deep", self._FILTER_SHORTCUTS[aid], f"filters_block_{n}")
+        else:
+            return None
+
+        blocks: List[Dict[str, Any]] = []
+        for block in view.get("blocks", []):
+            bid = block.get("block_id", "")
+            if bid == "obsmode_block":
+                blocks += new_mode
+            elif bid in self._MODE_BLOCK_IDS or bid.startswith("filters_block"):
+                continue
+            else:
+                blocks.append(block)
+        keep = ("type", "callback_id", "title", "submit", "close",
+                "notify_on_close", "private_metadata")
+        return {**{k: view[k] for k in keep if k in view}, "blocks": blocks}
+
+    def _on_form_action(self, body: Dict[str, Any], client) -> None:
+        view = body.get("view") or {}
+        try:
+            new_view = self._redrawn_view(view, body["actions"][0])
+        except (KeyError, IndexError, ValueError) as exc:
+            logger.warning(f"ToO form action ignored: {exc}")
+            return
+        if new_view is None:
+            return
+        try:
+            # hash: refuse the update if the view changed meanwhile (double click)
+            client.views_update(view_id=view["id"], hash=view.get("hash"), view=new_view)
+        except SlackApiError as exc:
+            logger.warning(f"ToO form redraw failed: {exc}")
 
     @staticmethod
     def _mode_summary(cfg: Dict[str, Any]) -> str:
