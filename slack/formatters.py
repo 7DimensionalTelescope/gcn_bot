@@ -278,14 +278,15 @@ class MessageFormatter:
                 lines.append(position)
 
             tiles = []
+            plural = lambda k: f"{k} tile{'s' if k != 1 else ''}"
             for tel, tr in (("7DT", tile_result), ("RASA36", tile_result_rasa36)):
                 if tr is None:
                     continue
                 n = tr.get("n_tiles", 0)
-                part = f"{tel} *{n}*" if n else f"{tel} none"
-                db = tr.get("db_count")
+                part = f"{tel} - {plural(n)}"
+                db = tr.get("db_count")          # tiles with reference images (7DT DB check)
                 if n and db is not None:
-                    part += f" (ref. images {min(db, n)}/{n})"
+                    part += f" (Ref tiles: {plural(min(db, n))})"
                 tiles.append(part)
             if tiles:
                 lines.append(f"> 🧩 *Tiles to cover the error region:* {' · '.join(tiles)}")

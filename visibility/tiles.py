@@ -226,24 +226,17 @@ class TileManager:
             # overlap, so fall back to point matching for small error circles.
             aperture = 0 if error < self.point_match_threshold else error
 
-            result = tiles.find_overlapping_tiles(
-                ra=ra,
-                dec=dec,
-                aperture=aperture,
-                fraction_overlap_lower=self.fraction_overlap_lower,
-                match_tolerance_minutes=self.match_tolerance_minutes,
-                visualize=False,
-            )
-
-            # find_overlapping_tiles returns a 3-tuple when no tiles match
-            if isinstance(result, tuple):
+            tile_ids = self._match_ids(tiles, ra, dec, aperture)
+            if aperture:
+                # supy counts a tile when overlap / *tile* area > fraction_overlap_lower,
+                # so a circle well inside a big tile never qualifies: RASA36 tiles
+                # (~3.05°×2.68°) reported 0 tiles for 0.3-0.51° errors, and a small
+                # circle near a 7DT tile edge could lose its own tile. The tile that
+                # holds the position always counts (point matching returns only a
+                # tile that contains the point, never a merely nearby one).
+                tile_ids += [t for t in self._match_ids(tiles, ra, dec, 0) if t not in tile_ids]
+            if not tile_ids:
                 return {"n_tiles": 0, "tile_ids": [], "db_count": None}
-
-            tile_table = tiles.tile_table
-            if tile_table is None or len(tile_table) == 0:
-                return {"n_tiles": 0, "tile_ids": [], "db_count": None}
-
-            tile_ids = list(tile_table["id"])
             db_count = (
                 self._db_checker.count_existing(tile_ids)
                 if self._db_checker is not None
@@ -254,6 +247,21 @@ class TileManager:
         except Exception as exc:
             logger.error(f"Tile info computation failed for RA={ra}, DEC={dec}: {exc}")
             return None
+
+    def _match_ids(self, tiles: Any, ra: float, dec: float, aperture: float) -> List[str]:
+        """Tile IDs supy matches for one aperture (0 = the tile containing the point)."""
+        result = tiles.find_overlapping_tiles(
+            ra=ra,
+            dec=dec,
+            aperture=aperture,
+            fraction_overlap_lower=self.fraction_overlap_lower,
+            match_tolerance_minutes=self.match_tolerance_minutes,
+            visualize=False,
+        )
+        # find_overlapping_tiles returns a 3-tuple when no tiles match
+        if isinstance(result, tuple) or tiles.tile_table is None or len(tiles.tile_table) == 0:
+            return []
+        return [str(t) for t in tiles.tile_table["id"]]
 
     def generate_plot(
         self,
@@ -279,18 +287,23 @@ class TileManager:
             aperture = 0 if error < self.point_match_threshold else error
 
             with tempfile.TemporaryDirectory() as tmpdir:
-                fig_path = tiles.find_overlapping_tiles(
-                    ra=ra,
-                    dec=dec,
-                    aperture=aperture,
-                    fraction_overlap_lower=self.fraction_overlap_lower,
-                    match_tolerance_minutes=self.match_tolerance_minutes,
-                    visualize=True,
-                    visualize_savepath=tmpdir,
-                    show=False,
-                    visualize_ncols=1,
-                    title=title
-                )
+                # A circle inside one big tile matches nothing by overlap (see
+                # get_tile_info) — then plot the tile holding the position.
+                for ap in ([aperture, 0] if aperture else [0]):
+                    fig_path = tiles.find_overlapping_tiles(
+                        ra=ra,
+                        dec=dec,
+                        aperture=ap,
+                        fraction_overlap_lower=self.fraction_overlap_lower,
+                        match_tolerance_minutes=self.match_tolerance_minutes,
+                        visualize=True,
+                        visualize_savepath=tmpdir,
+                        show=False,
+                        visualize_ncols=1,
+                        title=title
+                    )
+                    if not (isinstance(fig_path, tuple) or fig_path is None):
+                        break
 
                 # 3-tuple return means no tiles found → nothing to plot
                 if isinstance(fig_path, tuple) or fig_path is None:
