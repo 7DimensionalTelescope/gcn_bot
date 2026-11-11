@@ -69,6 +69,12 @@ class SlackToOHandler:
         ``provider(facility, trigger_num, telescope) -> str`` returning warning
         lines (mrkdwn) about linked same-burst events — a ToO already sent via
         another facility's event, or a better localization in its thread.
+    pending_provider : callable | None
+        ``provider(facility, trigger_num, telescope, ra, dec) -> str``: why a
+        request for that position must wait ("" = allowed) — an earlier request
+        of this event for the same tile is still open (not yet accepted /
+        observed). Shown when the modal opens; the submit is refused (field
+        error on RA, modal stays open) — no override. A different tile is fine.
     defaults_provider : callable | None
         ``provider(notice_data) -> dict | None`` returning the observation
         config the *automatic* ToO would use for this event. The RASA36 form is
@@ -87,6 +93,7 @@ class SlackToOHandler:
         defaults_provider: Optional[Callable[[Dict[str, Any]], Optional[Dict[str, Any]]]] = None,
         sent_at_provider: Optional[Callable[[str, str, str], str]] = None,
         link_note_provider: Optional[Callable[[str, str, str], str]] = None,
+        pending_provider: Optional[Callable[[str, str, str, Any, Any], str]] = None,
     ) -> None:
         self._slack      = slack
         self._emailer    = emailer
@@ -101,6 +108,7 @@ class SlackToOHandler:
         self._defaults_provider = defaults_provider
         self._sent_at_provider = sent_at_provider
         self._link_note_provider = link_note_provider
+        self._pending_provider = pending_provider
         # Bolt routing keys — unique per telescope so multiple handlers coexist
         self.action_id   = f"submit_too_request_{telescope.lower()}"
         self.callback_id = f"too_request_modal_{telescope.lower()}"
@@ -493,6 +501,28 @@ class SlackToOHandler:
             "selectedFilters":  filters,
         }
 
+    def _pending_errors(self, view: Dict[str, Any]) -> Dict[str, str]:
+        """Refuse a request while one for the same event + tile is still open."""
+        if self._pending_provider is None:
+            return {}
+        try:
+            meta = json.loads(view.get("private_metadata") or "{}")
+            values = view["state"]["values"]
+            ra = (values.get("ra_block", {}).get("ra_input", {}) or {}).get("value")
+            dec = (values.get("dec_block", {}).get("dec_input", {}) or {}).get("value")
+            reason = self._pending_provider(
+                str(meta.get("Facility", "")).strip(), str(meta.get("Trigger_num", "")).strip(),
+                self.telescope, ra, dec)
+        except Exception as exc:
+            logger.warning(f"ToO pending-request check failed: {exc}")
+            return {}
+        if not reason:
+            return {}
+        logger.info(f"Manual {self.telescope} ToO refused: {reason}")
+        # the field error stays short; the modal's top note has the full reason
+        first = reason.split(". ")[0].rstrip(".")
+        return {"ra_block": f"{first}. Wait until it is observed, or choose a different tile."}
+
     def validate_form(self, form_values: Dict[str, Any]) -> Dict[str, str]:
         """Slack ``errors`` dict (block_id → message) for an invalid 7DT form."""
         if self.telescope == "RASA36":
@@ -535,7 +565,7 @@ class SlackToOHandler:
         @app.view(self.callback_id)
         def handle_modal_submit(ack, body, client, view):
             submitted_at = time.time()   # the Submit click (timing tests)
-            errors = self.validate_form(view["state"]["values"])
+            errors = self.validate_form(view["state"]["values"]) or self._pending_errors(view)
             if errors:
                 ack(response_action="errors", errors=errors)   # modal stays open
                 return
@@ -583,6 +613,17 @@ class SlackToOHandler:
                 note = ""
             if note:
                 modal["blocks"].insert(0, {"type": "section", "text": {"type": "mrkdwn", "text": note}})
+        if self._pending_provider is not None:
+            try:
+                reason = self._pending_provider(facility, trigger, self.telescope,
+                                                notice_data.get("RA"), notice_data.get("DEC"))
+            except Exception as exc:
+                logger.warning(f"ToO pending-request lookup failed: {exc}")
+                reason = ""
+            if reason:
+                modal["blocks"].insert(0, {"type": "section", "text": {"type": "mrkdwn",
+                                                                        "text": f":no_entry: {reason}"}})
+                return
         if self._sent_at_provider is None:
             return
         try:
@@ -777,7 +818,8 @@ class SlackToOHandler:
                                       message=message if message["ts"] else None,
                                       rapid=too_is_rapid(too_config),
                                       requester=too_config.get("requester") or "",
-                                      sent_at=sent_at)
+                                      sent_at=sent_at,
+                                      ra=form_data.get("ra"), dec=form_data.get("dec"))
                     except Exception as exc:
                         logger.error(f"on_sent callback failed: {exc}")
         else:

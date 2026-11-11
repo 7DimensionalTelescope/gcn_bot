@@ -368,7 +368,8 @@ class ObservationTracker:
     def record_sent(self, telescope: str, facility: str, trigger: str, source: str,
                     name: str = "", message: Optional[Dict[str, Any]] = None,
                     rapid: Optional[bool] = None, requester: str = "",
-                    sent_at: Optional[float] = None) -> None:
+                    sent_at: Optional[float] = None, ra: Optional[float] = None,
+                    dec: Optional[float] = None) -> None:
         """Remember a request the bot just sent, to expect its announcement.
 
         ``message`` (``{channel, ts, text}``): the Slack message that shows this
@@ -377,7 +378,8 @@ class ObservationTracker:
         compare with the scheduler's "Immediate start?". ``requester``: the
         mail's Requester field — the scheduler announces *that* as the user.
         ``sent_at``: when SMTP accepted the mail (epoch; default now) — the
-        reference of the "after sending" times.
+        reference of the "after sending" times. ``ra``/``dec``: the requested
+        position — which tile a pending request holds (see ``pending_requests``).
         """
         if telescope not in self.channels or not trigger:
             return
@@ -385,7 +387,8 @@ class ObservationTracker:
         entry = {"telescope": telescope, "facility": str(facility), "trigger": str(trigger),
                  "name": str(name or ""), "source": source, "sent_at": sent_at or now,
                  "alert_id": "", "warned": False, "message": message, "lines": [],
-                 "rapid": rapid, "requester": (requester or "").lower()}
+                 "rapid": rapid, "requester": (requester or "").lower(),
+                 "ra": ra, "dec": dec}
         with self._lock:
             # The announcement can beat the send callback by a few seconds.
             for aid, alert in self._alerts.items():
@@ -397,6 +400,33 @@ class ObservationTracker:
             self._sent.append(entry)
             self._save()
         self._wake.set()  # start reading now
+
+    def pending_requests(self, telescope: str, facility: str, trigger: str) -> List[Dict[str, Any]]:
+        """Requests of this event to *telescope* that are still open.
+
+        Open = sent and awaiting acceptance (within the receipt timeout), or
+        accepted and not yet observed (no Success / ToO data transfer). Released:
+        observed, not announced within the timeout (lost — may be re-sent), or
+        no longer followed (``max_days``). Each item is the sent entry plus
+        ``accepted_at`` / ``tile`` (the scheduler's tile name) when accepted.
+        """
+        probe = {"telescope": telescope, "facility": str(facility), "trigger": str(trigger)}
+        now = self._clock()
+        out: List[Dict[str, Any]] = []
+        with self._lock:
+            for entry in self._sent:
+                if not self._same_event(entry, probe):
+                    continue
+                aid = entry.get("alert_id")
+                if not aid:
+                    if not entry.get("warned") and now - entry["sent_at"] <= self.receipt_timeout:
+                        out.append({**entry, "accepted_at": None, "tile": ""})
+                    continue
+                alert = self._alerts.get(aid)
+                if alert and not (alert.get("observed_at") or alert.get("transferred_at")):
+                    out.append({**entry, "accepted_at": alert["received_at"],
+                                "tile": alert.get("target", "")})
+        return out
 
     def poll_once(self, everything: bool = False) -> Optional[float]:
         """One pass: new announcements, replies of open alerts, timeouts.

@@ -268,6 +268,7 @@ class GCNBot:
             telescope="7DT",
             on_sent=self._on_manual_too_sent,
             sent_at_provider=self.notice_handler.too_sent_at,
+            pending_provider=self._pending_too_block,
             link_note_provider=self._too_link_note,
         )
         self.too_handler_rasa36 = SlackToOHandler(
@@ -278,6 +279,7 @@ class GCNBot:
             telescope="RASA36",
             on_sent=self._on_manual_too_sent,
             sent_at_provider=self.notice_handler.too_sent_at,
+            pending_provider=self._pending_too_block,
             link_note_provider=self._too_link_note,
             defaults_provider=self._rasa36_form_config,
         )
@@ -1542,7 +1544,8 @@ class GCNBot:
                 )
                 self._track_sent(telescope, facility, trigger, "deferred",
                                  notice_data.get("Name", ""), rapid=too_is_rapid(too_config),
-                                 sent_at=sent_at)
+                                 sent_at=sent_at, ra=notice_data.get("RA"),
+                                 dec=notice_data.get("DEC"))
             # Clear the pending marker either way; a failed send is not retried
             # (the operator is notified to submit manually).
             self.notice_handler.clear_too_deferred(facility, trigger, telescope)
@@ -1681,7 +1684,8 @@ class GCNBot:
                     f"· {self._rapid_tag(rapid)}"))
                 nd = notice_data or {}
                 self._track_sent(telescope, nd.get("Facility", ""), nd.get("Trigger_num", ""),
-                                 "auto", nd.get("Name", ""), rapid=rapid, sent_at=sent)
+                                 "auto", nd.get("Name", ""), rapid=rapid, sent_at=sent,
+                                 ra=nd.get("RA"), dec=nd.get("DEC"))
             else:
                 too_slot.finish_send(
                     telescope, ":warning: failed to send — check logs, submit manually"
@@ -1692,6 +1696,56 @@ class GCNBot:
     # ------------------------------------------------------------------
     # ToO observation tracking (see too/obs_tracker.py)
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _float_or_none(value: Any) -> Optional[float]:
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+
+    def _pending_too_block(
+        self, facility: str, trigger: str, telescope: str, ra: Any, dec: Any,
+    ) -> str:
+        """Why a manual request for this tile must wait ("" = allowed).
+
+        A request of the same event to the same telescope is still open (sent
+        and awaiting acceptance, or accepted and not yet observed — see
+        ``ObservationTracker.pending_requests``) and the new position falls in
+        the same tile. A different tile may always be requested. Unknown tiles
+        (outside coverage, no position recorded) count as the same.
+        """
+        if self.obs_tracker is None:
+            return ""
+        pending = self.obs_tracker.pending_requests(telescope, facility, trigger)
+        if not pending:
+            return ""
+        _, tiles = self._telescope_ctx(telescope)
+
+        def tile(r: Any, d: Any) -> Optional[str]:
+            r, d = self._float_or_none(r), self._float_or_none(d)
+            if tiles is None or r is None or d is None:
+                return None
+            return tiles.tile_of(r, d)
+
+        new = tile(ra, dec)
+        for p in pending:
+            old = tile(p.get("ra"), p.get("dec"))
+            if old is not None and new is not None and old != new:
+                continue                                  # another tile: allowed
+            sent = datetime.fromtimestamp(p["sent_at"], _KST).strftime("%H:%M:%S")
+            if p.get("accepted_at"):
+                acc = datetime.fromtimestamp(p["accepted_at"], timezone.utc).strftime("%H:%M:%S")
+                state = f"accepted {acc} UTC, not observed yet"
+            else:
+                state = "not accepted yet"
+            timeout = round(self.obs_tracker.receipt_timeout / 60)
+            return (f"The {telescope} ToO for tile {p.get('tile') or old or '?'} is still open "
+                    f"({p.get('source', 'sent')} request sent {sent} KST, {state}). Another "
+                    f"request for this tile is possible once it has been observed, or if it is "
+                    f"not accepted within {timeout} min. A different tile (other RA/Dec) can be "
+                    f"requested now.")
+        return ""
 
     @staticmethod
     def _rapid_tag(rapid: bool) -> str:
@@ -1710,20 +1764,22 @@ class GCNBot:
     def _track_sent(self, telescope: str, facility: Any, trigger: Any, source: str,
                     name: str = "", message: Optional[dict] = None,
                     rapid: Optional[bool] = None, requester: str = "",
-                    sent_at: Optional[float] = None) -> None:
+                    sent_at: Optional[float] = None, ra: Any = None, dec: Any = None) -> None:
         """Tell the tracker to expect the telescope's announcement of this request."""
         if self.obs_tracker is None:
             return
         try:
             self.obs_tracker.record_sent(telescope, str(facility or ""), str(trigger or ""),
                                          source, name=name, message=message, rapid=rapid,
-                                         requester=requester, sent_at=sent_at)
+                                         requester=requester, sent_at=sent_at,
+                                         ra=self._float_or_none(ra), dec=self._float_or_none(dec))
         except Exception as exc:
             logger.error(f"ToO tracking record failed ({telescope}): {exc}")
 
     def _on_manual_too_sent(
         self, facility: str, trigger: str, telescope: str, message: Optional[dict] = None,
         rapid: Optional[bool] = None, requester: str = "", sent_at: Optional[float] = None,
+        ra: Any = None, dec: Any = None,
     ) -> None:
         """Slack-button ToO sent: dup-guard marker + tracking.
 
@@ -1736,7 +1792,8 @@ class GCNBot:
         tracker = self.obs_tracker
         if message and tracker is not None and tracker.running and tracker.tracks(telescope):
             self._track_sent(telescope, facility, trigger, "manual", entry.get("name", ""),
-                             message=message, rapid=rapid, requester=requester, sent_at=sent_at)
+                             message=message, rapid=rapid, requester=requester, sent_at=sent_at,
+                             ra=ra, dec=dec)
             self._update_request_status(telescope, {**message, "lines": []})
             return
         if entry.get("thread_ts"):
@@ -1747,7 +1804,7 @@ class GCNBot:
             )
         # name: matches the request even if its Comments were edited in the form
         self._track_sent(telescope, facility, trigger, "manual", entry.get("name", ""),
-                         rapid=rapid, requester=requester, sent_at=sent_at)
+                         rapid=rapid, requester=requester, sent_at=sent_at, ra=ra, dec=dec)
 
     def _tracker_window(self, ra: float, dec: float) -> Optional[tuple]:
         """Tracker callback (tracker thread): (start, end) epochs of the target's

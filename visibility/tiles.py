@@ -248,6 +248,23 @@ class TileManager:
             logger.error(f"Tile info computation failed for RA={ra}, DEC={dec}: {exc}")
             return None
 
+    def tile_of(self, ra: float, dec: float) -> Optional[str]:
+        """ID of the tile containing the position (``None`` outside coverage).
+
+        7DT IDs are the 7DT scheduler's own (``T00500``…); RASA36 IDs are ours
+        (``R00501``…), not its scheduler's TOS names, so compare them only with
+        each other.
+        """
+        if not self.available:
+            return None
+        try:
+            tiles = self._make_tiles()
+            ids = self._match_ids(tiles, ra, dec, 0) if tiles is not None else []
+        except Exception as exc:
+            logger.error(f"Tile lookup failed for RA={ra}, DEC={dec}: {exc}")
+            return None
+        return ids[0] if ids else None
+
     def _match_ids(self, tiles: Any, ra: float, dec: float, aperture: float) -> List[str]:
         """Tile IDs supy matches for one aperture (0 = the tile containing the point)."""
         result = tiles.find_overlapping_tiles(
