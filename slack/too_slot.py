@@ -1,15 +1,22 @@
 """
-Auto-ToO status slot — one Slack message per event thread, edited in place.
+ToO status slot — one Slack message per event thread, edited in place.
 
 Instead of posting a new "ToO sent" reply for every telescope/outcome (which
 lands wherever the SMTP call happens to finish among the plot uploads), the
-bot posts a single ``🤖 Auto-ToO`` reply directly under the event's main
+bot posts a single ``🤖 ToO status`` reply directly under the event's main
 message and edits it as the state changes::
 
-    🤖 Auto-ToO
+    🤖 ToO status
     7DT     ✅ sent 15:54:50 KST
+            📥 accepted 06:55 UTC, 36 s after sending — tile T12561, queued for the night of 11-10
+            📸 observed — completed 11-11 02:59 UTC (100 s × 3)
     RASA36  ⏳ scheduled for 08:12 UTC (target rises; re-checked before send)
             ✅ sent 08:12 UTC (deferred)
+
+The accepted / observed / not-announced lines come from the telescopes'
+alert channels (too/obs_tracker.py). A manual (Slack-button) request shows
+its status under its own "ToO Request Submitted" confirmation instead; only
+with tracking off does it add a ``✋ manual request sent`` line here.
 
 Per telescope the slot keeps a list of lines:
 
@@ -95,7 +102,7 @@ class ToOSlotStore:
 
 
 class ToOSlot:
-    """The editable ``🤖 Auto-ToO`` status message of one event thread."""
+    """The editable ``🤖 ToO status`` message of one event thread."""
 
     def __init__(self, slack: Any, store: Optional[ToOSlotStore] = None) -> None:
         self._slack = slack
@@ -182,7 +189,7 @@ class ToOSlot:
     # ------------------------------------------------------------------
 
     def _render(self) -> List[Dict[str, Any]]:
-        out = [":robot_face: *Auto-ToO*"]
+        out = [":robot_face: *ToO status*"]
         for telescope, lines in self._lines.items():
             if not lines:
                 continue
@@ -195,7 +202,7 @@ class ToOSlot:
         if not self._attached or not any(self._lines.values()):
             return
         blocks = self._render()
-        text = "Auto-ToO status"
+        text = "ToO status"
         resp = None
         if self._slot_ts:
             resp = self._slack.update_message(ts=self._slot_ts, blocks=blocks, text=text)

@@ -128,6 +128,29 @@ _DEFAULTS: Dict[str, Any] = {
     # skips TCP+TLS+AUTH (~1.1-1.5 s); closed again as soon as it is unused.
     # False = every send opens and closes its own connection.
     "SMTP_PREWARM": True,
+    # ToO observation tracking — follows the bot's ToO requests through the
+    # telescopes' Slack alert channels (accepted → observed); see too/obs_tracker.py.
+    "OBS_TRACK_ENABLED": True,
+    "OBS_ALERT_CHANNEL_7DT": "",
+    "OBS_ALERT_CHANNEL_RASA36": "",
+    "OUTPUT_TOO_TRACKING": "too_tracking.json",
+    # Channels are read only while something is pending: fast while a sent
+    # request awaits its announcement (observed 8 s – 17.5 min), slow while
+    # accepted ones await observation, not at all otherwise.
+    "OBS_TRACK_FAST_POLL_SEC": 10.0,
+    "OBS_TRACK_SLOW_POLL_SEC": 300.0,
+    # After an observation, wait this long for the RASA36 ToO data-transfer
+    # message (seen 10 min and ~1 h after).
+    "OBS_TRACK_TRANSFER_WAIT_HOURS": 3.0,
+    # Warn when a sent request is not announced within this long. Observed
+    # send→announcement: 8 s, 36 s, 17.5 min.
+    "OBS_TRACK_RECEIPT_TIMEOUT_MIN": 30.0,
+    # A queued night is over at this UTC hour (CTIO observing ends by ~10:30 UTC).
+    "OBS_TRACK_NIGHT_END_UTC_HOUR": 12,
+    # Days an accepted request is followed (longest accepted→observed seen: 43.9 h).
+    "OBS_TRACK_MAX_DAYS": 3.0,
+    # First start only: how far back to read the channels.
+    "OBS_TRACK_LOOKBACK_HOURS": 24.0,
 
     # Email credentials
     "EMAIL_FROM": "",
@@ -346,6 +369,11 @@ class BotConfig:
         return self._resolve_path(raw)
 
     @property
+    def output_too_tracking(self) -> str:
+        raw = str(self.__dict__.get("output_too_tracking", _DEFAULTS["OUTPUT_TOO_TRACKING"]))
+        return self._resolve_path(raw)
+
+    @property
     def output_thread_index(self) -> str:
         raw = str(self.__dict__.get("output_thread_index", _DEFAULTS["OUTPUT_THREAD_INDEX"]))
         return self._resolve_path(raw)
@@ -517,6 +545,55 @@ class BotConfig:
             "too_deferred_check_interval_sec",
             _DEFAULTS["TOO_DEFERRED_CHECK_INTERVAL_SEC"],
         ))
+
+    @property
+    def obs_track_enabled(self) -> bool:
+        """Follow sent ToOs through the telescopes' Slack alert channels."""
+        return bool(self.__dict__.get("obs_track_enabled", _DEFAULTS["OBS_TRACK_ENABLED"]))
+
+    @property
+    def obs_alert_channels(self) -> Dict[str, str]:
+        """telescope → alert channel ID (empty = not tracked)."""
+        return {
+            "7DT": str(self.__dict__.get("obs_alert_channel_7dt",
+                                         _DEFAULTS["OBS_ALERT_CHANNEL_7DT"]) or ""),
+            "RASA36": str(self.__dict__.get("obs_alert_channel_rasa36",
+                                            _DEFAULTS["OBS_ALERT_CHANNEL_RASA36"]) or ""),
+        }
+
+    @property
+    def obs_track_fast_poll_sec(self) -> float:
+        return float(self.__dict__.get("obs_track_fast_poll_sec",
+                                       _DEFAULTS["OBS_TRACK_FAST_POLL_SEC"]))
+
+    @property
+    def obs_track_slow_poll_sec(self) -> float:
+        return float(self.__dict__.get("obs_track_slow_poll_sec",
+                                       _DEFAULTS["OBS_TRACK_SLOW_POLL_SEC"]))
+
+    @property
+    def obs_track_transfer_wait_hours(self) -> float:
+        return float(self.__dict__.get("obs_track_transfer_wait_hours",
+                                       _DEFAULTS["OBS_TRACK_TRANSFER_WAIT_HOURS"]))
+
+    @property
+    def obs_track_receipt_timeout_min(self) -> float:
+        return float(self.__dict__.get("obs_track_receipt_timeout_min",
+                                       _DEFAULTS["OBS_TRACK_RECEIPT_TIMEOUT_MIN"]))
+
+    @property
+    def obs_track_night_end_utc_hour(self) -> int:
+        return int(self.__dict__.get("obs_track_night_end_utc_hour",
+                                     _DEFAULTS["OBS_TRACK_NIGHT_END_UTC_HOUR"]))
+
+    @property
+    def obs_track_max_days(self) -> float:
+        return float(self.__dict__.get("obs_track_max_days", _DEFAULTS["OBS_TRACK_MAX_DAYS"]))
+
+    @property
+    def obs_track_lookback_hours(self) -> float:
+        return float(self.__dict__.get("obs_track_lookback_hours",
+                                       _DEFAULTS["OBS_TRACK_LOOKBACK_HOURS"]))
 
     @property
     def smtp_prewarm(self) -> bool:

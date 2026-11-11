@@ -406,6 +406,14 @@ AUTO_COMMENT_SOURCE = "Automatic ToO request from GCN Alert System."
 MANUAL_COMMENT_SOURCE = "Manual ToO request via Slack."
 
 
+def too_is_rapid(cfg: Optional[Dict[str, Any]]) -> bool:
+    """Whether a ToO config requests a rapid ToO (``rapidToO`` or the older
+    ``abortObservation`` key) — the value written as ``Is_rapid_ToO``."""
+    cfg = cfg or {}
+    return (_tcspy_bool(cfg.get("rapidToO", False)) == "True"
+            or _tcspy_bool(cfg.get("abortObservation", False)) == "True")
+
+
 def gcn_event_comment(notice_data: Dict[str, Any], source: str) -> str:
     """Comment line naming the GCN event, facility and trigger ID."""
     return (f"New event {notice_data.get('Name', 'New_GRB_Event')}. "
@@ -932,10 +940,7 @@ class GCNToOEmailer:
             # "rapidToO" key or the older "abortObservation" one, so callers
             # written against the previous behaviour keep working.
             "isToO":             cfg.get("isToO", "True"),
-            "rapidToO":          "True" if (
-                _tcspy_bool(cfg.get("rapidToO", False)) == "True"
-                or _tcspy_bool(cfg.get("abortObservation", False)) == "True"
-            ) else "False",
+            "rapidToO":          "True" if too_is_rapid(cfg) else "False",
             "priority":          cfg["priority"],
             "gain":              cfg["gain"],
             "binning":           cfg["binning"],

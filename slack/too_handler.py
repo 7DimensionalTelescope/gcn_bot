@@ -21,18 +21,28 @@ constructor arguments so it can be tested with mocks independently.
 
 import json
 import re
+import time
 import uuid
 import logging
+from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Dict, List, Optional
 
 from slack_sdk.errors import SlackApiError
 
 from too.emailer import (
     COLORMODES_7DT, FILTERS_7DT, FILTERS_7DT_ALL_UNITS, OBSMODES_7DT,
-    MANUAL_COMMENT_SOURCE, SPECMODES_7DT, deep_filter_note, gcn_event_comment,
+    MANUAL_COMMENT_SOURCE, SPECMODES_7DT, deep_filter_note, gcn_event_comment, too_is_rapid,
 )
 
 logger = logging.getLogger(__name__)
+
+_KST = timezone(timedelta(hours=9))
+
+
+def _kst(ts: float) -> str:
+    """KST clock time to 0.01 s ("16:51:55.12")."""
+    dt = datetime.fromtimestamp(ts, _KST)
+    return f"{dt.strftime('%H:%M:%S')}.{dt.microsecond // 10000:02d}"
 
 
 class SlackToOHandler:
@@ -73,7 +83,7 @@ class SlackToOHandler:
         user_group: str,
         too_config: Optional[Dict[str, Any]] = None,
         telescope: str = "7DT",
-        on_sent: Optional[Callable[[str, str, str], None]] = None,
+        on_sent: Optional[Callable[..., None]] = None,
         defaults_provider: Optional[Callable[[Dict[str, Any]], Optional[Dict[str, Any]]]] = None,
         sent_at_provider: Optional[Callable[[str, str, str], str]] = None,
         link_note_provider: Optional[Callable[[str, str, str], str]] = None,
@@ -524,12 +534,13 @@ class SlackToOHandler:
 
         @app.view(self.callback_id)
         def handle_modal_submit(ack, body, client, view):
+            submitted_at = time.time()   # the Submit click (timing tests)
             errors = self.validate_form(view["state"]["values"])
             if errors:
                 ack(response_action="errors", errors=errors)   # modal stays open
                 return
             ack()
-            self._on_modal_submit(body, client, view)
+            self._on_modal_submit(body, client, view, submitted_at=submitted_at)
 
         # Sent because the modal sets notify_on_close: the form was cancelled,
         # so the SMTP connection pre-warmed when it opened can be closed.
@@ -651,15 +662,18 @@ class SlackToOHandler:
     # Private: modal submission handler
     # ------------------------------------------------------------------
 
-    def _on_modal_submit(self, body: Dict[str, Any], client, view: Dict[str, Any]) -> None:
+    def _on_modal_submit(self, body: Dict[str, Any], client, view: Dict[str, Any],
+                         submitted_at: Optional[float] = None) -> None:
         try:
-            self._submit(body, client, view)
+            self._submit(body, client, view, submitted_at=submitted_at)
         finally:
             # Normally the send already gave the lease back; this covers the
             # early-return and exception paths (releasing twice is harmless).
             self._emailer.release_prewarm(self._lease_from(view))
 
-    def _submit(self, body: Dict[str, Any], client, view: Dict[str, Any]) -> None:
+    def _submit(self, body: Dict[str, Any], client, view: Dict[str, Any],
+                submitted_at: Optional[float] = None) -> None:
+        submitted_at = submitted_at or time.time()
         user_id    = body["user"]["id"]
         channel_id = body.get("container", {}).get("channel_id") or self._slack.channel
 
@@ -722,6 +736,7 @@ class SlackToOHandler:
 
         username = self._slack.get_user_display_name(user_id)
         success  = self._emailer.send_too_email(merged, too_config=too_config, release_token=lease)
+        sent_at  = time.time()
 
         post_channel = thread_channel or channel_id
         if success:
@@ -731,7 +746,8 @@ class SlackToOHandler:
                     f"✅ *{self.telescope} ToO Request Submitted*\n"
                     f"*Target:* {merged.get('Name', 'Unknown')}\n"
                     f"*Submitted by:* {username}\n"
-                    f"*RA/DEC:* {form_data.get('ra')}, {form_data.get('dec')}"
+                    f"*RA/DEC:* {form_data.get('ra')}, {form_data.get('dec')}\n"
+                    f"*Rapid ToO:* {'Yes' if too_is_rapid(too_config) else 'No'}"
                 ),
             }
             if self.telescope != "RASA36":
@@ -740,9 +756,11 @@ class SlackToOHandler:
                         if too_config["obsmode"] == "Deep" else "")
                 if note:
                     msg_kwargs["text"] += f"\n:warning: {note}"
+            msg_kwargs["text"] += (f"\n*Submitted:* {_kst(submitted_at)} KST → *email sent:* "
+                                   f"{_kst(sent_at)} KST (+{sent_at - submitted_at:.2f} s)")
             if thread_ts:
                 msg_kwargs["thread_ts"] = thread_ts
-            client.chat_postMessage(**msg_kwargs)
+            resp = client.chat_postMessage(**msg_kwargs)
             logger.info(f"ToO form submitted by {user_id} for {merged.get('Name')}")
 
             # Record the send so a later auto-ToO for this event is suppressed.
@@ -751,7 +769,15 @@ class SlackToOHandler:
                 trigger  = str(merged.get("Trigger_num", "")).strip()
                 if facility and trigger:
                     try:
-                        self._on_sent(facility, trigger, self.telescope)
+                        # the confirmation message carries this request's
+                        # observation status (accepted / observed …) from here on
+                        message = {"channel": resp.get("channel") or post_channel,
+                                   "ts": resp.get("ts"), "text": msg_kwargs["text"]}
+                        self._on_sent(facility, trigger, self.telescope,
+                                      message=message if message["ts"] else None,
+                                      rapid=too_is_rapid(too_config),
+                                      requester=too_config.get("requester") or "",
+                                      sent_at=sent_at)
                     except Exception as exc:
                         logger.error(f"on_sent callback failed: {exc}")
         else:

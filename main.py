@@ -29,12 +29,15 @@ import logging
 import signal
 import sys
 import threading
+import time
 import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, List, Optional
 
 from gcn import linking
 from slack.too_slot import ToOSlot
+from too.emailer import too_is_rapid
+from too.obs_tracker import ObservationTracker
 from too.scheduler import DeferredEntry, DeferredToOScheduler
 
 # ---------------------------------------------------------------------------
@@ -233,6 +236,27 @@ class GCNBot:
             check_interval=config.too_deferred_check_interval_sec,
         )
 
+        # --- ToO observation tracking ---
+        # Reads the 7DT / RASA36 Slack alert channels and appends accepted /
+        # observed / not-announced lines to the event's ToO slot. Started in run().
+        self.obs_tracker = None
+        if config.obs_track_enabled and any(config.obs_alert_channels.values()):
+            self.obs_tracker = ObservationTracker(
+                client=self.slack.client,
+                channels=config.obs_alert_channels,
+                store_path=config.output_too_tracking,
+                on_line=self._on_obs_line,
+                permalink=self.slack.get_permalink,
+                fast_poll_sec=config.obs_track_fast_poll_sec,
+                slow_poll_sec=config.obs_track_slow_poll_sec,
+                transfer_wait_hours=config.obs_track_transfer_wait_hours,
+                receipt_timeout_min=config.obs_track_receipt_timeout_min,
+                night_end_hour_utc=config.obs_track_night_end_utc_hour,
+                max_days=config.obs_track_max_days,
+                lookback_hours=config.obs_track_lookback_hours,
+                sender=config.email_from,
+            )
+
         # --- Slack ToO handlers (one per telescope) ---
         self.too_handler = SlackToOHandler(
             slack=self.slack,
@@ -240,7 +264,7 @@ class GCNBot:
             user_group=config.too_user_group,
             too_config=config.too_config,
             telescope="7DT",
-            on_sent=self.notice_handler.mark_too_sent,
+            on_sent=self._on_manual_too_sent,
             sent_at_provider=self.notice_handler.too_sent_at,
             link_note_provider=self._too_link_note,
         )
@@ -250,7 +274,7 @@ class GCNBot:
             user_group=config.too_user_group,
             too_config=config.too_config,
             telescope="RASA36",
-            on_sent=self.notice_handler.mark_too_sent,
+            on_sent=self._on_manual_too_sent,
             sent_at_provider=self.notice_handler.too_sent_at,
             link_note_provider=self._too_link_note,
             defaults_provider=self._rasa36_form_config,
@@ -279,6 +303,8 @@ class GCNBot:
                 f"multi={config.turn_on_too_email_auto_rasa36_multi}",
                 f"Same-burst link: {config.same_event_link} "
                 f"(±{self.link_params.time_window_sec:g} s, {self.link_params.pos_sigma:g}σ)",
+                f"ToO tracking  : "
+                + (", ".join(self.obs_tracker.channels) if self.obs_tracker else "off"),
             ],
         )
 
@@ -672,6 +698,8 @@ class GCNBot:
     def _process_notice_message(self, topic: str, value: Any) -> None:
         """Run the notice pipeline; give back any SMTP pre-warm lease it left."""
         self._notice_leases = {}
+        # when the bot got this notice — start of the auto-ToO timing line
+        self._notice_received_at = time.time()
         try:
             self._process_notice_pipeline(topic, value)
         finally:
@@ -1302,8 +1330,10 @@ class GCNBot:
                 emailer.send_too_email_async(
                     notice_data,
                     too_config=too_config,
-                    on_success=self._make_too_notice(too_slot, telescope, True),
-                    on_failure=self._make_too_notice(too_slot, telescope, False),
+                    on_success=self._make_too_notice(
+                        too_slot, telescope, True, notice_data, rapid=too_is_rapid(too_config),
+                        notice_at=getattr(self, "_notice_received_at", None)),
+                    on_failure=self._make_too_notice(too_slot, telescope, False, notice_data),
                     # the send gives the pre-warm lease back itself, after sending
                     release_token=self._notice_leases.pop(telescope, None),
                 )
@@ -1420,6 +1450,7 @@ class GCNBot:
              later than first estimated, reschedule; anything else (now outside
              the 1..max tile range, not observable) → skip.
         """
+        fired_at = time.time()
         facility, trigger, telescope = entry.facility, entry.trigger_num, entry.telescope
         emailer, tiles = self._telescope_ctx(telescope)
         if emailer is None:
@@ -1502,14 +1533,20 @@ class GCNBot:
         if case == "now":
             too_config = self._auto_too_config(telescope, n_tiles)
             ok = emailer.send_too_email(notice_data, too_config)
+            sent_at = time.time()
             if ok:
                 self.notice_handler.mark_too_sent(
                     facility, trigger, telescope, tiles=(tile_result or {}).get("tile_ids"),
                 )
+                self._track_sent(telescope, facility, trigger, "deferred",
+                                 notice_data.get("Name", ""), rapid=too_is_rapid(too_config),
+                                 sent_at=sent_at)
             # Clear the pending marker either way; a failed send is not retried
             # (the operator is notified to submit manually).
             self.notice_handler.clear_too_deferred(facility, trigger, telescope)
-            self._post_deferred_result(thread_ts, telescope, sent=ok)
+            self._post_deferred_result(thread_ts, telescope, sent=ok,
+                                       rapid=too_is_rapid(too_config),
+                                       timing=self._timing(fired_at, sent_at, "fired"))
         elif case == "soon":
             hrs = self._soon_hours(visibility_result) or 0.05
             new_fire = datetime.now(timezone.utc) + timedelta(hours=hrs)
@@ -1606,7 +1643,8 @@ class GCNBot:
 
     def _post_deferred_result(
         self, thread_ts: Optional[str], telescope: str, sent: Optional[bool],
-        reason: str = "retracted / no longer qualifies",
+        reason: str = "retracted / no longer qualifies", rapid: bool = False,
+        timing: str = "",
     ) -> None:
         """Append the outcome of a fired deferred ToO below its ``scheduled`` line.
 
@@ -1615,7 +1653,8 @@ class GCNBot:
         """
         if sent is True:
             now = datetime.now(timezone.utc).strftime("%H:%M")
-            text = f":white_check_mark: sent {now} UTC (deferred)"
+            text = (f":white_check_mark: {timing} (deferred)" if timing
+                    else f":white_check_mark: sent {now} UTC (deferred)") + f" · {self._rapid_tag(rapid)}"
         elif sent is False:
             text = ":warning: failed to send — check logs, submit manually"
         else:
@@ -1624,21 +1663,120 @@ class GCNBot:
 
     def _make_too_notice(
         self, too_slot: "ToOSlot", telescope: str, success: bool,
+        notice_data: Optional[dict] = None, rapid: bool = False,
+        notice_at: Optional[float] = None,
     ) -> Callable[[], None]:
         """
         Build a zero-arg callback (run on the emailer's worker thread) that
         turns the telescope's ``sending…`` line into ✅ sent / ⚠️ failed.
+        ``notice_at`` (bot receipt of the notice) starts the timing shown.
         """
         def _notify() -> None:
             if success:
-                stamp = datetime.now(_KST).strftime("%H:%M:%S")
-                too_slot.finish_send(telescope, f":white_check_mark: sent {stamp} KST")
+                sent = time.time()
+                too_slot.finish_send(telescope, (
+                    f":white_check_mark: {self._timing(notice_at, sent, 'notice')} "
+                    f"· {self._rapid_tag(rapid)}"))
+                nd = notice_data or {}
+                self._track_sent(telescope, nd.get("Facility", ""), nd.get("Trigger_num", ""),
+                                 "auto", nd.get("Name", ""), rapid=rapid, sent_at=sent)
             else:
                 too_slot.finish_send(
                     telescope, ":warning: failed to send — check logs, submit manually"
                 )
 
         return _notify
+
+    # ------------------------------------------------------------------
+    # ToO observation tracking (see too/obs_tracker.py)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _rapid_tag(rapid: bool) -> str:
+        return "rapid" if rapid else "normal"
+
+    @staticmethod
+    def _timing(start: Optional[float], sent: float, what: str) -> str:
+        """``notice 16:51:55.12 → email sent 16:51:58.06 KST (+2.94 s)`` (KST, 0.01 s)."""
+        def hms(t: float) -> str:
+            dt = datetime.fromtimestamp(t, _KST)
+            return f"{dt.strftime('%H:%M:%S')}.{dt.microsecond // 10000:02d}"
+        if start is None:
+            return f"email sent {hms(sent)} KST"
+        return f"{what} {hms(start)} → email sent {hms(sent)} KST (+{sent - start:.2f} s)"
+
+    def _track_sent(self, telescope: str, facility: Any, trigger: Any, source: str,
+                    name: str = "", message: Optional[dict] = None,
+                    rapid: Optional[bool] = None, requester: str = "",
+                    sent_at: Optional[float] = None) -> None:
+        """Tell the tracker to expect the telescope's announcement of this request."""
+        if self.obs_tracker is None:
+            return
+        try:
+            self.obs_tracker.record_sent(telescope, str(facility or ""), str(trigger or ""),
+                                         source, name=name, message=message, rapid=rapid,
+                                         requester=requester, sent_at=sent_at)
+        except Exception as exc:
+            logger.error(f"ToO tracking record failed ({telescope}): {exc}")
+
+    def _on_manual_too_sent(
+        self, facility: str, trigger: str, telescope: str, message: Optional[dict] = None,
+        rapid: Optional[bool] = None, requester: str = "", sent_at: Optional[float] = None,
+    ) -> None:
+        """Slack-button ToO sent: dup-guard marker + tracking.
+
+        With the tracker running, the request's status (waiting → accepted →
+        observed …) is shown under its own "ToO Request Submitted" confirmation
+        (``message``); otherwise a line in the event's ToO slot records the send.
+        """
+        self.notice_handler.mark_too_sent(facility, trigger, telescope)
+        entry = self.notice_handler.lookup_thread(facility, trigger) or {}
+        tracker = self.obs_tracker
+        if message and tracker is not None and tracker.running and tracker.tracks(telescope):
+            self._track_sent(telescope, facility, trigger, "manual", entry.get("name", ""),
+                             message=message, rapid=rapid, requester=requester, sent_at=sent_at)
+            self._update_request_status(telescope, {**message, "lines": []})
+            return
+        if entry.get("thread_ts"):
+            stamp = datetime.fromtimestamp(sent_at or time.time(), _KST).strftime("%H:%M:%S")
+            self._too_slot_for_thread(entry["thread_ts"]).add_line(
+                telescope, f":raised_hand: manual request sent {stamp} KST"
+                + (f" · {self._rapid_tag(rapid)}" if rapid is not None else "")
+            )
+        # name: matches the request even if its Comments were edited in the form
+        self._track_sent(telescope, facility, trigger, "manual", entry.get("name", ""),
+                         rapid=rapid, requester=requester, sent_at=sent_at)
+
+    def _update_request_status(self, telescope: str, target: dict) -> bool:
+        """Re-render a request's own message: its text + status lines (or 'waiting')."""
+        lines = target.get("lines") or []
+        if not lines:
+            channel = self.obs_tracker.channels.get(telescope, "") if self.obs_tracker else ""
+            lines = [f":hourglass_flowing_sand: waiting for {telescope} to accept the request"
+                     + (f" (<#{channel}>)" if channel else "")]
+        try:
+            self.slack.client.chat_update(
+                channel=target["channel"], ts=target["ts"],
+                text=target["text"] + "\n" + "\n".join(lines),
+            )
+            return True
+        except Exception as exc:
+            logger.warning(f"ToO request status edit failed ({target.get('ts')}): {exc}")
+            return False
+
+    def _on_obs_line(
+        self, telescope: str, facility: str, trigger: str, text: str,
+        target: Optional[dict] = None,
+    ) -> None:
+        """Tracker callback (tracker thread): the request's own message when it has
+        one (manual confirmation), else the event's ToO slot."""
+        if target and target.get("ts") and self._update_request_status(telescope, target):
+            return
+        thread_ts = (self.notice_handler.lookup_thread(facility, trigger) or {}).get("thread_ts")
+        if not thread_ts:
+            logger.info(f"ToO tracking: no thread for {facility} #{trigger} — {text}")
+            return
+        self._too_slot_for_thread(thread_ts).add_line(telescope, text)
 
     def _upload_visibility_plot(
         self,
@@ -1890,6 +2028,11 @@ class GCNBot:
         except Exception as exc:
             logger.error(f"Deferred ToO reload failed: {exc}", exc_info=True)
 
+        # Follow sent ToOs through the telescopes' alert channels (edits Slack,
+        # so only when posting is on).
+        if self.obs_tracker is not None and self.send_to_slack:
+            self.obs_tracker.start()
+
         # Handle OS signals — just flip the flag; shutdown() runs from the finally block
         signal.signal(signal.SIGTERM, lambda *_: setattr(self.consumer, "_running", False))
         signal.signal(signal.SIGINT,  lambda *_: setattr(self.consumer, "_running", False))
@@ -1914,6 +2057,11 @@ class GCNBot:
             self.deferred_scheduler.stop()
         except Exception as exc:
             logger.warning(f"Deferred scheduler stop error: {exc}")
+        if self.obs_tracker is not None:
+            try:
+                self.obs_tracker.stop()
+            except Exception as exc:
+                logger.warning(f"ToO observation tracker stop error: {exc}")
         try:
             self.consumer.stop()
         except Exception as exc:

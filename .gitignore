@@ -203,4 +203,5 @@ too_request*
 # runtime state files written by the bot
 thread_index.json
 too_slots.json
+too_tracking.json
 gcn_circular.csv.bak-*
