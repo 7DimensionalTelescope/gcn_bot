@@ -218,6 +218,18 @@ def _ago(seconds: float) -> str:
     return f"{seconds / 3600:.1f} h"
 
 
+def _event_label(name: str, facility: str, trigger: str) -> str:
+    """Log label naming the event first — "SVOM-ECLAIRs #sb26110813" alone reads
+    like a telescope: "GRB 261108D (SVOM-ECLAIRs #sb26110813)"."""
+    ev = f"{facility} #{trigger}"
+    return f"{name} ({ev})" if name else ev
+
+
+def _local_hms(ts: float) -> str:
+    """Host-local clock time, as in the log's own timestamps."""
+    return datetime.fromtimestamp(ts).strftime("%H:%M:%S")
+
+
 class ObservationTracker:
     """Follows the bot's ToO requests through the telescopes' alert channels.
 
@@ -510,7 +522,9 @@ class ObservationTracker:
             self._alerts[msg.alert_id] = alert
             latency = self._match_sent(msg.alert_id, alert)
             entry = self._entry_for(msg.alert_id)
-            logger.info(f"ToO tracker: {telescope} accepted {facility} #{trigger} "
+            label = _event_label((entry or {}).get("name") or msg.note, facility, trigger)
+            sent = f", sent {_local_hms(entry['sent_at'])}" if entry else ""
+            logger.info(f"ToO tracker: {telescope} accepted the {label} request{sent} "
                         f"(alert {msg.alert_id[:8]}, {msg.target})")
             self._emit(lines, telescope, facility, trigger,
                        self._received_line(alert, latency, entry), entry)
@@ -524,8 +538,10 @@ class ObservationTracker:
             exp_txt = f" ({exp:g} s × {n})" if n else ""
             entry = self._entry_for(msg.alert_id)
             after = f", {_dur(done - entry['sent_at'])} after sending" if entry else ""
-            logger.info(f"ToO tracker: {telescope} observed {alert['facility']} "
-                        f"#{alert['trigger']} (alert {msg.alert_id[:8]}{after})")
+            label = _event_label((entry or {}).get("name") or alert.get("note", ""),
+                                 alert["facility"], alert["trigger"])
+            logger.info(f"ToO tracker: {telescope} observed the {label} request "
+                        f"(alert {msg.alert_id[:8]}{after})")
             self._emit(lines, telescope, alert["facility"], alert["trigger"],
                        f":camera_with_flash: observed — completed {_hm(done, True)}{after}"
                        f"{exp_txt}", entry)
@@ -607,9 +623,10 @@ class ObservationTracker:
                     and now - entry["sent_at"] > self.receipt_timeout):
                 entry["warned"] = True
                 channel = self.channels.get(entry["telescope"], "")
-                logger.warning(f"ToO tracker: no {entry['telescope']} announcement for "
-                               f"{entry['facility']} #{entry['trigger']} "
-                               f"{_ago(now - entry['sent_at'])} after sending")
+                label = _event_label(entry.get("name", ""), entry["facility"], entry["trigger"])
+                logger.warning(f"ToO tracker: no {entry['telescope']} announcement for the "
+                               f"{label} request sent {_local_hms(entry['sent_at'])} "
+                               f"({_ago(now - entry['sent_at'])} ago)")
                 self._emit(lines, entry["telescope"], entry["facility"], entry["trigger"],
                            f":warning: not announced in <#{channel}> "
                            f"{_ago(now - entry['sent_at'])} after sending — the request "
