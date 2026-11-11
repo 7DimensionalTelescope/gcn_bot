@@ -139,6 +139,9 @@ _DEFAULTS: Dict[str, Any] = {
     # accepted ones await observation, not at all otherwise.
     "OBS_TRACK_FAST_POLL_SEC": 10.0,
     "OBS_TRACK_SLOW_POLL_SEC": 300.0,
+    # Awaiting observation while the target is observable now at CTIO (our
+    # altitude / Moon limits) — the only time a Success message can come.
+    "OBS_TRACK_OBSERVE_POLL_SEC": 30.0,
     # After an observation, wait this long for the RASA36 ToO data-transfer
     # message (seen 10 min and ~1 h after).
     "OBS_TRACK_TRANSFER_WAIT_HOURS": 3.0,
@@ -570,6 +573,11 @@ class BotConfig:
     def obs_track_slow_poll_sec(self) -> float:
         return float(self.__dict__.get("obs_track_slow_poll_sec",
                                        _DEFAULTS["OBS_TRACK_SLOW_POLL_SEC"]))
+
+    @property
+    def obs_track_observe_poll_sec(self) -> float:
+        return float(self.__dict__.get("obs_track_observe_poll_sec",
+                                       _DEFAULTS["OBS_TRACK_OBSERVE_POLL_SEC"]))
 
     @property
     def obs_track_transfer_wait_hours(self) -> float:

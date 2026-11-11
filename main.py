@@ -249,6 +249,8 @@ class GCNBot:
                 permalink=self.slack.get_permalink,
                 fast_poll_sec=config.obs_track_fast_poll_sec,
                 slow_poll_sec=config.obs_track_slow_poll_sec,
+                observe_poll_sec=config.obs_track_observe_poll_sec,
+                visibility=self._tracker_window,
                 transfer_wait_hours=config.obs_track_transfer_wait_hours,
                 receipt_timeout_min=config.obs_track_receipt_timeout_min,
                 night_end_hour_utc=config.obs_track_night_end_utc_hour,
@@ -1746,6 +1748,35 @@ class GCNBot:
         # name: matches the request even if its Comments were edited in the form
         self._track_sent(telescope, facility, trigger, "manual", entry.get("name", ""),
                          rapid=rapid, requester=requester, sent_at=sent_at)
+
+    def _tracker_window(self, ra: float, dec: float) -> Optional[tuple]:
+        """Tracker callback (tracker thread): (start, end) epochs of the target's
+        current / next observable window at CTIO tonight, or ``None``.
+
+        Uses its own VisibilityManager — the notice pipeline's is used on the
+        main thread at the same time.
+        """
+        if getattr(self, "_tracker_vis", None) is None:
+            from visibility.plotter import VisibilityManager
+            self._tracker_vis = VisibilityManager(
+                min_altitude=self.config.min_altitude, min_moon_sep=self.config.min_moon_sep,
+            )
+        status = self._tracker_vis.get_status(ra=ra, dec=dec)
+        if not status or status.get("case") not in ("observable_now", "observable_later"):
+            return None
+        window = ((status.get("details") or {}).get("tonight") or {}).get("window") or {}
+
+        def epoch(key: str) -> Optional[float]:
+            raw = str(window.get(key) or "")
+            try:
+                return datetime.fromisoformat(raw).replace(tzinfo=timezone.utc).timestamp()
+            except ValueError:
+                return None
+
+        start, end = epoch("start_time_utc"), epoch("end_time_utc")
+        if status["case"] == "observable_now" and start is None:
+            start = time.time()
+        return (start, end) if start is not None and end is not None else None
 
     def _update_request_status(self, telescope: str, target: dict) -> bool:
         """Re-render a request's own message: its text + status lines (or 'waiting')."""

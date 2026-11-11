@@ -21,8 +21,11 @@ those tags are other people's ToOs and are ignored.
 (``conversations.history`` for new top-level messages, ``conversations.replies``
 for alerts still open) — only while something is pending: every
 ``fast_poll_sec`` while a sent request awaits its announcement (within the
-receipt timeout), every ``slow_poll_sec`` while accepted requests await their
-observation (or a late announcement), not at all otherwise; ``record_sent``
+receipt timeout); for an accepted request awaiting its observation, every
+``observe_poll_sec`` while its target is observable now (``visibility``
+callback on the announced tile centre — an observation can only complete
+then), else every ``slow_poll_sec`` (waking at the window start); every
+``slow_poll_sec`` for a late announcement; not at all otherwise. ``record_sent``
 wakes it. An alert is done once observed (+ ``transfer_wait_hours`` for the
 RASA36 data-transfer message) or after ``max_days``, and reports each state change through
 ``on_line(telescope, facility, trigger, text, target)``. ``target`` is the
@@ -56,6 +59,8 @@ logger = logging.getLogger(__name__)
 
 _ALERT_ID_RE  = re.compile(r"Alert ID:\s*([0-9a-f]{32})")
 _TARGET_RE    = re.compile(r"\*Target Name:\*\s*(\S+)")
+_RA_RE        = re.compile(r"\*RA:\*\s*([-+\d.]+)")
+_DEC_RE       = re.compile(r"\*Dec:\*\s*([-+\d.]+)")
 _NOTE_RE      = re.compile(r"\*Note:\*\s*(\S+)")
 _COMMENTS_RE  = re.compile(r"\*Comments:\*\s*([^\n]*)")
 _IMMEDIATE_RE = re.compile(r"\*Immediate start\?\*\s*(\w+)")
@@ -87,6 +92,8 @@ class AlertMessage:
     at: Optional[datetime] = None   # received / completed / transferred (UTC)
     scheduled: str = ""
     sender: str = ""                # mail account the request came from
+    ra: Optional[float] = None      # where the scheduler will point (tile centre)
+    dec: Optional[float] = None
     extra: Dict[str, Any] = field(default_factory=dict)
 
 
@@ -126,6 +133,9 @@ def parse_alert_message(text: str) -> Optional[AlertMessage]:
         msg.scheduled = hit.group(1).strip() if hit else ""
         hit = _SENDER_RE.search(text)
         msg.sender = hit.group(1).lower() if hit else ""
+        ra, dec = _RA_RE.search(text), _DEC_RE.search(text)
+        if ra and dec:
+            msg.ra, msg.dec = float(ra.group(1)), float(dec.group(1))
         return msg
     if "Data transfer complete" in text:
         m = _TRANSFER_RE.search(text)
@@ -186,6 +196,10 @@ def night_end(received: datetime, scheduled: str, end_hour_utc: int) -> datetime
 # ---------------------------------------------------------------------------
 
 LineCallback = Callable[[str, str, str, str, Optional[Dict[str, Any]]], None]
+# (ra, dec) -> (start, end) epochs of the current / next observable window, or
+# None when not observable (tonight). May raise.
+WindowCallback = Callable[[float, float], Optional[Tuple[float, float]]]
+_WINDOW_RECHECK_SEC = 3600.0   # re-ask "observable?" this often when there is no window
 Line = Tuple[str, str, str, str, Optional[Dict[str, Any]]]
 
 
@@ -245,6 +259,8 @@ class ObservationTracker:
         ``(telescope, facility, trigger, text, target)`` — called outside the lock.
     permalink :
         optional ``(message_ts, channel) -> url`` for the announcement link.
+    visibility :
+        optional :data:`WindowCallback` — sets the observation-wait cadence.
     sender :
         the bot's mail account. A request from it whose Comments lost the event
         tags (edited in the manual form) is matched by Note = event name.
@@ -259,6 +275,8 @@ class ObservationTracker:
         permalink: Optional[Callable[[str, str], str]] = None,
         fast_poll_sec: float = 10.0,
         slow_poll_sec: float = 300.0,
+        observe_poll_sec: float = 30.0,
+        visibility: Optional[WindowCallback] = None,
         transfer_wait_hours: float = 3.0,
         receipt_timeout_min: float = 30.0,
         night_end_hour_utc: int = 12,
@@ -276,6 +294,8 @@ class ObservationTracker:
         self._permalink = permalink
         self.fast_poll = max(5.0, float(fast_poll_sec))
         self.slow_poll = max(self.fast_poll, float(slow_poll_sec))
+        self.observe_poll = min(self.slow_poll, max(5.0, float(observe_poll_sec)))
+        self._visibility = visibility
         self.transfer_wait = float(transfer_wait_hours) * 3600.0
         self.receipt_timeout = float(receipt_timeout_min) * 60.0
         self.night_end_hour = int(night_end_hour_utc)
@@ -284,7 +304,6 @@ class ObservationTracker:
         self._lock = threading.RLock()
         self._stop = threading.Event()
         self._wake = threading.Event()
-        self._replies_due = 0.0
         self._mode = ""
         self._thread: Optional[threading.Thread] = None
         state = self._load()
@@ -395,30 +414,48 @@ class ObservationTracker:
                 for msg in self._fetch_history(channel):
                     with self._lock:
                         self._handle(telescope, channel, msg, lines)
-        if everything or now >= self._replies_due:   # observations: slow cadence
-            self._replies_due = now + self.slow_poll
+        # observations: each open alert on its own schedule (see _alert_interval)
+        with self._lock:
+            due = [(aid, dict(a)) for aid, a in self._alerts.items()
+                   if self._is_open(a) and (everything or now >= a.get("next_check", 0))]
+        for aid, alert in due:
+            for msg in self._fetch_replies(alert["channel"], alert["ts"]):
+                with self._lock:
+                    self._handle(alert["telescope"], alert["channel"], msg, lines)
+        for aid, alert in due:
             with self._lock:
-                open_alerts = [dict(a) for a in self._alerts.values() if self._is_open(a)]
-            for alert in open_alerts:
-                for msg in self._fetch_replies(alert["channel"], alert["ts"]):
-                    with self._lock:
-                        self._handle(alert["telescope"], alert["channel"], msg, lines)
+                current = dict(self._alerts.get(aid) or alert)   # may be observed now
+            interval = self._alert_interval(current, self._clock())  # outside the lock
+            with self._lock:
+                if aid in self._alerts:
+                    self._alerts[aid]["vis"] = current.get("vis")
+                    self._alerts[aid]["in_window"] = current.get("in_window", False)
+                    self._alerts[aid]["next_check"] = self._clock() + interval
         with self._lock:
             self._check_timeouts(self._clock(), lines)
             self._prune(self._clock())
             self._save()
             fast, active = self._pending(self._clock())
+            now = self._clock()
+            open_alerts = [a for a in self._alerts.values() if self._is_open(a)]
+            waits = [max(1.0, a.get("next_check", 0) - now) for a in open_alerts]
+            watching = sorted({a["telescope"] for a in open_alerts if a.get("in_window")})
         for telescope, facility, trigger, text, target in lines:
             try:
                 self._on_line(telescope, facility, trigger, text, target)
             except Exception as exc:
                 logger.error(f"ToO tracking line failed ({telescope} {facility} #{trigger}): {exc}",
                              exc_info=True)
-        mode = "fast" if fast else "slow" if active else "idle"
+        mode = ("fast" if fast else f"observable now ({', '.join(watching)})" if watching
+                else "slow" if active else "idle")
         if mode != self._mode:
-            logger.info(f"ToO tracker: {mode}" + (f" ({', '.join(sorted(active))})" if active else ""))
+            logger.info(f"ToO tracker: {mode}"
+                        + (f" — pending {', '.join(sorted(active))}" if active else ""))
             self._mode = mode
-        return self.fast_poll if fast else self.slow_poll if active else None
+        if not active:
+            return None
+        delays = waits + [self.slow_poll] + ([self.fast_poll] if fast else [])
+        return min(delays)
 
     # ------------------------------------------------------------------
     # Internals
@@ -485,6 +522,48 @@ class ObservationTracker:
         return (a["telescope"] == b["telescope"] and str(a["trigger"]) == str(b["trigger"])
                 and family_of(a["facility"]) == family_of(b["facility"]))
 
+    def _alert_interval(self, alert: Dict[str, Any], now: float) -> float:
+        """Seconds until an open alert's replies are read again.
+
+        Observable now → ``observe_poll``; before tonight's window → ``slow_poll``
+        but waking at its start; otherwise (not observable, unknown, already
+        observed and only awaiting the RASA36 transfer) → ``slow_poll``. Our
+        altitude / Moon limits are not the scheduler's, so outside the window
+        it still looks, just slowly.
+        """
+        alert["in_window"] = False
+        if alert.get("observed_at"):
+            return self.slow_poll
+        window = self._window(alert, now)
+        if window is None:
+            return self.slow_poll
+        start, end = window
+        if start <= now < end:
+            alert["in_window"] = True
+            return min(self.observe_poll, max(1.0, end - now))
+        if now < start:
+            return max(1.0, min(self.slow_poll, start - now))
+        return self.slow_poll
+
+    def _window(self, alert: Dict[str, Any], now: float) -> Optional[Tuple[float, float]]:
+        """Cached observable window of the alert's target ([start, end, checked])."""
+        if self._visibility is None or alert.get("ra") is None:
+            return None
+        vis = alert.get("vis")
+        stale = (vis is None
+                 or (vis[1] is not None and now >= vis[1])                 # window over
+                 or (vis[1] is None and now - vis[2] >= _WINDOW_RECHECK_SEC))
+        if stale:
+            try:
+                win = self._visibility(alert["ra"], alert["dec"])
+            except Exception as exc:
+                logger.warning(f"ToO tracker: visibility of {alert['ra']}, {alert['dec']} "
+                               f"failed: {exc}")
+                win = None
+            vis = [win[0], win[1], now] if win else [None, None, now]
+            alert["vis"] = vis
+        return (vis[0], vis[1]) if vis[0] is not None else None
+
     def _is_open(self, alert: Dict[str, Any]) -> bool:
         now = self._clock()
         if now - alert["received_at"] > self.max_age:
@@ -514,6 +593,7 @@ class ObservationTracker:
                 "telescope": telescope, "channel": channel, "ts": raw["ts"],
                 "facility": facility, "trigger": trigger, "target": msg.target,
                 "note": msg.note, "received_at": received.timestamp(),
+                "ra": msg.ra, "dec": msg.dec,
                 "immediate": msg.immediate, "night_end": end.timestamp(),
                 "night": (end - timedelta(days=1)).strftime("%m-%d"),
                 "matched": False, "observed_at": None, "transferred_at": None,
