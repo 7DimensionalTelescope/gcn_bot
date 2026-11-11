@@ -35,7 +35,6 @@ acting on ``classify_auto_too()`` / ``evaluate_criteria()``. This class is
 unaware of those flags so that it remains testable in isolation.
 """
 
-import json
 import logging
 import os
 import re
@@ -45,8 +44,6 @@ import ssl
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime
-from email.mime.application import MIMEApplication
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from email.utils import formatdate, make_msgid
@@ -817,12 +814,7 @@ class GCNToOEmailer:
             subject    = self._build_subject(email_data)
             body       = self._build_body(email_data)
 
-            # JSON attachment, built in memory (no temp-file round trip)
-            now_str   = datetime.now().strftime("%Y%m%d%H%M%S")
-            file_name = f"too_request_{now_str}.json"
-            payload   = json.dumps(email_data, indent=4, default=str).encode("utf-8")
-
-            # Build MIME message
+            # Build MIME message (body only — the JSON attachment was dropped)
             msg            = MIMEMultipart()
             msg["Subject"] = subject
             msg["From"]    = self.email_from
@@ -830,9 +822,6 @@ class GCNToOEmailer:
             msg["Date"]    = formatdate(localtime=True)
             msg["Message-ID"] = make_msgid(domain=self.email_from.rsplit("@", 1)[-1])
             msg.attach(MIMEText(body, "plain"))
-            att = MIMEApplication(payload, Name=file_name)
-            att["Content-Disposition"] = f'attachment; filename="{file_name}"'
-            msg.attach(att)
             t_built = time.monotonic()
 
             # Send. The envelope recipients are passed explicitly (not inferred
@@ -929,7 +918,8 @@ class GCNToOEmailer:
         total_exp   = cfg["singleExposure"] * cfg["imageCount"]
 
         data: Dict[str, Any] = {
-            "requester":         self.email_from,
+            # Manual form: the "Requester Email" field; automatic → bot address.
+            "requester":         str(cfg.get("requester") or "").strip() or self.email_from,
             "target":            target_name,
             "ra":                notice_data.get("RA"),
             "dec":               notice_data.get("DEC"),
@@ -1019,7 +1009,6 @@ class GCNToOEmailer:
 - Target Name: {email_data['target']}
 - Right Ascension (R.A.): {email_data['ra']}
 - Declination (Dec.): {email_data['dec']}
-- Total Exposure Time (seconds): {float(email_data['exposure'])}
 - Single Exposure Time (seconds): {float(email_data['singleExposure'])}
 - # of images: {email_data['imageCount']}
 - Obsmode: {obsmode}{mode_lines}
@@ -1049,9 +1038,9 @@ class GCNToOEmailer:
 
         * "Image Count"  -> count      (the old "# of images" matched nothing,
                                         so every request silently became 5)
-        * "Total Integration" is deliberately NOT called "Total Exposure Time",
-          because that label also matches tcspy's exptime key and competes
-          with the single-exposure line.
+        * No total-exposure line: "Total Exposure Time" also matches tcspy's
+          exptime key and competes with the single-exposure line, and the
+          total is just exposure × count anyway.
         """
         # RASA36 uses two independent booleans rather than abortObservation:
         #   Is_ToO       — this is a target of opportunity at all
@@ -1084,7 +1073,6 @@ AUTOMATIC ToO Request - GRB Alert
 - Target Name: {email_data['target']}
 - Right Ascension (R.A.): {email_data['ra']}
 - Declination (Dec.): {email_data['dec']}
-- Total Integration (seconds): {email_data['exposure']}
 - Single Exposure Time (seconds): {email_data['singleExposure']}
 - Image Count: {email_data['imageCount']}
 - Obsmode: Single

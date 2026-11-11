@@ -698,6 +698,7 @@ class SlackToOHandler:
                 "gain":              form_data.get("gain", "25"),
                 "binning":           form_data.get("binning", "1"),
                 "comments":          form_data.get("comments") or "",
+                "requester":         form_data.get("requester") or "",
             }
         else:
             too_config = {
@@ -713,6 +714,7 @@ class SlackToOHandler:
                 "gain":              form_data.get("gain", "2750"),
                 "binning":           form_data.get("binning", "1"),
                 "comments":          form_data.get("comments") or "",
+                "requester":         form_data.get("requester") or "",
             }
 
         # Merge with notice_data for the emailer
